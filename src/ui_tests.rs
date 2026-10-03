@@ -1430,6 +1430,8 @@ fn escape_cancels_the_topic_editor_then_connection_edits_and_restores_focus(cx: 
     cx.update_window(handle, |_, window, cx| {
         window.render_frame(cx);
         window.press("shift-tab", cx);
+        assert_eq!(window.find("topic-search").focused(), Some(true));
+        window.press("shift-tab", cx);
         assert_eq!(window.find("settings").focused(), Some(true));
         window.press("enter", cx);
     })
@@ -2237,4 +2239,49 @@ fn metadata_tags_leave_room_for_json_at_minimum_size_in_both_themes(cx: &mut Tes
         })
         .unwrap();
     }
+}
+
+#[gpui_kit::test]
+fn topic_filter_shows_matching_paths_and_ancestors_then_restores_the_tree(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, false, 900., 640.);
+    view.update(cx, |view, cx| {
+        view.expanded.insert("home".into());
+        view.sync_tree(cx);
+        cx.notify();
+    });
+
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |view, cx| view.select_topic("home/b", window, cx));
+        window.render_frame(cx);
+        window.click("topic-search", cx);
+        window.input("HOME/A", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(view.read(cx).topic_filter.read(cx).value().as_str(), "HOME/A");
+        assert_eq!(view.read(cx).selected.as_deref(), Some("home/b"));
+        assert!(window.find("topic:home").visible());
+        assert!(window.find("topic:home/a").visible());
+        assert!(window.try_find("topic:home/b").is_none());
+        window.press("secondary-a", cx);
+        window.input("missing", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.find("topics-filter-empty").visible());
+        window.press("escape", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.find("topic:home/a").visible());
+        assert!(window.find("topic:home/b").visible());
+        assert!(window.try_find("topics-filter-empty").is_none());
+    })
+    .unwrap();
 }

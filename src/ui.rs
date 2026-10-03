@@ -11,7 +11,7 @@ use gpui_kit::assets::IconName as AssetIconName;
 use gpui_kit::component::{
     ActiveTheme, Disableable, Icon, IconName, IndexPath, Sizable, StyledExt, TitleBar, WindowExt,
     button::{Button, ButtonVariant, ButtonVariants},
-    input::{Editor, EditorState, InputEvent, InputState},
+    input::{Editor, EditorState, Input, InputEvent, InputState},
     list::ListItem,
     marker::{Marker, MarkerContent},
     menu::{DropdownMenu, PopupMenuItem},
@@ -113,6 +113,7 @@ pub struct Explorer {
     host: Entity<InputState>,
     port: Entity<InputState>,
     topic_input: Entity<InputState>,
+    topic_filter: Entity<InputState>,
     topic_qos: Entity<SelectState<Vec<&'static str>>>,
     subscription_topics: Vec<TopicSubscription>,
     topics_open: bool,
@@ -200,6 +201,7 @@ impl Explorer {
         let host = cx.new(|cx| InputState::new(window, cx).default_value(initial.host));
         let port = cx.new(|cx| InputState::new(window, cx).default_value(initial.port.to_string()));
         let topic_input = cx.new(|cx| InputState::new(window, cx).placeholder("e.g. home/#"));
+        let topic_filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter").clean_on_escape());
         let topic_qos = cx.new(|cx| SelectState::new(vec!["0", "1", "2"], Some(IndexPath::default()), window, cx));
         let username = cx.new(|cx| InputState::new(window, cx).placeholder("Optional").default_value(initial.username));
         let password = cx.new(|cx| {
@@ -237,6 +239,12 @@ impl Explorer {
                 })
             })
             .collect();
+        subscriptions.push(cx.subscribe_in(&topic_filter, window, |view, _, event, _, cx| {
+            if matches!(event, InputEvent::Change) {
+                view.sync_tree(cx);
+                cx.notify();
+            }
+        }));
         subscriptions.push(cx.subscribe_in(&topic_input, window, |view, input, event, window, cx| match event {
             InputEvent::Focus if view.topic_editor_open && window.last_input_was_keyboard() => {
                 input.update(cx, |input, cx| input.select_all(window, cx));
@@ -258,6 +266,14 @@ impl Explorer {
         }));
         subscriptions.push(cx.observe_in(&tree_state, window, |view, state, window, cx| {
             let selected = state.read(cx).selected_item().map(|item| item.id.to_string());
+            if selected.is_none()
+                && let Some(current) = view.selected.as_ref()
+            {
+                let filter = view.topic_filter.read(cx).value().to_lowercase();
+                if !filter.trim().is_empty() && !view.filtered_topic_paths(filter.trim()).contains(current) {
+                    return;
+                }
+            }
             if view.selected != selected {
                 view.selected = selected;
                 view.refresh_details(window, cx);
@@ -283,6 +299,7 @@ impl Explorer {
             host,
             port,
             topic_input,
+            topic_filter,
             topic_qos,
             subscription_topics: initial.topics,
             topics_open: true,
@@ -418,18 +435,45 @@ impl Explorer {
         }
     }
 
+    fn filtered_topic_paths(&self, filter: &str) -> BTreeSet<String> {
+        if filter.is_empty() {
+            return self.topics.nodes.keys().cloned().collect();
+        }
+
+        let mut paths = BTreeSet::new();
+        for path in self.topics.nodes.keys().filter(|path| path.to_lowercase().contains(filter)) {
+            paths.insert(path.clone());
+            for (index, _) in path.match_indices('/') {
+                let ancestor = &path[..index];
+                if self.topics.nodes.contains_key(ancestor) {
+                    paths.insert(ancestor.to_owned());
+                }
+            }
+        }
+        paths
+    }
+
     fn sync_tree(&mut self, cx: &mut Context<Self>) {
         // Children sort after their prefix, so reverse order builds complete roots
         // without recursing through broker-controlled topic depth.
+        let filter = self.topic_filter.read(cx).value().to_lowercase();
+        let paths = self.filtered_topic_paths(filter.trim());
+        let filtering = !filter.trim().is_empty();
         let mut items = BTreeMap::new();
         for (path, node) in self.topics.nodes.iter().rev() {
+            if !paths.contains(path) {
+                continue;
+            }
             let children: Vec<_> = node.children.iter().filter_map(|child| items.remove(child)).collect();
+            let expanded = if filtering {
+                !children.is_empty()
+            } else {
+                self.expanded.contains(path)
+            };
             let label = if path.is_empty() { "(empty level)".into() } else { path.clone() };
             items.insert(
                 path.clone(),
-                TreeItem::new(path.clone(), label)
-                    .children(children)
-                    .expanded(self.expanded.contains(path)),
+                TreeItem::new(path.clone(), label).children(children).expanded(expanded),
             );
         }
         let selected: Option<SharedString> = self.selected.clone().map(Into::into);
@@ -599,7 +643,12 @@ impl Explorer {
     }
 
     fn select_boundary(&mut self, last: bool, cx: &mut Context<Self>) {
-        let count = self.topics.visible_paths(&self.expanded).len();
+        let filter = self.topic_filter.read(cx).value().to_lowercase();
+        let count = if filter.trim().is_empty() {
+            self.topics.visible_paths(&self.expanded).len()
+        } else {
+            self.filtered_topic_paths(filter.trim()).len()
+        };
         if count == 0 {
             return;
         }
@@ -798,7 +847,18 @@ impl Explorer {
                     .border_b_1()
                     .border_color(cx.theme().border)
                     .font_medium()
-                    .child("Topics"),
+                    .child("Topics")
+                    .child(
+                        div().h_flex().flex_1().min_w_0().ml_4().justify_end().child(
+                            Input::new(&self.topic_filter)
+                                .id("topic-search")
+                                .small()
+                                .w_full()
+                                .max_w(rems(11.5))
+                                .prefix(Icon::new(IconName::Search).small())
+                                .aria_label("Filter topics"),
+                        ),
+                    ),
             )
             .when(self.topics.nodes.is_empty(), |tree| {
                 tree.child(
@@ -827,29 +887,42 @@ impl Explorer {
                 )
             })
             .when(!self.topics.nodes.is_empty(), |tree| {
-                tree.child(
-                    div()
-                        .flex_1()
-                        .min_h_0()
-                        .border_1()
-                        .border_color(cx.theme().sidebar)
-                        .child(Tree::new(&self.tree_state, move |_, entry, _, window, cx| {
-                            let Some(view) = view.upgrade() else {
-                                return ListItem::new("closed-topic");
-                            };
-                            let view = view.read(cx);
-                            if !cx.reduce_motion()
-                                && view
-                                    .topics
-                                    .nodes
-                                    .get(entry.item().id.as_str())
-                                    .is_some_and(|node| node.flashing(Instant::now()))
-                            {
-                                window.request_animation_frame();
-                            }
-                            view.topic_row(entry, cx)
-                        })),
-                )
+                let filter = self.topic_filter.read(cx).value().to_lowercase();
+                if !filter.trim().is_empty() && self.filtered_topic_paths(filter.trim()).is_empty() {
+                    tree.child(
+                        div()
+                            .id("topics-filter-empty")
+                            .test_support()
+                            .flex_1()
+                            .p_4()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("No topics match this filter."),
+                    )
+                } else {
+                    tree.child(
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .border_1()
+                            .border_color(cx.theme().sidebar)
+                            .child(Tree::new(&self.tree_state, move |_, entry, _, window, cx| {
+                                let Some(view) = view.upgrade() else {
+                                    return ListItem::new("closed-topic");
+                                };
+                                let view = view.read(cx);
+                                if !cx.reduce_motion()
+                                    && view
+                                        .topics
+                                        .nodes
+                                        .get(entry.item().id.as_str())
+                                        .is_some_and(|node| node.flashing(Instant::now()))
+                                {
+                                    window.request_animation_frame();
+                                }
+                                view.topic_row(entry, cx)
+                            })),
+                    )
+                }
             })
     }
 
