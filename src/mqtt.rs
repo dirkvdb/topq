@@ -5,7 +5,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, ensure};
@@ -185,12 +185,7 @@ async fn run(
     mut commands: mpsc::Receiver<ClearRetained>,
     session: &AtomicU64,
 ) -> Result<()> {
-    let id = format!(
-        "mqtt-ui-{}-{:x}",
-        std::process::id(),
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos()
-    );
-    let mut options = MqttOptions::new(id, config.host, config.port);
+    let mut options = MqttOptions::new(config.client_id, config.host, config.port);
     options.set_keep_alive(Duration::from_secs(30));
     options.set_clean_session(true);
     options.set_max_packet_size(16 * 1024 * 1024, 16 * 1024 * 1024);
@@ -361,6 +356,12 @@ mod tests {
         (header[0], body)
     }
 
+    fn connect_client_id(body: &[u8]) -> &str {
+        assert_eq!(&body[..7], b"\0\x04MQTT\x04");
+        let length = usize::from(u16::from_be_bytes([body[10], body[11]]));
+        std::str::from_utf8(&body[12..12 + length]).unwrap()
+    }
+
     fn handshake(listener: &TcpListener, granted: u8) -> TcpStream {
         handshake_with_subscriptions(listener, &[TopicSubscription::default()], &[granted])
     }
@@ -410,6 +411,34 @@ mod tests {
 
     fn runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+    }
+
+    #[test]
+    fn connect_uses_the_configured_client_id() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let broker = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let (header, body) = read_packet(&mut stream);
+            assert_eq!(header, 0x10);
+            assert_eq!(connect_client_id(&body), "custom-client");
+            stream.write_all(&[0x20, 2, 0, 0]).unwrap();
+            let (header, subscribe) = read_packet(&mut stream);
+            assert_eq!(header, 0x82);
+            stream.write_all(&[0x90, 3, subscribe[0], subscribe[1], 0]).unwrap();
+        });
+        let runtime = runtime();
+        let mut connection = connect(ConnectionConfig {
+            host: "127.0.0.1".into(),
+            port,
+            client_id: "custom-client".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(matches!(next_event(&runtime, &mut connection), BrokerEvent::Connected));
+        drop(connection);
+        broker.join().unwrap();
     }
 
     #[test]

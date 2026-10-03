@@ -167,6 +167,7 @@ impl Explorer {
             ConnectionField::Name => &self.name,
             ConnectionField::Host => &self.host,
             ConnectionField::Port => &self.port,
+            ConnectionField::ClientId => &self.client_id,
             ConnectionField::Topics => &self.topic_input,
             ConnectionField::Username => &self.username,
         };
@@ -208,6 +209,7 @@ impl Explorer {
             name,
             host: self.host.read(cx).value().trim().to_owned(),
             port,
+            client_id: self.client_id.read(cx).value().trim().to_owned(),
             topics: self.subscription_topics.clone(),
             username: self.username.read(cx).value().to_string(),
             password: self.password.read(cx).value().to_string(),
@@ -257,6 +259,8 @@ impl Explorer {
         self.host.update(cx, |input, cx| input.set_value(config.host.clone(), window, cx));
         self.port
             .update(cx, |input, cx| input.set_value(config.port.to_string(), window, cx));
+        self.client_id
+            .update(cx, |input, cx| input.set_value(config.client_id.clone(), window, cx));
         self.subscription_topics = config.topics.clone();
         self.topics_open = true;
         self.topic_editor_open = false;
@@ -949,6 +953,7 @@ impl Explorer {
             self.setting_input("name", "Connection name", &self.name, Some(ConnectionField::Name)),
             self.setting_input("host", "Host", &self.host, Some(ConnectionField::Host)),
             self.setting_input("port", "Port", &self.port, Some(ConnectionField::Port)),
+            self.setting_input("client-id", "Client ID", &self.client_id, Some(ConnectionField::ClientId)),
             tls_item,
             self.setting_input("username", "Username", &self.username, Some(ConnectionField::Username)),
             self.setting_input("password", "Password", &self.password, None),

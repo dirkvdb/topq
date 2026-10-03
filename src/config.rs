@@ -1,10 +1,12 @@
 //! Connection settings on disk and MQTT passwords in the system credential store.
 
 use std::{
-    collections::HashSet,
+    collections::{HashSet, hash_map::RandomState},
     fmt, fs,
+    hash::{BuildHasher, Hash, Hasher},
     io::Write,
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -52,6 +54,7 @@ pub struct ConnectionConfig {
     pub name: String,
     pub host: String,
     pub port: u16,
+    pub client_id: String,
     pub topics: Vec<TopicSubscription>,
     pub username: String,
     #[serde(skip)]
@@ -64,6 +67,7 @@ pub(crate) enum ConnectionField {
     Name,
     Host,
     Port,
+    ClientId,
     Topics,
     Username,
 }
@@ -94,6 +98,7 @@ impl Default for ConnectionConfig {
             name: String::new(),
             host: "localhost".into(),
             port: 1883,
+            client_id: default_client_id(),
             topics: vec![TopicSubscription::default()],
             username: String::new(),
             password: String::new(),
@@ -109,6 +114,7 @@ struct DeserializedConnectionConfig {
     name: String,
     host: String,
     port: u16,
+    client_id: String,
     topics: Option<Vec<TopicSubscription>>,
     base_topic: Option<String>,
     username: String,
@@ -122,6 +128,7 @@ impl Default for DeserializedConnectionConfig {
             name: config.name,
             host: config.host,
             port: config.port,
+            client_id: config.client_id,
             topics: None,
             base_topic: None,
             username: config.username,
@@ -142,12 +149,24 @@ impl From<DeserializedConnectionConfig> for ConnectionConfig {
             name: config.name,
             host: config.host,
             port: config.port,
+            client_id: config.client_id,
             topics,
             username: config.username,
             password: String::new(),
             tls: config.tls,
         }
     }
+}
+
+fn default_client_id() -> String {
+    let mut hasher = RandomState::new().build_hasher();
+    std::process::id().hash(&mut hasher);
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .hash(&mut hasher);
+    format!("topq-{:016x}", hasher.finish())
 }
 
 impl ConnectionConfig {
@@ -168,6 +187,12 @@ impl ConnectionConfig {
             return Err(ConnectionValidationError {
                 field: ConnectionField::Port,
                 message: "Enter a port between 1 and 65535.",
+            });
+        }
+        if self.client_id.trim().is_empty() || self.client_id.len() > usize::from(u16::MAX) || self.client_id.contains('\0') {
+            return Err(ConnectionValidationError {
+                field: ConnectionField::ClientId,
+                message: "Enter a non-empty MQTT client ID up to 65535 bytes, without null characters.",
             });
         }
         if self.topics.is_empty() {
@@ -537,6 +562,13 @@ mod tests {
             };
             assert!(config.validate().is_err());
         }
+        for client_id in [String::new(), "bad\0id".into(), "x".repeat(usize::from(u16::MAX) + 1)] {
+            let config = ConnectionConfig {
+                client_id,
+                ..Default::default()
+            };
+            assert_eq!(config.validate().unwrap_err().field(), ConnectionField::ClientId);
+        }
     }
 
     #[test]
@@ -562,6 +594,20 @@ mod tests {
         assert_eq!(config.username, "");
         assert_eq!(config.password, "");
         assert!(!config.tls);
+    }
+
+    #[test]
+    fn generated_client_ids_are_unique_and_legacy_configs_receive_a_default() {
+        let first = ConnectionConfig::default().client_id;
+        let second = ConnectionConfig::default().client_id;
+        assert!(first.starts_with("topq-"));
+        assert_ne!(first, second);
+        assert_eq!(first.len(), 21);
+
+        let legacy: ConnectionConfig = serde_json::from_str(r#"{"host":"broker.example"}"#).unwrap();
+        assert!(legacy.client_id.starts_with("topq-"));
+        let configured: ConnectionConfig = serde_json::from_str(r#"{"client_id":"custom-client"}"#).unwrap();
+        assert_eq!(configured.client_id, "custom-client");
     }
 
     #[test]
@@ -867,6 +913,8 @@ mod tests {
         assert_eq!(loaded.connections[1].name, second.name);
         assert_eq!(loaded.connections[0].topics, first.topics);
         assert_eq!(loaded.connections[1].topics, second.topics);
+        assert_eq!(loaded.connections[0].client_id, first.client_id);
+        assert_eq!(loaded.connections[1].client_id, second.client_id);
         let bytes = fs::read(&path).unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(

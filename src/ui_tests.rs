@@ -375,6 +375,7 @@ fn connection_cards_open_a_full_width_form_and_return_to_the_overview(cx: &mut T
         window.render_frame(cx);
         assert_eq!(window.find("name").value(), Some(""));
         assert_eq!(window.find("host").value(), Some("localhost"));
+        assert!(window.find("client-id").value().unwrap().starts_with("topq-"));
     })
     .unwrap();
 }
@@ -537,6 +538,7 @@ fn new_connection_topics_default_to_all_topics_with_qos_zero_after_credentials(c
         assert_eq!(window.find("remove-topic:#").label(), Some("Remove topic #"));
         assert_eq!(window.find("begin-add-topic").label(), Some("Add topic"));
         assert!(window.try_find("topic-editor").is_none());
+        assert!(window.find("connection-field:client-id").bounds().top() > window.find("field:port").bounds().bottom());
         assert!(window.find("connection-field:username").bounds().top() > window.find("tls").bounds().bottom());
         assert!(window.find("field:username").bounds().bottom() < window.find("field:password").bounds().top());
         assert!(section.bounds().top() > window.find("connection-field:password").bounds().bottom());
@@ -742,7 +744,7 @@ fn topic_editor_buttons_support_keyboard_activation_and_cancel_restores_the_trig
         window.click("port", cx);
     })
     .unwrap();
-    for id in ["tls", "username", "password", "toggle-topics", "begin-add-topic"] {
+    for id in ["client-id", "tls", "username", "password", "toggle-topics", "begin-add-topic"] {
         cx.update_window(handle, |_, window, cx| window.press("tab", cx)).unwrap();
         cx.run_until_parked();
         cx.update_window(handle, |_, window, cx| {
@@ -940,6 +942,13 @@ fn topics_disclosure_stays_left_aligned_above_headerless_rows_with_qos_tags(cx: 
                 });
                 cx.update_window(handle, |_, window, cx| {
                     window.render_frame(cx);
+                    for _ in 0..40 {
+                        if window.find("remove-topic:$SYS/#").visible() {
+                            break;
+                        }
+                        window.scroll("settings-dialog", gpui_kit::ScrollDelta::Lines(gpui_kit::point(0., -2.)), cx);
+                    }
+                    window.render_frame(cx);
                     let section = window.find("subscription-topics").bounds();
                     let trigger = window.find("toggle-topics").bounds();
                     let first_row = window.find("subscription:#").bounds();
@@ -1043,7 +1052,7 @@ fn connection_inputs_leave_room_for_their_focus_rings(cx: &mut TestAppContext) {
         let (handle, _) = open(cx, true, 1200., 1200.);
         cx.update(|cx| Theme::update(cx, |theme| theme.font_size = px(font_size)));
         cx.update_window(handle, |_, window, cx| {
-            for id in ["name", "host", "port", "username", "password"] {
+            for id in ["name", "host", "port", "client-id", "username", "password"] {
                 window.render_frame(cx);
                 window.click(id, cx);
                 window.render_frame(cx);
@@ -1163,6 +1172,7 @@ fn tabbing_between_connection_inputs_selects_values_and_visits_subscription_cont
                 (&view.name, "Home"),
                 (&view.host, "localhost"),
                 (&view.port, "1883"),
+                (&view.client_id, "topq-test-client"),
                 (&view.username, "reader"),
                 (&view.password, "secret"),
             ] {
@@ -1176,6 +1186,7 @@ fn tabbing_between_connection_inputs_selects_values_and_visits_subscription_cont
     for (key, id, replacement) in [
         ("tab", "host", Some("broker.example")),
         ("tab", "port", Some("8883")),
+        ("tab", "client-id", Some("topq-next-client")),
         ("tab", "tls", None),
         ("tab", "username", Some("another-reader")),
         ("tab", "password", Some("new-password")),
@@ -1187,6 +1198,7 @@ fn tabbing_between_connection_inputs_selects_values_and_visits_subscription_cont
         ("shift-tab", "password", Some("replacement-password")),
         ("shift-tab", "username", Some("replacement-reader")),
         ("shift-tab", "tls", None),
+        ("shift-tab", "client-id", Some("topq-previous-client")),
         ("shift-tab", "port", Some("1884")),
         ("shift-tab", "host", Some("other.example")),
         ("shift-tab", "name", Some("Workshop")),
@@ -1209,6 +1221,7 @@ fn tabbing_between_connection_inputs_selects_values_and_visits_subscription_cont
                     "name" => &view.name,
                     "host" => &view.host,
                     "port" => &view.port,
+                    "client-id" => &view.client_id,
                     "username" => &view.username,
                     "password" => &view.password,
                     _ => unreachable!(),

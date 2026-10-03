@@ -112,6 +112,7 @@ pub struct Explorer {
     name: Entity<InputState>,
     host: Entity<InputState>,
     port: Entity<InputState>,
+    client_id: Entity<InputState>,
     topic_input: Entity<InputState>,
     topic_filter: Entity<InputState>,
     topic_qos: Entity<SelectState<Vec<&'static str>>>,
@@ -200,6 +201,7 @@ impl Explorer {
         let name = cx.new(|cx| InputState::new(window, cx).placeholder("e.g. Home").default_value(initial.name));
         let host = cx.new(|cx| InputState::new(window, cx).default_value(initial.host));
         let port = cx.new(|cx| InputState::new(window, cx).default_value(initial.port.to_string()));
+        let client_id = cx.new(|cx| InputState::new(window, cx).default_value(initial.client_id));
         let topic_input = cx.new(|cx| InputState::new(window, cx).placeholder("e.g. home/#"));
         let topic_filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter").clean_on_escape());
         let topic_qos = cx.new(|cx| SelectState::new(vec!["0", "1", "2"], Some(IndexPath::default()), window, cx));
@@ -223,7 +225,7 @@ impl Explorer {
         tree_state.update(cx, |state, cx| state.focus(window, cx));
         let _tree_focus = window.focused(cx).map(|handle| handle.tab_stop(true));
         let panes = cx.new(|_| ResizableState::default());
-        let mut subscriptions: Vec<_> = [&name, &host, &port, &username, &password]
+        let mut subscriptions: Vec<_> = [&name, &host, &port, &client_id, &username, &password]
             .into_iter()
             .map(|input| {
                 cx.subscribe_in(input, window, |view, input, event, window, cx| match event {
@@ -298,6 +300,7 @@ impl Explorer {
             name,
             host,
             port,
+            client_id,
             topic_input,
             topic_filter,
             topic_qos,
