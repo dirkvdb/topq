@@ -1,5 +1,5 @@
 [package]
-name = "mqtt-ui"
+name = "topq"
 version = "0.1.0"
 edition = "2024"
 description = "A minimal, read-only MQTT explorer built with GPUI Kit"

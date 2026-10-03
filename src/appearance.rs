@@ -12,12 +12,28 @@ use serde::{Deserialize, Serialize};
 
 use crate::config;
 
-#[derive(Default, Serialize, Deserialize)]
+const DEFAULT_THEME: &str = "Charcoal Grove";
+
+#[derive(Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct Appearance {
+    #[serde(default = "default_theme")]
     theme: Option<String>,
     #[serde(skip)]
     path: Option<PathBuf>,
+}
+
+fn default_theme() -> Option<String> {
+    Some(DEFAULT_THEME.to_owned())
+}
+
+impl Default for Appearance {
+    fn default() -> Self {
+        Self {
+            theme: default_theme(),
+            path: None,
+        }
+    }
 }
 
 impl Global for Appearance {}
@@ -30,6 +46,7 @@ impl Appearance {
 
 pub(crate) fn register_bundled(cx: &mut App) -> Result<()> {
     for content in [
+        include_str!("../themes/charcoal-grove.json"),
         include_str!("../themes/ayu.json"),
         include_str!("../themes/tokyonight.json"),
         include_str!("../themes/collection.json"),
@@ -60,7 +77,7 @@ pub(crate) fn init(cx: &mut App) {
     if let Err(error) = apply(selected.as_ref(), None, cx) {
         eprintln!("{error:#}");
         cx.set_global(Appearance::default());
-        _ = apply(None, None, cx);
+        _ = apply(Some(&DEFAULT_THEME.into()), None, cx);
     }
 }
 
@@ -158,8 +175,7 @@ pub(crate) fn select(name: Option<SharedString>, window: &mut Window, cx: &mut A
         Some(path) => path.clone(),
         None => config::config_path()?.with_file_name("appearance.json"),
     };
-    config::write_json(&path, cx.global::<Appearance>())
-        .context("Theme changed, but the preference could not be saved.")
+    config::write_json(&path, cx.global::<Appearance>()).context("Theme changed, but the preference could not be saved.")
 }
 
 pub(crate) fn sync_system(window: &mut Window, cx: &mut App) {
@@ -175,9 +191,7 @@ mod tests {
     use super::*;
 
     #[gpui_kit::test]
-    fn switching_themes_resets_geometry_and_updates_editor_and_surface_tokens(
-        cx: &mut TestAppContext,
-    ) {
+    fn switching_themes_resets_geometry_and_updates_editor_and_surface_tokens(cx: &mut TestAppContext) {
         cx.update(|cx| {
             gpui_kit::init(cx);
             register_bundled(cx).unwrap();
@@ -201,10 +215,31 @@ mod tests {
             }
             apply(None, None, cx).unwrap();
             let theme = Theme::global(cx);
-            assert!(matches!(
-                theme.theme_name().as_str(),
-                "Ayu Light" | "Ayu Dark"
-            ));
+            assert!(matches!(theme.theme_name().as_str(), "Ayu Light" | "Ayu Dark"));
+        });
+    }
+
+    #[test]
+    fn no_saved_preference_uses_charcoal_grove_but_explicit_system_choice_is_preserved() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("appearance.json");
+        assert_eq!(load(&path).unwrap().theme.as_deref(), Some(DEFAULT_THEME));
+        fs::write(&path, r#"{"theme":null}"#).unwrap();
+        assert_eq!(load(&path).unwrap().theme, None);
+        fs::write(&path, "{}").unwrap();
+        assert_eq!(load(&path).unwrap().theme.as_deref(), Some(DEFAULT_THEME));
+    }
+
+    #[gpui_kit::test]
+    fn bundled_charcoal_grove_is_dark_and_selected_by_default(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            register_bundled(cx).unwrap();
+            apply(Some(&DEFAULT_THEME.into()), None, cx).unwrap();
+            let theme = Theme::global(cx);
+            assert_eq!(theme.theme_name().as_str(), DEFAULT_THEME);
+            assert!(theme.mode.is_dark());
+            assert_eq!(theme.highlight_theme.name, DEFAULT_THEME);
         });
     }
 

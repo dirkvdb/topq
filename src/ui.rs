@@ -6,31 +6,29 @@ use std::{
 };
 
 use gpui_kit::component::{
-    ActiveTheme, Disableable, Icon, IconName, Sizable, StyledExt, ThemeRegistry,
+    ActiveTheme, Icon, IconName, Sizable, StyledExt, TitleBar,
     button::{Button, ButtonVariants},
-    checkbox::Checkbox,
-    form::{Field, Form},
-    input::{Editor, EditorState, Input, InputEvent, InputGroup, InputState},
+    input::{Editor, EditorState, Input, InputEvent, InputState},
     list::ListItem,
     menu::{DropdownMenu, PopupMenuItem},
     resizable::{ResizablePanelEvent, ResizableState, h_resizable, resizable_panel},
-    scroll::ScrollableElement,
     spinner::Spinner,
     tag::Tag,
     tree::{Tree, TreeEntry, TreeEvent, TreeItem, TreeState},
 };
 use gpui_kit::{
-    App, ClipboardItem, Context, Entity, FocusHandle, IntoElement, KeyBinding, MouseButton, Render,
-    Role, ScrollStrategy, SharedString, Subscription, Task, TestSupportExt, Window, div,
-    prelude::*, relative, rems,
+    App, ClipboardItem, Context, Entity, FocusHandle, IntoElement, KeyBinding, MouseButton, Render, Role, ScrollStrategy, SharedString,
+    Subscription, Task, TestSupportExt, Window, div, prelude::*, relative, rems,
 };
 
 use crate::{
     appearance::{self, Appearance},
-    config::{self, ConnectionConfig, ConnectionField},
+    config::{self, ConnectionConfig, ConnectionField, SavedConnections},
     mqtt::{self, BrokerEvent, Connection},
     topics::{FLASH_DURATION, TopicStore},
 };
+
+mod settings;
 
 gpui_kit::actions!(
     mqtt_ui,
@@ -52,11 +50,7 @@ pub(crate) fn init(cx: &mut App) {
         KeyBinding::new("secondary-1", FocusTopics, Some("Explorer")),
         KeyBinding::new("home", FirstTopic, Some("Tree")),
         KeyBinding::new("end", LastTopic, Some("Tree")),
-        KeyBinding::new(
-            "enter",
-            gpui_kit::base::actions::Confirm { secondary: false },
-            Some("Tree"),
-        ),
+        KeyBinding::new("enter", gpui_kit::base::actions::Confirm { secondary: false }, Some("Tree")),
         KeyBinding::new("ctrl-alt-left", NarrowTopics, Some("Explorer")),
         KeyBinding::new("ctrl-alt-right", WidenTopics, Some("Explorer")),
     ]);
@@ -67,6 +61,20 @@ enum ConnectionStatus {
     Connecting,
     Connected,
     Failed(String),
+}
+
+fn connection_label(config: &ConnectionConfig) -> String {
+    if !config.name.trim().is_empty() {
+        return config.name.clone();
+    }
+    let mut label = format!("{}:{}", config.host, config.port);
+    if !config.username.is_empty() {
+        label.push_str(&format!(" · {}", config.username));
+    }
+    if config.tls {
+        label.push_str(" · TLS");
+    }
+    label
 }
 
 fn topic_summary(topics: usize, messages: u64) -> String {
@@ -96,6 +104,7 @@ impl ConnectionStatus {
 }
 
 pub struct Explorer {
+    name: Entity<InputState>,
     host: Entity<InputState>,
     port: Entity<InputState>,
     username: Entity<InputState>,
@@ -107,7 +116,9 @@ pub struct Explorer {
     status: ConnectionStatus,
     error: Option<String>,
     field_error: Option<(ConnectionField, String)>,
-    saved: bool,
+    saved_connections: SavedConnections,
+    editing: Option<usize>,
+    connection_form_open: bool,
     topics: TopicStore,
     tree_state: Entity<TreeState>,
     expanded: BTreeSet<String>,
@@ -119,6 +130,7 @@ pub struct Explorer {
     topics_width_rem: Option<f32>,
     focus: FocusHandle,
     restore_focus: Option<FocusHandle>,
+    settings_generation: u64,
     flash_until: Option<Instant>,
     _poll: Task<()>,
     _subscriptions: Vec<Subscription>,
@@ -126,16 +138,37 @@ pub struct Explorer {
 
 impl Explorer {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let (saved_config, error) = match config::load() {
-            Ok(config) => (config, None),
-            Err(error) => (None, Some(format!("{error:#}"))),
+        let (saved_connections, error) = match config::load_connections() {
+            Ok(connections) => (connections, None),
+            Err(error) => (SavedConnections::default(), Some(format!("{error:#}"))),
         };
         let width = config::load_topics_width().unwrap_or_default();
-        Self::with_settings(saved_config, error, width, window, cx)
+        Self::with_connections(saved_connections, error, width, window, cx)
     }
 
+    #[cfg(test)]
     fn with_settings(
         saved_config: Option<ConnectionConfig>,
+        error: Option<String>,
+        width: Option<f32>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let selected = saved_config.as_ref().map(|_| 0);
+        Self::with_connections(
+            SavedConnections {
+                connections: saved_config.into_iter().collect(),
+                selected,
+            },
+            error,
+            width,
+            window,
+            cx,
+        )
+    }
+
+    fn with_connections(
+        saved_connections: SavedConnections,
         error: Option<String>,
         width: Option<f32>,
         window: &mut Window,
@@ -144,14 +177,15 @@ impl Explorer {
         if !cx.has_global::<Appearance>() {
             cx.set_global(Appearance::default());
         }
+        let saved_config = saved_connections
+            .selected
+            .and_then(|index| saved_connections.connections.get(index))
+            .cloned();
         let initial = saved_config.clone().unwrap_or_default();
+        let name = cx.new(|cx| InputState::new(window, cx).placeholder("e.g. Home").default_value(initial.name));
         let host = cx.new(|cx| InputState::new(window, cx).default_value(initial.host));
         let port = cx.new(|cx| InputState::new(window, cx).default_value(initial.port.to_string()));
-        let username = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("Optional")
-                .default_value(initial.username)
-        });
+        let username = cx.new(|cx| InputState::new(window, cx).placeholder("Optional").default_value(initial.username));
         let password = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("Optional")
@@ -172,13 +206,14 @@ impl Explorer {
         tree_state.update(cx, |state, cx| state.focus(window, cx));
         let _tree_focus = window.focused(cx).map(|handle| handle.tab_stop(true));
         let panes = cx.new(|_| ResizableState::default());
-        let mut subscriptions: Vec<_> = [&host, &port, &username, &password]
+        let mut subscriptions: Vec<_> = [&name, &host, &port, &username, &password]
             .into_iter()
             .map(|input| {
-                cx.subscribe_in(input, window, |view, _, event, window, cx| match event {
-                    InputEvent::PressEnter { .. } if view.show_config => {
-                        view.connect_from_form(window, cx)
+                cx.subscribe_in(input, window, |view, input, event, window, cx| match event {
+                    InputEvent::Focus if view.show_config && view.connection_form_open && window.last_input_was_keyboard() => {
+                        input.update(cx, |input, cx| input.select_all(window, cx));
                     }
+                    InputEvent::PressEnter { .. } if view.show_config && view.connection_form_open => view.connect_from_form(window, cx),
                     InputEvent::Change if view.field_error.is_some() => {
                         view.field_error = None;
                         cx.notify();
@@ -187,55 +222,38 @@ impl Explorer {
                 })
             })
             .collect();
-        subscriptions.push(cx.subscribe_in(
-            &tree_state,
-            window,
-            |view, _, event, _, _| match event {
-                TreeEvent::Expanded(path) => {
-                    view.expanded.insert(path.to_string());
-                }
-                TreeEvent::Collapsed(path) => {
-                    view.expanded.remove(path.as_str());
-                }
-            },
-        ));
-        subscriptions.push(
-            cx.observe_in(&tree_state, window, |view, state, window, cx| {
-                let selected = state
-                    .read(cx)
-                    .selected_item()
-                    .map(|item| item.id.to_string());
-                if view.selected != selected {
-                    view.selected = selected;
-                    view.refresh_details(window, cx);
-                    cx.notify();
-                }
-            }),
-        );
+        subscriptions.push(cx.subscribe_in(&tree_state, window, |view, _, event, _, _| match event {
+            TreeEvent::Expanded(path) => {
+                view.expanded.insert(path.to_string());
+            }
+            TreeEvent::Collapsed(path) => {
+                view.expanded.remove(path.as_str());
+            }
+        }));
+        subscriptions.push(cx.observe_in(&tree_state, window, |view, state, window, cx| {
+            let selected = state.read(cx).selected_item().map(|item| item.id.to_string());
+            if view.selected != selected {
+                view.selected = selected;
+                view.refresh_details(window, cx);
+                cx.notify();
+            }
+        }));
         subscriptions.push(cx.observe_window_appearance(window, |_, window, cx| {
             appearance::sync_system(window, cx);
         }));
-        subscriptions.push(cx.subscribe_in(
-            &panes,
-            window,
-            |view, state, _: &ResizablePanelEvent, window, cx| {
-                view.persist_split(state, window, cx);
-            },
-        ));
+        subscriptions.push(cx.subscribe_in(&panes, window, |view, state, _: &ResizablePanelEvent, window, cx| {
+            view.persist_split(state, window, cx);
+        }));
         let poll = cx.spawn_in(window, async move |view, cx| {
             loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(50))
-                    .await;
-                if view
-                    .update_in(cx, |view, window, cx| view.poll(window, cx))
-                    .is_err()
-                {
+                cx.background_executor().timer(Duration::from_millis(50)).await;
+                if view.update_in(cx, |view, window, cx| view.poll(window, cx)).is_err() {
                     break;
                 }
             }
         });
         let mut view = Self {
+            name,
             host,
             port,
             username,
@@ -252,13 +270,16 @@ impl Explorer {
             status: ConnectionStatus::Disconnected,
             error,
             field_error: None,
-            saved: saved_config.is_some(),
+            editing: saved_connections.selected,
+            connection_form_open: saved_config.is_none(),
+            saved_connections,
             topics: TopicStore::default(),
             expanded: BTreeSet::new(),
             selected: None,
             topics_width_rem: width,
             focus: cx.focus_handle(),
             restore_focus: None,
+            settings_generation: 0,
             flash_until: None,
             _poll: poll,
             _subscriptions: subscriptions,
@@ -266,66 +287,12 @@ impl Explorer {
         if let Some(config) = saved_config {
             view.start_connection(config, window, cx);
         } else {
-            view.host.update(cx, |input, cx| input.focus(window, cx));
+            view.name.update(cx, |input, cx| input.focus(window, cx));
         }
         view
     }
 
-    fn invalid_field(
-        &mut self,
-        field: ConnectionField,
-        message: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.field_error = Some((field, message));
-        let input = match field {
-            ConnectionField::Host => &self.host,
-            ConnectionField::Port => &self.port,
-            ConnectionField::Username => &self.username,
-        };
-        input.update(cx, |input, cx| input.focus(window, cx));
-        cx.notify();
-    }
-
-    fn connect_from_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.status.is_connecting() {
-            return;
-        }
-        self.field_error = None;
-        let port = match self.port.read(cx).value().trim().parse::<u16>() {
-            Ok(port) => port,
-            Err(_) => {
-                self.invalid_field(
-                    ConnectionField::Port,
-                    "Enter a port between 1 and 65535.".into(),
-                    window,
-                    cx,
-                );
-                return;
-            }
-        };
-        let config = ConnectionConfig {
-            host: self.host.read(cx).value().trim().to_owned(),
-            port,
-            username: self.username.read(cx).value().to_string(),
-            password: self.password.read(cx).value().to_string(),
-            tls: self.tls,
-        };
-        if let Err(error) = config.validate() {
-            self.invalid_field(error.field(), error.to_string(), window, cx);
-            return;
-        }
-        self.saved = false;
-        self.start_connection(config, window, cx);
-    }
-
-    fn start_connection(
-        &mut self,
-        config: ConnectionConfig,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn start_connection(&mut self, config: ConnectionConfig, window: &mut Window, cx: &mut Context<Self>) {
         self.connection = None;
         self.error = None;
         self.field_error = None;
@@ -335,12 +302,7 @@ impl Explorer {
                 self.active_config = Some(config);
                 self.show_config = false;
                 self.status = ConnectionStatus::Connecting;
-                self.topics = TopicStore::default();
-                self.expanded.clear();
-                self.selected = None;
-                self.flash_until = None;
-                self.sync_tree(cx);
-                self.refresh_details(window, cx);
+                self.clear_topics(window, cx);
                 self.focus_topics(window, cx);
             }
             Err(error) => {
@@ -351,51 +313,13 @@ impl Explorer {
         cx.notify();
     }
 
-    fn disconnect(&mut self, cx: &mut Context<Self>) {
-        self.connection = None;
-        self.status = ConnectionStatus::Disconnected;
-        self.error = None;
-        cx.notify();
-    }
-
-    fn open_connection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.show_config {
-            self.restore_focus = window.focused(cx);
-            if let Some(config) = &self.active_config {
-                self.host.update(cx, |input, cx| {
-                    input.set_value(config.host.clone(), window, cx)
-                });
-                self.port.update(cx, |input, cx| {
-                    input.set_value(config.port.to_string(), window, cx)
-                });
-                self.username.update(cx, |input, cx| {
-                    input.set_value(config.username.clone(), window, cx)
-                });
-                self.password.update(cx, |input, cx| {
-                    input.set_value(config.password.clone(), window, cx)
-                });
-                self.tls = config.tls;
-            }
-        }
-        self.show_config = true;
-        self.field_error = None;
-        self.host.update(cx, |input, cx| input.focus(window, cx));
-        cx.notify();
-    }
-
-    fn cancel_connection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.show_config || self.active_config.is_none() {
-            cx.propagate();
-            return;
-        }
-        self.show_config = false;
-        self.field_error = None;
-        if let Some(handle) = self.restore_focus.take() {
-            handle.focus(window, cx);
-        } else {
-            self.focus_topics(window, cx);
-        }
-        cx.notify();
+    fn clear_topics(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.topics = TopicStore::default();
+        self.expanded.clear();
+        self.selected = None;
+        self.flash_until = None;
+        self.sync_tree(cx);
+        self.refresh_details(window, cx);
     }
 
     fn poll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -421,18 +345,6 @@ impl Explorer {
                 BrokerEvent::Connecting => self.status = ConnectionStatus::Connecting,
                 BrokerEvent::Connected => {
                     self.status = ConnectionStatus::Connected;
-                    if !self.saved
-                        && let Some(config) = &self.active_config
-                    {
-                        match config::save(config) {
-                            Ok(()) => self.saved = true,
-                            Err(error) => {
-                                self.error = Some(format!(
-                                    "Connected, but could not save settings: {error:#}"
-                                ))
-                            }
-                        }
-                    }
                 }
                 BrokerEvent::Status(status) => self.status = ConnectionStatus::Failed(status),
                 BrokerEvent::Message(message) => {
@@ -446,8 +358,7 @@ impl Explorer {
         }
         if ended {
             self.connection = None;
-            self.status =
-                ConnectionStatus::Failed(format!("Connection stopped · {}", self.status.label()));
+            self.status = ConnectionStatus::Failed(format!("Connection stopped · {}", self.status.label()));
             changed = true;
         }
         if tree_changed {
@@ -472,16 +383,8 @@ impl Explorer {
         // without recursing through broker-controlled topic depth.
         let mut items = BTreeMap::new();
         for (path, node) in self.topics.nodes.iter().rev() {
-            let children: Vec<_> = node
-                .children
-                .iter()
-                .filter_map(|child| items.remove(child))
-                .collect();
-            let label = if path.is_empty() {
-                "(empty level)".into()
-            } else {
-                path.clone()
-            };
+            let children: Vec<_> = node.children.iter().filter_map(|child| items.remove(child)).collect();
+            let label = if path.is_empty() { "(empty level)".into() } else { path.clone() };
             items.insert(
                 path.clone(),
                 TreeItem::new(path.clone(), label)
@@ -498,22 +401,15 @@ impl Explorer {
 
     fn refresh_details(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let topic = self.selected.clone().unwrap_or_default();
-        self.topic_name
-            .update(cx, |input, cx| input.set_value(topic, window, cx));
+        self.topic_name.update(cx, |input, cx| input.set_value(topic, window, cx));
         let value = self
             .selected
             .as_ref()
             .and_then(|path| self.topics.nodes.get(path))
             .and_then(|node| node.value.as_ref());
         self.payload_format = value.map_or("Text", |value| value.format_label());
-        let value = value
-            .map(|value| value.display_payload())
-            .unwrap_or_default();
-        let language = if self.payload_format == "JSON" {
-            "json"
-        } else {
-            "plaintext"
-        };
+        let value = value.map(|value| value.display_payload()).unwrap_or_default();
+        let language = if self.payload_format == "JSON" { "json" } else { "plaintext" };
         self.payload.update(cx, |input, cx| {
             if input.language_name() != language {
                 input.set_highlighter(language, cx);
@@ -526,8 +422,7 @@ impl Explorer {
         if self.show_config {
             return;
         }
-        self.tree_state
-            .update(cx, |state, cx| state.focus(window, cx));
+        self.tree_state.update(cx, |state, cx| state.focus(window, cx));
     }
 
     fn select_boundary(&mut self, last: bool, cx: &mut Context<Self>) {
@@ -538,14 +433,7 @@ impl Explorer {
         let ix = if last { count - 1 } else { 0 };
         self.tree_state.update(cx, |state, cx| {
             state.set_selected_index(Some(ix), cx);
-            state.scroll_to_item(
-                ix,
-                if last {
-                    ScrollStrategy::Bottom
-                } else {
-                    ScrollStrategy::Top
-                },
-            );
+            state.scroll_to_item(ix, if last { ScrollStrategy::Bottom } else { ScrollStrategy::Top });
         });
     }
 
@@ -557,17 +445,11 @@ impl Explorer {
             return;
         };
         let delta = rems(if wider { 2. } else { -2. }).to_pixels(window.rem_size());
-        self.panes.update(cx, |state, cx| {
-            state.resize_panel(0, current + delta, window, cx)
-        });
+        self.panes
+            .update(cx, |state, cx| state.resize_panel(0, current + delta, window, cx));
     }
 
-    fn persist_split(
-        &mut self,
-        state: &Entity<ResizableState>,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn persist_split(&mut self, state: &Entity<ResizableState>, window: &Window, cx: &mut Context<Self>) {
         if let Some(width) = state.read(cx).sizes().first() {
             let width = *width / window.rem_size();
             self.topics_width_rem = Some(width);
@@ -578,198 +460,75 @@ impl Explorer {
         }
     }
 
-    fn field(
-        &self,
-        id: &'static str,
-        label: &'static str,
-        input: &Entity<InputState>,
-        field: Option<ConnectionField>,
-        cx: &Context<Self>,
-    ) -> Field {
-        let error = self
-            .field_error
-            .as_ref()
-            .filter(|(which, _)| Some(*which) == field)
-            .map(|(_, message)| message.clone());
-        let danger = cx.theme().danger;
-        Field::new()
-            .label(label)
-            .child(
-                InputGroup::new(SharedString::from(format!("field:{id}")))
-                    .invalid(error.is_some())
-                    .input(Input::new(input).id(id).aria_label(label)),
-            )
-            .when_some(error, |field, error| {
-                field.description_fn(move |_, _| {
-                    div()
-                        .id(SharedString::from(format!("{id}-error")))
-                        .test_support()
-                        .role(Role::Alert)
-                        .aria_label(error.clone())
-                        .text_sm()
-                        .text_color(danger)
-                        .child(error.clone())
-                })
-            })
-    }
-
-    fn connection_form(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let connecting = self.status.is_connecting();
-        let content = div().size_full().v_flex()
-            .child(div().v_flex().min_h_full().items_center().justify_center().p_8()
-                .child(div().v_flex().w_full().max_w(rems(28.)).gap_6()
-                    .child(div().v_flex().gap_2()
-                        .child(div().text_xl().font_semibold().child("Connect to a broker"))
-                        .child(div().text_sm().text_color(cx.theme().muted_foreground).child("Your last successful connection opens automatically next time.")))
-                    .child(Form::new()
-                        .child(self.field("host", "Host", &self.host, Some(ConnectionField::Host), cx))
-                        .child(self.field("port", "Port", &self.port, Some(ConnectionField::Port), cx))
-                        .child(Field::new().label_indent(false).child(
-                            Checkbox::new("tls").label("Use TLS").checked(self.tls).on_change(cx.listener(|view, checked, window, cx| {
-                                view.tls = *checked;
-                                let port = view.port.read(cx).value();
-                                if port == "1883" && *checked || port == "8883" && !checked {
-                                    view.port.update(cx, |input, cx| input.set_value(if *checked { "8883" } else { "1883" }, window, cx));
-                                }
-                                cx.notify();
-                            }))))
-                        .child(self.field("username", "Username", &self.username, Some(ConnectionField::Username), cx))
-                        .child(self.field("password", "Password", &self.password, None, cx))
-                        .footer(div().h_flex().gap_2()
-                            .when(self.active_config.is_some(), |buttons| buttons.child(
-                                Button::new("cancel").label("Cancel").on_click(cx.listener(|view, _, window, cx| view.cancel_connection(window, cx)))))
-                            .child(Button::new("connect").primary().label("Connect").loading(connecting).disabled(connecting)
-                                .on_click(cx.listener(|view, _, window, cx| view.connect_from_form(window, cx))))))
-                    .when_some(self.error.clone(), |form, error| form.child(
-                        div().text_sm().text_color(cx.theme().danger).child(error)))
-                    .when(connecting, |form| form.child(div().h_flex().gap_2().text_sm()
-                        .child(Spinner::new().small()).child("Connecting to broker")))))
-            .overflow_y_scrollbar();
-        div()
-            .id("connection-form")
-            .test_support()
-            .size_full()
-            .child(content)
-    }
-
-    fn theme_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn connection_menu(&self, broker: String, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.weak_entity();
-        Button::new("theme")
+        Button::new("connection-picker")
             .small()
-            .outline()
-            .label("Theme")
+            .ghost()
+            .label(broker)
             .icon(IconName::ChevronDown)
             .dropdown_menu(move |menu, window, cx| {
-                let system_view = view.clone();
-                let mut menu = menu
-                    // PopupMenu sizing takes resolved pixels rather than rems.
-                    .min_w(rems(14.).to_pixels(window.rem_size()))
-                    .max_h(rems(24.).to_pixels(window.rem_size()))
-                    .scrollable(true)
-                    .item(
-                        PopupMenuItem::new("Follow system (Ayu)")
-                            .checked(Appearance::selected(cx).is_none())
+                let mut menu = menu.min_w(rems(15.).to_pixels(window.rem_size()));
+                let Some(view) = view.upgrade() else { return menu };
+                let selected = view.read(cx).saved_connections.selected;
+                let connections: Vec<_> = view
+                    .read(cx)
+                    .saved_connections
+                    .connections
+                    .iter()
+                    .enumerate()
+                    .map(|(index, config)| (index, connection_label(config)))
+                    .collect();
+                if connections.is_empty() {
+                    menu = menu.label("No saved connections");
+                }
+                for (index, label) in connections {
+                    let view = view.downgrade();
+                    menu = menu.item(
+                        PopupMenuItem::new(label)
+                            .checked(selected == Some(index))
                             .on_click(move |_, window, cx| {
-                                _ = system_view
-                                    .update(cx, |view, cx| view.select_theme(None, window, cx));
+                                _ = view.update(cx, |view, cx| view.select_connection(index, window, cx));
                             }),
                     );
-                for dark in [false, true] {
-                    menu =
-                        menu.separator()
-                            .label(if dark { "Dark themes" } else { "Light themes" });
-                    for theme in ThemeRegistry::global(cx).sorted_themes() {
-                        if theme.mode.is_dark() != dark {
-                            continue;
-                        }
-                        let name = theme.name.clone();
-                        let selected = Appearance::selected(cx) == Some(name.as_str());
-                        let view = view.clone();
-                        menu =
-                            menu.item(PopupMenuItem::new(name.clone()).checked(selected).on_click(
-                                move |_, window, cx| {
-                                    _ = view.update(cx, |view, cx| {
-                                        view.select_theme(Some(name.clone()), window, cx)
-                                    });
-                                },
-                            ));
-                    }
                 }
                 menu
             })
     }
 
-    fn select_theme(
-        &mut self,
-        name: Option<SharedString>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if let Err(error) = appearance::select(name, window, cx) {
-            self.error = Some(format!("{error:#}"));
-        }
-        cx.notify();
-    }
-
     fn header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let broker = self
-            .active_config
-            .as_ref()
-            .map(|config| format!("{}:{}", config.host, config.port))
-            .unwrap_or_default();
-        div()
-            .id("toolbar")
-            .test_support()
-            .h_flex()
-            .flex_none()
-            .h_12()
-            .px_4()
-            .gap_3()
-            .min_w_0()
-            .border_b_1()
-            .border_color(cx.theme().border)
-            .child(div().flex_none().font_semibold().child("MQTT UI"))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(broker),
-            )
-            .child(self.theme_menu(cx))
-            .when(self.connection.is_some(), |header| {
-                header.child(
-                    Button::new("disconnect")
+            .saved_connections
+            .selected
+            .and_then(|index| self.saved_connections.connections.get(index))
+            .map(connection_label)
+            .unwrap_or_else(|| "Choose a connection".into());
+        TitleBar::new().child(
+            div()
+                .id("toolbar")
+                .test_support()
+                .h_flex()
+                .h_full()
+                .w_full()
+                .pr_2()
+                .gap_2()
+                .min_w_0()
+                .child(div().flex_1())
+                .child(self.connection_menu(broker, cx))
+                .child(
+                    Button::new("settings")
                         .small()
-                        .label("Disconnect")
-                        .on_click(cx.listener(|view, _, _, cx| view.disconnect(cx))),
-                )
-            })
-            .when(self.connection.is_none(), |header| {
-                header.child(
-                    Button::new("reconnect")
-                        .small()
-                        .label("Reconnect")
-                        .on_click(cx.listener(|view, _, window, cx| {
-                            if let Some(config) = view.active_config.clone() {
-                                view.start_connection(config, window, cx);
-                            }
-                        })),
-                )
-            })
-            .child(
-                Button::new("settings")
-                    .small()
-                    .outline()
-                    .label("Connection…")
-                    .tooltip(if cfg!(target_os = "macos") {
-                        "Connection settings (Cmd+,)"
-                    } else {
-                        "Connection settings (Ctrl+,)"
-                    })
-                    .on_click(cx.listener(|view, _, window, cx| view.open_connection(window, cx))),
-            )
+                        .ghost()
+                        .icon(IconName::Settings)
+                        .accessibility_label("Settings")
+                        .tooltip(if cfg!(target_os = "macos") {
+                            "Settings (Cmd+,)"
+                        } else {
+                            "Settings (Ctrl+,)"
+                        })
+                        .on_click(cx.listener(|view, _, window, cx| view.open_connection(window, cx))),
+                ),
+        )
     }
 
     fn topic_row(&self, entry: &TreeEntry, cx: &App) -> ListItem {
@@ -802,15 +561,11 @@ impl Explorer {
             } else {
                 path.to_owned()
             })
-            .h_7()
+            .h_6()
             .text_sm()
-            .text_color(
-                cx.theme()
-                    .foreground
-                    .blend(cx.theme().warning.opacity(highlight)),
-            )
+            .text_color(cx.theme().foreground.blend(cx.theme().warning.opacity(highlight)))
             .rounded(cx.theme().radius_tokens().sm)
-            .pl(rems(0.75 + entry.depth() as f32))
+            .pl(rems(0.625 + entry.depth() as f32 * 0.875))
             .on_mouse_down(MouseButton::Left, move |_, window, cx| {
                 state.update(cx, |state, cx| state.focus(window, cx))
             })
@@ -887,7 +642,7 @@ impl Explorer {
                                 .child(if self.status.is_connected() {
                                     "Topics appear as the broker sends messages."
                                 } else {
-                                    "Use Connection… to check the broker settings."
+                                    "Use Settings to check the broker settings."
                                 }),
                         ),
                 )
@@ -899,37 +654,28 @@ impl Explorer {
                         .min_h_0()
                         .border_1()
                         .border_color(cx.theme().sidebar)
-                        .child(Tree::new(
-                            &self.tree_state,
-                            move |_, entry, _, window, cx| {
-                                let Some(view) = view.upgrade() else {
-                                    return ListItem::new("closed-topic");
-                                };
-                                let view = view.read(cx);
-                                if !cx.reduce_motion()
-                                    && view
-                                        .topics
-                                        .nodes
-                                        .get(entry.item().id.as_str())
-                                        .is_some_and(|node| node.flashing(Instant::now()))
-                                {
-                                    window.request_animation_frame();
-                                }
-                                view.topic_row(entry, cx)
-                            },
-                        )),
+                        .child(Tree::new(&self.tree_state, move |_, entry, _, window, cx| {
+                            let Some(view) = view.upgrade() else {
+                                return ListItem::new("closed-topic");
+                            };
+                            let view = view.read(cx);
+                            if !cx.reduce_motion()
+                                && view
+                                    .topics
+                                    .nodes
+                                    .get(entry.item().id.as_str())
+                                    .is_some_and(|node| node.flashing(Instant::now()))
+                            {
+                                window.request_animation_frame();
+                            }
+                            view.topic_row(entry, cx)
+                        })),
                 )
             })
     }
 
     fn details(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut panel = div()
-            .id("details-pane")
-            .test_support()
-            .v_flex()
-            .size_full()
-            .min_h_0()
-            .min_w_0();
+        let mut panel = div().id("details-pane").test_support().v_flex().size_full().min_h_0().min_w_0();
         let Some(path) = &self.selected else {
             return panel.p_6().justify_center().items_center().child(
                 div()
@@ -961,29 +707,20 @@ impl Explorer {
                         .small()
                         .icon(IconName::Copy)
                         .accessibility_label("Copy topic name")
-                        .on_click(move |_, _, cx| {
-                            cx.write_to_clipboard(ClipboardItem::new_string(copy_path.clone()))
-                        }),
+                        .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(copy_path.clone()))),
                 ),
         );
-        let mut content = div()
-            .v_flex()
-            .p_4()
-            .gap_4()
-            .flex_1()
-            .min_h_0()
-            .min_w_0()
-            .child(
-                Input::new(&self.topic_name)
-                    .id("selected-topic")
-                    .aria_label("Selected topic")
-                    .readonly(true)
-                    .font_family("monospace")
-                    // Keep the full text line inside the input's padding and border.
-                    .h_auto()
-                    .flex_none()
-                    .w_full(),
-            );
+        let mut content = div().v_flex().p_4().gap_4().flex_1().min_h_0().min_w_0().child(
+            Input::new(&self.topic_name)
+                .id("selected-topic")
+                .aria_label("Selected topic")
+                .readonly(true)
+                .font_family("monospace")
+                // Keep the full text line inside the input's padding and border.
+                .h_auto()
+                .flex_none()
+                .w_full(),
+        );
         if let Some(value) = &node.value {
             content = content
                 .child(
@@ -1002,33 +739,20 @@ impl Explorer {
                                 .child(Tag::secondary().small().child(format!(
                                     "{} {}",
                                     value.payload.len(),
-                                    if value.payload.len() == 1 {
-                                        "byte"
-                                    } else {
-                                        "bytes"
-                                    }
+                                    if value.payload.len() == 1 { "byte" } else { "bytes" }
                                 )))
                                 .child(Tag::secondary().small().child(format!(
                                     "{} {}",
                                     value.messages,
-                                    if value.messages == 1 {
-                                        "message"
-                                    } else {
-                                        "messages"
-                                    }
+                                    if value.messages == 1 { "message" } else { "messages" }
                                 )))
-                                .when(value.retained, |meta| {
-                                    meta.child(Tag::secondary().small().child("Retained"))
-                                }),
+                                .when(value.retained, |meta| meta.child(Tag::secondary().small().child("Retained"))),
                         )
                         .child(
                             div()
                                 .text_xs()
                                 .text_color(cx.theme().muted_foreground)
-                                .child(format!(
-                                    "Received {}",
-                                    value.received_at.format("%Y-%m-%d %H:%M:%S%.3f")
-                                )),
+                                .child(format!("Received {}", value.received_at.format("%Y-%m-%d %H:%M:%S%.3f"))),
                         ),
                 )
                 .child(
@@ -1058,29 +782,17 @@ impl Explorer {
                         ),
                 )
                 .child(
-                    div()
-                        .id("payload")
-                        .test_support()
-                        .flex_1()
-                        .min_h_0()
-                        .min_w_0()
-                        .w_full()
-                        .child(
-                            Editor::new(&self.payload)
-                                .readonly(true)
-                                .h(relative(1.))
-                                .w_full()
-                                .text_sm()
-                                .aria_label("Latest topic payload"),
-                        ),
+                    div().id("payload").test_support().flex_1().min_h_0().min_w_0().w_full().child(
+                        Editor::new(&self.payload)
+                            .readonly(true)
+                            .h(relative(1.))
+                            .w_full()
+                            .text_sm()
+                            .aria_label("Latest topic payload"),
+                    ),
                 )
                 .when(value.payload.is_empty(), |content| {
-                    content.child(
-                        div()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child("Empty payload"),
-                    )
+                    content.child(div().text_sm().text_color(cx.theme().muted_foreground).child("Empty payload"))
                 });
         } else {
             content = content
@@ -1088,10 +800,7 @@ impl Explorer {
                     div()
                         .text_sm()
                         .text_color(cx.theme().muted_foreground)
-                        .child(format!(
-                            "{} in this branch",
-                            topic_summary(node.topics, node.messages)
-                        )),
+                        .child(format!("{} in this branch", topic_summary(node.topics, node.messages))),
                 )
                 .child("No message received on this exact topic.");
         }
@@ -1102,11 +811,7 @@ impl Explorer {
         // The resize API takes resolved pixels; derive all pane constraints from rem.
         let rem = window.rem_size();
         let width = self.topics_width_rem.unwrap_or(24.).clamp(15., 50.);
-        let status = self
-            .error
-            .as_deref()
-            .unwrap_or_else(|| self.status.label())
-            .to_owned();
+        let status = self.error.as_deref().unwrap_or_else(|| self.status.label()).to_owned();
         div()
             .v_flex()
             .size_full()
@@ -1145,9 +850,7 @@ impl Explorer {
                     .min_w_0()
                     .border_t_1()
                     .border_color(cx.theme().border)
-                    .when(self.status.is_connecting(), |bar| {
-                        bar.child(Spinner::new().small())
-                    })
+                    .when(self.status.is_connecting(), |bar| bar.child(Spinner::new().small()))
                     .when(!self.status.is_connecting(), |bar| {
                         bar.child(
                             div()
@@ -1162,17 +865,8 @@ impl Explorer {
                         )
                     })
                     .child(div().flex_1().min_w_0().child(status))
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_color(cx.theme().muted_foreground)
-                            .child("Readonly"),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .child(topic_summary(self.topics.topics, self.topics.messages)),
-                    ),
+                    .child(div().flex_none().text_color(cx.theme().muted_foreground).child("Readonly"))
+                    .child(div().flex_none().child(topic_summary(self.topics.topics, self.topics.messages))),
             )
     }
 }
@@ -1184,54 +878,19 @@ impl Render for Explorer {
             .test_support()
             .key_context("Explorer")
             .track_focus(&self.focus)
-            .on_action(
-                cx.listener(|view, _: &OpenConnection, window, cx| {
-                    view.open_connection(window, cx)
-                }),
-            )
-            .on_action(cx.listener(|view, _: &CancelConnection, window, cx| {
-                view.cancel_connection(window, cx)
-            }))
-            .on_action(
-                cx.listener(|view, _: &FocusTopics, window, cx| view.focus_topics(window, cx)),
-            )
+            .on_action(cx.listener(|view, _: &OpenConnection, window, cx| view.open_connection(window, cx)))
+            .on_action(cx.listener(|view, _: &CancelConnection, window, cx| view.cancel_connection(window, cx)))
+            .on_action(cx.listener(|view, _: &FocusTopics, window, cx| view.focus_topics(window, cx)))
             .on_action(cx.listener(|view, _: &FirstTopic, _, cx| view.select_boundary(false, cx)))
             .on_action(cx.listener(|view, _: &LastTopic, _, cx| view.select_boundary(true, cx)))
-            .on_action(cx.listener(|view, _: &NarrowTopics, window, cx| {
-                view.resize_topics(false, window, cx)
-            }))
-            .on_action(
-                cx.listener(|view, _: &WidenTopics, window, cx| {
-                    view.resize_topics(true, window, cx)
-                }),
-            )
+            .on_action(cx.listener(|view, _: &NarrowTopics, window, cx| view.resize_topics(false, window, cx)))
+            .on_action(cx.listener(|view, _: &WidenTopics, window, cx| view.resize_topics(true, window, cx)))
             .size_full()
             .text_sm()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
-            .child(if self.show_config {
-                div()
-                    .v_flex()
-                    .size_full()
-                    .when(self.active_config.is_none(), |screen| {
-                        screen.child(
-                            div()
-                                .h_flex()
-                                .h_12()
-                                .flex_none()
-                                .px_4()
-                                .justify_end()
-                                .child(self.theme_menu(cx)),
-                        )
-                    })
-                    .when(self.active_config.is_some(), |screen| {
-                        screen.child(self.header(cx))
-                    })
-                    .child(div().flex_1().min_h_0().child(self.connection_form(cx)))
-                    .into_any_element()
-            } else {
-                self.explorer(window, cx).into_any_element()
-            })
+            .child(self.explorer(window, cx))
+            .when(self.show_config, |root| root.child(self.settings_dialog(cx)))
     }
 }
 
