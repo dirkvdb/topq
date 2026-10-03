@@ -1036,6 +1036,9 @@ impl Explorer {
     }
 
     pub(super) fn settings_dialog(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut search_header = div().hidden();
+        let search_header_style = search_header.style().clone();
+
         div()
             .id("settings-dialog")
             .test_support()
@@ -1080,7 +1083,8 @@ impl Explorer {
                     .child(
                         div().flex_1().min_h_0().child(
                             Settings::new(SharedString::from(format!("settings-pages:{}", self.settings_generation)))
-                                .pages([self.connections_page(cx), self.appearance_page(cx)]),
+                                .pages([self.connections_page(cx), self.appearance_page(cx)])
+                                .header_style(&search_header_style),
                         ),
                     ),
             )
