@@ -66,6 +66,38 @@ fn message(topic: &str) -> Message {
 }
 
 #[gpui_kit::test]
+fn status_bar_stays_compact_across_connection_states_and_text_sizes(cx: &mut TestAppContext) {
+    for font_size in [16., 20.] {
+        let (handle, view) = open(cx, false, 760., 540.);
+        cx.update(|cx| Theme::update(cx, |theme| theme.font_size = px(font_size)));
+        for status in [
+            ConnectionStatus::Disconnected,
+            ConnectionStatus::Connecting,
+            ConnectionStatus::Connected,
+            ConnectionStatus::Failed("Could not connect to broker".into()),
+        ] {
+            view.update(cx, |view, cx| {
+                view.status = status;
+                cx.notify();
+            });
+            cx.update_window(handle, |_, window, cx| {
+                window.render_frame(cx);
+                let bar = window.find("status");
+                assert!(bar.visible());
+                assert_eq!(bar.label(), Some(view.read(cx).status.label()));
+                let height = bar.bounds().size.height;
+                let compact_height = window.rem_size() * 1.5;
+                assert!(
+                    height >= compact_height && height <= compact_height + px(1.),
+                    "status bar should retain its compact height: {height:?}"
+                );
+            })
+            .unwrap();
+        }
+    }
+}
+
+#[gpui_kit::test]
 fn theme_selector_stays_compact_in_appearance_settings(cx: &mut TestAppContext) {
     let (handle, _) = open(cx, true, 760., 540.);
     cx.update_window(handle, |_, window, cx| {
