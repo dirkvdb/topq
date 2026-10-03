@@ -5,25 +5,27 @@ use std::{
     time::{Duration, Instant},
 };
 
+use gpui_kit::assets::IconName as AssetIconName;
 use gpui_kit::component::{
-    ActiveTheme, Icon, IconName, Sizable, StyledExt, TitleBar,
+    ActiveTheme, Disableable, Icon, IconName, IndexPath, Sizable, StyledExt, TitleBar,
     button::{Button, ButtonVariants},
-    input::{Editor, EditorState, Input, InputEvent, InputState},
+    input::{Editor, EditorState, InputEvent, InputState},
     list::ListItem,
     menu::{DropdownMenu, PopupMenuItem},
     resizable::{ResizablePanelEvent, ResizableState, h_resizable, resizable_panel},
+    select::SelectState,
     spinner::Spinner,
     tag::Tag,
     tree::{Tree, TreeEntry, TreeEvent, TreeItem, TreeState},
 };
 use gpui_kit::{
-    App, ClipboardItem, Context, Entity, FocusHandle, IntoElement, KeyBinding, MouseButton, Render, Role, ScrollStrategy, SharedString,
-    Subscription, Task, TestSupportExt, Window, div, prelude::*, relative, rems,
+    App, ClipboardItem, Context, Entity, FocusHandle, IntoElement, KeyBinding, MouseButton, PromptButton, PromptLevel, Render, Role,
+    ScrollStrategy, SharedString, Subscription, Task, TestSupportExt, Window, div, prelude::*, relative, rems,
 };
 
 use crate::{
     appearance::{self, Appearance},
-    config::{self, ConnectionConfig, ConnectionField, SavedConnections},
+    config::{self, ConnectionConfig, ConnectionField, SavedConnections, TopicSubscription},
     mqtt::{self, BrokerEvent, Connection},
     topics::{FLASH_DURATION, TopicStore},
 };
@@ -107,6 +109,12 @@ pub struct Explorer {
     name: Entity<InputState>,
     host: Entity<InputState>,
     port: Entity<InputState>,
+    topic_input: Entity<InputState>,
+    topic_qos: Entity<SelectState<Vec<&'static str>>>,
+    subscription_topics: Vec<TopicSubscription>,
+    topics_open: bool,
+    topic_editor_open: bool,
+    topic_editor_restore_focus: Option<FocusHandle>,
     username: Entity<InputState>,
     password: Entity<InputState>,
     tls: bool,
@@ -123,11 +131,12 @@ pub struct Explorer {
     tree_state: Entity<TreeState>,
     expanded: BTreeSet<String>,
     selected: Option<String>,
-    topic_name: Entity<InputState>,
     payload: Entity<EditorState>,
     payload_format: &'static str,
     panes: Entity<ResizableState>,
     topics_width_rem: Option<f32>,
+    topics_width_fraction: Option<f32>,
+    restore_topics_width: bool,
     focus: FocusHandle,
     restore_focus: Option<FocusHandle>,
     settings_generation: u64,
@@ -142,8 +151,8 @@ impl Explorer {
             Ok(connections) => (connections, None),
             Err(error) => (SavedConnections::default(), Some(format!("{error:#}"))),
         };
-        let width = config::load_topics_width().unwrap_or_default();
-        Self::with_connections(saved_connections, error, width, window, cx)
+        let layout = config::load_topics_layout().unwrap_or_default();
+        Self::with_connections(saved_connections, error, layout.width_rem, layout.width_fraction, window, cx)
     }
 
     #[cfg(test)]
@@ -162,6 +171,7 @@ impl Explorer {
             },
             error,
             width,
+            None,
             window,
             cx,
         )
@@ -171,6 +181,7 @@ impl Explorer {
         saved_connections: SavedConnections,
         error: Option<String>,
         width: Option<f32>,
+        width_fraction: Option<f32>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -185,6 +196,8 @@ impl Explorer {
         let name = cx.new(|cx| InputState::new(window, cx).placeholder("e.g. Home").default_value(initial.name));
         let host = cx.new(|cx| InputState::new(window, cx).default_value(initial.host));
         let port = cx.new(|cx| InputState::new(window, cx).default_value(initial.port.to_string()));
+        let topic_input = cx.new(|cx| InputState::new(window, cx).placeholder("e.g. home/#"));
+        let topic_qos = cx.new(|cx| SelectState::new(vec!["0", "1", "2"], Some(IndexPath::default()), window, cx));
         let username = cx.new(|cx| InputState::new(window, cx).placeholder("Optional").default_value(initial.username));
         let password = cx.new(|cx| {
             InputState::new(window, cx)
@@ -192,7 +205,6 @@ impl Explorer {
                 .default_value(initial.password)
                 .masked(true)
         });
-        let topic_name = cx.new(|cx| InputState::new(window, cx));
         let payload = cx.new(|cx| {
             EditorState::new(window, cx)
                 .language("plaintext")
@@ -222,6 +234,17 @@ impl Explorer {
                 })
             })
             .collect();
+        subscriptions.push(cx.subscribe_in(&topic_input, window, |view, input, event, window, cx| match event {
+            InputEvent::Focus if view.topic_editor_open && window.last_input_was_keyboard() => {
+                input.update(cx, |input, cx| input.select_all(window, cx));
+            }
+            InputEvent::PressEnter { .. } if view.topic_editor_open => view.add_topic_from_form(window, cx),
+            InputEvent::Change if matches!(view.field_error, Some((ConnectionField::Topics, _))) => {
+                view.field_error = None;
+                cx.notify();
+            }
+            _ => {}
+        }));
         subscriptions.push(cx.subscribe_in(&tree_state, window, |view, _, event, _, _| match event {
             TreeEvent::Expanded(path) => {
                 view.expanded.insert(path.to_string());
@@ -256,13 +279,20 @@ impl Explorer {
             name,
             host,
             port,
+            topic_input,
+            topic_qos,
+            subscription_topics: initial.topics,
+            topics_open: true,
+            topic_editor_open: false,
+            topic_editor_restore_focus: None,
             username,
             password,
-            topic_name,
             payload,
             payload_format: "Text",
             tree_state,
             panes,
+            topics_width_fraction: width_fraction,
+            restore_topics_width: width.is_some() || width_fraction.is_some(),
             tls: initial.tls,
             show_config: saved_config.is_none(),
             active_config: None,
@@ -347,6 +377,7 @@ impl Explorer {
                     self.status = ConnectionStatus::Connected;
                 }
                 BrokerEvent::Status(status) => self.status = ConnectionStatus::Failed(status),
+                BrokerEvent::OperationError(error) => self.error = Some(format!("Could not clear retained topics: {error}")),
                 BrokerEvent::Message(message) => {
                     payload_changed |= self.selected.as_ref() == Some(&message.topic);
                     tree_changed |= self.topics.receive(message, now);
@@ -400,8 +431,6 @@ impl Explorer {
     }
 
     fn refresh_details(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let topic = self.selected.clone().unwrap_or_default();
-        self.topic_name.update(cx, |input, cx| input.set_value(topic, window, cx));
         let value = self
             .selected
             .as_ref()
@@ -416,6 +445,93 @@ impl Explorer {
             }
             input.set_value(value, window, cx);
         });
+    }
+
+    fn select_topic(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.topics.nodes.contains_key(path) {
+            return;
+        }
+        for (index, _) in path.match_indices('/') {
+            self.expanded.insert(path[..index].to_owned());
+        }
+        self.selected = Some(path.to_owned());
+        self.sync_tree(cx);
+        self.tree_state.update(cx, |state, cx| {
+            if let Some(index) = state.index_of(&SharedString::from(path.to_owned())) {
+                state.scroll_to_item(index, ScrollStrategy::Top);
+            }
+            state.focus(window, cx);
+        });
+        self.refresh_details(window, cx);
+        cx.notify();
+    }
+
+    fn confirm_clear_topic(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.selected.clone() else {
+            return;
+        };
+        let Some(session) = self.connection.as_ref().and_then(Connection::retained_clear_session) else {
+            self.error = Some("Connect to the broker before clearing retained topics.".into());
+            cx.notify();
+            return;
+        };
+        self.confirm_clear_topic_with_send(path, window, cx, move |view, topics| {
+            let connection = view
+                .connection
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("The broker connection has closed."))?;
+            connection.clear_retained_in_session(topics, &session)
+        });
+    }
+
+    fn confirm_clear_topic_with_send(
+        &mut self,
+        path: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        send: impl FnOnce(&Self, Vec<String>) -> anyhow::Result<()> + 'static,
+    ) {
+        if !self.status.is_connected() {
+            return;
+        }
+        // Freeze the exact scope shown in the warning; new topics need a new confirmation.
+        let topics = self.topics.branch_paths(&path);
+        if topics.is_empty() {
+            return;
+        }
+        let children = topics.len() - usize::from(!path.is_empty());
+        let scope = if path.is_empty() {
+            format!("the {children} known topics under the empty topic level")
+        } else {
+            format!(
+                "\"{path}\" and {children} known child {}",
+                if children == 1 { "topic" } else { "topics" }
+            )
+        };
+        let detail = format!(
+            "Do you want to clear {scope}?\n\nThis will send an empty payload (QoS 0, retain) to each exact topic name in this branch, clearing retained messages on the broker. This cannot be undone and may affect other subscribers. Only use this function if you know what you are doing.\n\nOnly the topics known now are included. Live publishers may recreate them."
+        );
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            "Confirm delete",
+            Some(&detail),
+            &[PromptButton::cancel("Cancel"), PromptButton::new("Delete")],
+            cx,
+        );
+        cx.spawn_in(window, async move |view, cx| {
+            if answer.await == Ok(1) {
+                _ = view.update_in(cx, |view, _, cx| {
+                    let result = if view.status.is_connected() {
+                        send(view, topics)
+                    } else {
+                        Err(anyhow::anyhow!("The broker disconnected. Confirm again while connected."))
+                    };
+                    view.error = result.err().map(|error| format!("Could not clear retained topics: {error:#}"));
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
     }
 
     fn focus_topics(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -450,14 +566,20 @@ impl Explorer {
     }
 
     fn persist_split(&mut self, state: &Entity<ResizableState>, window: &Window, cx: &mut Context<Self>) {
-        if let Some(width) = state.read(cx).sizes().first() {
-            let width = *width / window.rem_size();
-            self.topics_width_rem = Some(width);
-            if let Err(error) = config::save_topics_width(width) {
-                self.error = Some(format!("Could not save the pane layout: {error:#}"));
-            }
-            cx.notify();
+        let state = state.read(cx);
+        let Some(width) = state.sizes().first() else { return };
+        let container_size = state.container_size();
+        if container_size.as_f32() <= 0. {
+            return;
         }
+        let width_rem = *width / window.rem_size();
+        let width_fraction = (*width / container_size).clamp(0., 1.);
+        self.topics_width_rem = Some(width_rem);
+        self.topics_width_fraction = Some(width_fraction);
+        if let Err(error) = config::save_topics_width(width_rem, width_fraction) {
+            self.error = Some(format!("Could not save the pane layout: {error:#}"));
+        }
+        cx.notify();
     }
 
     fn connection_menu(&self, broker: String, cx: &mut Context<Self>) -> impl IntoElement {
@@ -466,7 +588,7 @@ impl Explorer {
             .small()
             .ghost()
             .label(broker)
-            .icon(IconName::ChevronDown)
+            .dropdown_caret(true)
             .dropdown_menu(move |menu, window, cx| {
                 let mut menu = menu.min_w(rems(15.).to_pixels(window.rem_size()));
                 let Some(view) = view.upgrade() else { return menu };
@@ -689,6 +811,39 @@ impl Explorer {
         let Some(node) = self.topics.nodes.get(path) else {
             return panel;
         };
+        let mut breadcrumbs = div()
+            .id("selected-topic")
+            .test_support()
+            .aria_label(path.clone())
+            .h_flex()
+            .flex_1()
+            .min_w_0()
+            .gap_2()
+            .overflow_x_scroll();
+        let mut end = 0;
+        for (index, level) in path.split('/').enumerate() {
+            if index > 0 {
+                end += 1;
+                breadcrumbs = breadcrumbs.child(div().flex_none().text_color(cx.theme().muted_foreground).child("/"));
+            }
+            end += level.len();
+            let prefix = path[..end].to_owned();
+            breadcrumbs = breadcrumbs.child(
+                Button::new(SharedString::from(format!("topic-segment:{index}")))
+                    .link()
+                    .small()
+                    .flex_none()
+                    .font_medium()
+                    .label(if level.is_empty() { "(empty level)" } else { level }.to_owned())
+                    .accessibility_label(format!("Navigate to topic {prefix}"))
+                    .tooltip(if prefix.is_empty() {
+                        "(empty level)".to_owned()
+                    } else {
+                        prefix.clone()
+                    })
+                    .on_click(cx.listener(move |view, _, window, cx| view.select_topic(&prefix, window, cx))),
+            );
+        }
         let copy_path = path.clone();
         panel = panel.child(
             div()
@@ -700,9 +855,23 @@ impl Explorer {
                 .px_4()
                 .border_b_1()
                 .border_color(cx.theme().border)
-                .child(div().flex_1().font_medium().child("Topic"))
+                .gap_3()
+                .min_w_0()
+                .child(breadcrumbs)
+                .child(
+                    Button::new("delete-topic")
+                        .flex_none()
+                        .ghost()
+                        .small()
+                        .icon(AssetIconName::Trash)
+                        .accessibility_label("Delete topic and subtopics")
+                        .tooltip("Clear retained topic and subtopics")
+                        .disabled(!self.status.is_connected() || self.connection.is_none())
+                        .on_click(cx.listener(|view, _, window, cx| view.confirm_clear_topic(window, cx))),
+                )
                 .child(
                     Button::new("copy-topic")
+                        .flex_none()
                         .ghost()
                         .small()
                         .icon(IconName::Copy)
@@ -710,17 +879,7 @@ impl Explorer {
                         .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(copy_path.clone()))),
                 ),
         );
-        let mut content = div().v_flex().p_4().gap_4().flex_1().min_h_0().min_w_0().child(
-            Input::new(&self.topic_name)
-                .id("selected-topic")
-                .aria_label("Selected topic")
-                .readonly(true)
-                .font_family("monospace")
-                // Keep the full text line inside the input's padding and border.
-                .h_auto()
-                .flex_none()
-                .w_full(),
-        );
+        let mut content = div().v_flex().p_4().gap_4().flex_1().min_h_0().min_w_0();
         if let Some(value) = &node.value {
             content = content
                 .child(
@@ -873,6 +1032,24 @@ impl Explorer {
 
 impl Render for Explorer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.restore_topics_width {
+            self.restore_topics_width = false;
+            let width_rem = self.topics_width_rem.unwrap_or(24.).clamp(15., 50.);
+            let width_fraction = self.topics_width_fraction;
+            let view = cx.weak_entity();
+            window.on_next_frame(move |window, cx| {
+                if let Some(view) = view.upgrade() {
+                    let _ = view.update(cx, |view, cx| {
+                        view.panes.update(cx, |state, cx| {
+                            let width = width_fraction
+                                .map(|fraction| state.container_size() * fraction)
+                                .unwrap_or_else(|| rems(width_rem).to_pixels(window.rem_size()));
+                            state.resize_panel(0, width, window, cx);
+                        });
+                    });
+                }
+            });
+        }
         div()
             .id("explorer")
             .test_support()

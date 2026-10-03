@@ -51,11 +51,7 @@ impl TopicValue {
 
     pub fn preview(&self) -> String {
         match std::str::from_utf8(&self.payload) {
-            Ok(text) => text
-                .chars()
-                .take(100)
-                .map(|ch| if ch.is_control() { ' ' } else { ch })
-                .collect(),
+            Ok(text) => text.chars().take(100).map(|ch| if ch.is_control() { ' ' } else { ch }).collect(),
             Err(_) => format!("<{} binary bytes>", self.payload.len()),
         }
     }
@@ -81,8 +77,7 @@ pub struct TopicNode {
 
 impl TopicNode {
     pub fn flashing(&self, now: Instant) -> bool {
-        self.updated
-            .is_some_and(|updated| now.duration_since(updated) < FLASH_DURATION)
+        self.updated.is_some_and(|updated| now.duration_since(updated) < FLASH_DURATION)
     }
 
     pub fn flash_amount(&self, now: Instant) -> f32 {
@@ -95,14 +90,9 @@ impl TopicNode {
             progress * progress * (3. - 2. * progress)
         };
         if elapsed < FLASH_FADE_IN {
-            self.flash_from
-                + (1. - self.flash_from)
-                    * smooth(elapsed.as_secs_f32() / FLASH_FADE_IN.as_secs_f32())
+            self.flash_from + (1. - self.flash_from) * smooth(elapsed.as_secs_f32() / FLASH_FADE_IN.as_secs_f32())
         } else {
-            1. - smooth(
-                (elapsed - FLASH_FADE_IN).as_secs_f32()
-                    / (FLASH_DURATION - FLASH_FADE_IN).as_secs_f32(),
-            )
+            1. - smooth((elapsed - FLASH_FADE_IN).as_secs_f32() / (FLASH_DURATION - FLASH_FADE_IN).as_secs_f32())
         }
     }
 }
@@ -120,15 +110,9 @@ impl TopicStore {
     ///
     /// Empty levels are preserved: `a`, `a/`, `/a` and `a//b` are distinct MQTT topics.
     pub fn receive(&mut self, message: Message, now: Instant) -> bool {
-        let new_topic = self
-            .nodes
-            .get(&message.topic)
-            .is_none_or(|node| node.value.is_none());
+        let new_topic = self.nodes.get(&message.topic).is_none_or(|node| node.value.is_none());
         let mut new_nodes = false;
-        let root = message
-            .topic
-            .split_once('/')
-            .map_or(message.topic.as_str(), |(root, _)| root);
+        let root = message.topic.split_once('/').map_or(message.topic.as_str(), |(root, _)| root);
         self.roots.insert(root.to_owned());
         let mut ends = message
             .topic
@@ -164,6 +148,24 @@ impl TopicStore {
         new_nodes
     }
 
+    /// Exact publishable names in a branch, including intermediate levels but not the empty root.
+    pub fn branch_paths(&self, path: &str) -> Vec<String> {
+        if !self.nodes.contains_key(path) {
+            return Vec::new();
+        }
+        self.nodes
+            .range(path.to_owned()..)
+            .take_while(|(candidate, _)| candidate.starts_with(path))
+            .filter(|(candidate, _)| {
+                !candidate.is_empty()
+                    && candidate
+                        .strip_prefix(path)
+                        .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('/'))
+            })
+            .map(|(candidate, _)| candidate.clone())
+            .collect()
+    }
+
     pub fn visible_paths(&self, expanded: &BTreeSet<String>) -> Vec<&str> {
         let mut paths = Vec::new();
         let mut stack: Vec<_> = self.roots.iter().rev().collect();
@@ -192,6 +194,26 @@ mod tests {
     }
 
     #[test]
+    fn branch_paths_include_exact_topic_and_descendants_but_not_similar_prefixes() {
+        let mut store = TopicStore::default();
+        for topic in ["a", "a/", "a//測定値", "a/b/c", "ab/x", "a-b/x", "z"] {
+            store.receive(message(topic, b"value"), Instant::now());
+        }
+        assert_eq!(store.branch_paths("a"), ["a", "a/", "a//測定値", "a/b", "a/b/c"]);
+        assert_eq!(store.branch_paths("a/"), ["a/", "a//測定値"]);
+        assert!(store.branch_paths("missing").is_empty());
+    }
+
+    #[test]
+    fn branch_paths_preserve_leading_empty_levels_without_publishing_an_empty_name() {
+        let mut store = TopicStore::default();
+        for topic in ["/a", "//b", "a"] {
+            store.receive(message(topic, b"value"), Instant::now());
+        }
+        assert_eq!(store.branch_paths(""), ["/", "//b", "/a"]);
+    }
+
+    #[test]
     fn aggregates_updates_without_double_counting_topics() {
         let mut store = TopicStore::default();
         let now = Instant::now();
@@ -199,10 +221,7 @@ mod tests {
         store.receive(message("home/temperature", b"21"), now);
         store.receive(message("home", b"online"), now);
         assert_eq!((store.topics, store.messages), (2, 3));
-        assert_eq!(
-            (store.nodes["home"].topics, store.nodes["home"].messages),
-            (2, 3)
-        );
+        assert_eq!((store.nodes["home"].topics, store.nodes["home"].messages), (2, 3));
         let value = store.nodes["home/temperature"].value.as_ref().unwrap();
         assert_eq!(value.payload.as_ref(), b"21");
         assert_eq!(value.messages, 2);
@@ -234,14 +253,7 @@ mod tests {
         ] {
             let mut store = TopicStore::default();
             store.receive(message("test", payload), Instant::now());
-            assert_eq!(
-                store.nodes["test"]
-                    .value
-                    .as_ref()
-                    .unwrap()
-                    .display_payload(),
-                expected
-            );
+            assert_eq!(store.nodes["test"].value.as_ref().unwrap().display_payload(), expected);
         }
     }
 
@@ -250,11 +262,7 @@ mod tests {
         let mut store = TopicStore::default();
         store.receive(message("test", &[0xff; 17]), Instant::now());
         assert_eq!(
-            store.nodes["test"]
-                .value
-                .as_ref()
-                .unwrap()
-                .display_payload(),
+            store.nodes["test"].value.as_ref().unwrap().display_payload(),
             "ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff\nff"
         );
     }

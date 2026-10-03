@@ -3,21 +3,97 @@
 use super::{ConnectionStatus, Explorer, connection_label};
 use crate::{
     appearance::{self, Appearance},
-    config::{self, ConnectionConfig, ConnectionField, SavedConnections},
+    config::{self, ConnectionConfig, ConnectionField, SavedConnections, TopicSubscription},
 };
 use gpui_kit::assets::IconName as AssetIconName;
 use gpui_kit::component::{
     ActiveTheme, Disableable, Icon, IconName, Sizable, StyledExt, ThemeRegistry,
     button::{Button, ButtonVariants},
     checkbox::Checkbox,
+    collapsible::Collapsible,
     input::{Input, InputGroup, InputState},
     menu::{DropdownMenu, PopupMenuItem},
+    select::Select,
     setting::{SettingGroup, SettingItem, SettingPage, Settings},
+    tag::Tag,
+    tooltip::Tooltip,
 };
 use gpui_kit::{
-    Context, Entity, IntoElement, MouseButton, PromptButton, PromptLevel, Role, SharedString, TestSupportExt, WeakEntity, Window, div,
-    prelude::*, relative, rems,
+    App, AvailableSpace, Bounds, Context, Element, ElementId, Entity, GlobalElementId, InspectorElementId, IntoElement, LayoutId,
+    MouseButton, Pixels, PromptButton, PromptLevel, Role, SharedString, Style, TestSupportExt, WeakEntity, Window, div, prelude::*, px,
+    relative, rems, size,
 };
+
+// The native header's title row shrink-wraps its suffix. A large preferred width with a zero
+// minimum lets that row fill the page without overflowing or replacing its full-width divider.
+struct HeaderSpacer;
+
+impl IntoElement for HeaderSpacer {
+    type Element = Self;
+
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl Element for HeaderSpacer {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        _: &mut App,
+    ) -> (LayoutId, ()) {
+        let mut style = Style {
+            flex_grow: 1.,
+            ..Style::default()
+        };
+        style.min_size.width = px(0.).into();
+        let layout = window.request_measured_layout(style, |known, available, window, _| {
+            let width = known.width.unwrap_or_else(|| match available.width {
+                AvailableSpace::MinContent => px(0.),
+                AvailableSpace::MaxContent => window.viewport_size().width,
+                AvailableSpace::Definite(width) => width.max(px(0.)),
+            });
+            size(width, known.height.unwrap_or(px(0.)))
+        });
+        (layout, ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut (),
+        _: &mut Window,
+        _: &mut App,
+    ) {
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut (),
+        _: &mut (),
+        _: &mut Window,
+        _: &mut App,
+    ) {
+    }
+}
 
 impl Explorer {
     pub(super) fn select_connection(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -67,6 +143,10 @@ impl Explorer {
             cx.propagate();
             return;
         }
+        if self.topic_editor_open {
+            self.cancel_topic_edit(window, cx);
+            return;
+        }
         self.show_config = false;
         self.field_error = None;
         if let Some(handle) = self.restore_focus.take() {
@@ -79,10 +159,15 @@ impl Explorer {
 
     fn invalid_field(&mut self, field: ConnectionField, message: String, window: &mut Window, cx: &mut Context<Self>) {
         self.field_error = Some((field, message));
+        if field == ConnectionField::Topics {
+            self.topics_open = true;
+            self.topic_editor_open = true;
+        }
         let input = match field {
             ConnectionField::Name => &self.name,
             ConnectionField::Host => &self.host,
             ConnectionField::Port => &self.port,
+            ConnectionField::Topics => &self.topic_input,
             ConnectionField::Username => &self.username,
         };
         input.update(cx, |input, cx| input.focus(window, cx));
@@ -115,10 +200,15 @@ impl Explorer {
             self.invalid_field(ConnectionField::Name, "Enter a connection name.".into(), window, cx);
             return;
         }
+        if self.topic_editor_open {
+            self.invalid_field(ConnectionField::Topics, "Add or cancel the topic before saving.".into(), window, cx);
+            return;
+        }
         let config = ConnectionConfig {
             name,
             host: self.host.read(cx).value().trim().to_owned(),
             port,
+            topics: self.subscription_topics.clone(),
             username: self.username.read(cx).value().to_string(),
             password: self.password.read(cx).value().to_string(),
             tls: self.tls,
@@ -167,6 +257,12 @@ impl Explorer {
         self.host.update(cx, |input, cx| input.set_value(config.host.clone(), window, cx));
         self.port
             .update(cx, |input, cx| input.set_value(config.port.to_string(), window, cx));
+        self.subscription_topics = config.topics.clone();
+        self.topics_open = true;
+        self.topic_editor_open = false;
+        self.topic_editor_restore_focus = None;
+        self.topic_input.update(cx, |input, cx| input.set_value("", window, cx));
+        self.topic_qos.update(cx, |state, cx| state.set_selected_value(&"0", window, cx));
         self.username
             .update(cx, |input, cx| input.set_value(config.username.clone(), window, cx));
         self.password
@@ -175,6 +271,65 @@ impl Explorer {
         self.field_error = None;
         self.error = None;
         self.name.update(cx, |input, cx| input.focus(window, cx));
+        cx.notify();
+    }
+
+    fn begin_topic_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.topics_open = true;
+        if !self.topic_editor_open {
+            self.topic_editor_restore_focus = window.focused(cx);
+            self.topic_input.update(cx, |input, cx| input.set_value("", window, cx));
+            self.topic_qos.update(cx, |state, cx| state.set_selected_value(&"0", window, cx));
+            self.field_error = None;
+        }
+        self.topic_editor_open = true;
+        self.topic_input.update(cx, |input, cx| input.focus(window, cx));
+        cx.notify();
+    }
+
+    fn cancel_topic_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.topic_editor_open = false;
+        self.field_error = None;
+        if let Some(handle) = self.topic_editor_restore_focus.take() {
+            handle.focus(window, cx);
+        } else {
+            self.username.update(cx, |input, cx| input.focus(window, cx));
+        }
+        cx.notify();
+    }
+
+    pub(super) fn add_topic_from_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let subscription = TopicSubscription {
+            topic: self.topic_input.read(cx).value().to_string(),
+            qos: match self.topic_qos.read(cx).selected_value() {
+                Some(&"1") => 1,
+                Some(&"2") => 2,
+                _ => 0,
+            },
+        };
+        if let Err(error) = subscription.validate() {
+            self.invalid_field(ConnectionField::Topics, error.to_string(), window, cx);
+            return;
+        }
+        if self.subscription_topics.iter().any(|saved| saved.topic == subscription.topic) {
+            self.invalid_field(
+                ConnectionField::Topics,
+                "This topic filter is already in the list.".into(),
+                window,
+                cx,
+            );
+            return;
+        }
+        self.subscription_topics.push(subscription);
+        self.cancel_topic_edit(window, cx);
+    }
+
+    fn remove_subscription_topic(&mut self, topic: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.subscription_topics.retain(|subscription| subscription.topic != topic);
+        self.field_error = None;
+        if window.last_input_was_keyboard() {
+            self.username.update(cx, |input, cx| input.focus(window, cx));
+        }
         cx.notify();
     }
 
@@ -277,7 +432,9 @@ impl Explorer {
                 .test_support()
                 .v_flex()
                 .w_full()
-                .p_1()
+                .px_1()
+                .py_0()
+                .pb_1()
                 .gap_1()
                 .child(div().text_sm().font_medium().child(label))
                 .child(
@@ -325,23 +482,13 @@ impl Explorer {
             .flat_map(|(_, name, details)| [name.clone(), details.clone()])
             .collect();
         keywords.extend(["servers", "connections", "add", "edit", "delete", "connect"].map(str::to_owned));
+        let add_view = view.clone();
         let list = SettingItem::render(move |_, _, cx| {
             div()
                 .id("connections-overview")
                 .test_support()
                 .v_flex()
                 .gap_4()
-                .child(
-                    div()
-                        .h_flex()
-                        .justify_end()
-                        .child(Button::new("new-connection").primary().label("Add connection").on_click({
-                            let view = view.clone();
-                            move |_, window, cx| {
-                                _ = view.update(cx, |view, cx| view.new_connection(window, cx));
-                            }
-                        })),
-                )
                 .when(servers.is_empty(), |list| {
                     list.child(
                         div()
@@ -465,7 +612,246 @@ impl Explorer {
                 .keywords(["connection", "error"]),
             );
         }
-        SettingPage::new("Connections").resettable(false).group(group)
+        SettingPage::new("Connections")
+            .resettable(false)
+            .title_suffix(move |_, _| {
+                div()
+                    .id("connections-header-actions")
+                    .test_support()
+                    .h_flex()
+                    .min_w_0()
+                    .flex_auto()
+                    .child(HeaderSpacer)
+                    .child(
+                        Button::new("new-connection")
+                            .small()
+                            .primary()
+                            .flex_shrink_0()
+                            .icon(IconName::Plus)
+                            .accessibility_label("Add connection")
+                            .tooltip("Add connection")
+                            .on_click({
+                                let view = add_view.clone();
+                                move |_, window, cx| {
+                                    _ = view.update(cx, |view, cx| view.new_connection(window, cx));
+                                }
+                            }),
+                    )
+            })
+            .group(group)
+    }
+
+    fn subscription_topics_section(&self, cx: &mut Context<Self>) -> SettingItem {
+        let view = cx.weak_entity();
+        let topics = self.subscription_topics.clone();
+        let open = self.topics_open;
+        let editing = self.topic_editor_open;
+        let input = self.topic_input.clone();
+        let qos = self.topic_qos.clone();
+        let error = self
+            .field_error
+            .as_ref()
+            .filter(|(field, _)| *field == ConnectionField::Topics)
+            .map(|(_, message)| message.clone());
+        SettingItem::render(move |_, _, cx| {
+            let mut content = div().v_flex().min_w_0().gap_2();
+            if topics.is_empty() {
+                content = content.child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("No topics. Add a topic filter to subscribe."),
+                );
+            } else {
+                for subscription in &topics {
+                    let topic = subscription.topic.clone();
+                    let tooltip_topic = topic.clone();
+                    let remove_view = view.clone();
+                    let remove_topic = topic.clone();
+                    content = content.child(
+                        div()
+                            .id(SharedString::from(format!("subscription:{topic}")))
+                            .test_support()
+                            .h_flex()
+                            .min_w_0()
+                            .gap_2()
+                            .px_1()
+                            .py_1()
+                            .text_sm()
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("topic-filter:{topic}")))
+                                    .test_support()
+                                    .aria_label(topic.clone())
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .font_family(cx.theme().mono_font_family.clone())
+                                    .tooltip(move |window, cx| Tooltip::new(tooltip_topic.clone()).build(window, cx))
+                                    .child(topic.clone()),
+                            )
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("topic-qos:{topic}")))
+                                    .test_support()
+                                    .aria_label(format!("QoS {}", subscription.qos))
+                                    .flex_none()
+                                    .child(Tag::secondary().small().child(format!("QoS {}", subscription.qos))),
+                            )
+                            .child(
+                                Button::new(SharedString::from(format!("remove-topic:{topic}")))
+                                    .small()
+                                    .ghost()
+                                    .icon(AssetIconName::Trash)
+                                    .accessibility_label(format!("Remove topic {topic}"))
+                                    .tooltip("Remove subscription")
+                                    .on_click(move |_, window, cx| {
+                                        _ = remove_view.update(cx, |view, cx| view.remove_subscription_topic(&remove_topic, window, cx));
+                                    }),
+                            ),
+                    );
+                }
+            }
+            if editing {
+                let add_view = view.clone();
+                let cancel_view = view.clone();
+                content = content.child(
+                    div()
+                        .id("topic-editor")
+                        .test_support()
+                        .v_flex()
+                        .gap_2()
+                        .p_1()
+                        .when(!topics.is_empty(), |editor| {
+                            editor.border_t_1().border_color(cx.theme().border).pt_3()
+                        })
+                        .child(
+                            div()
+                                .h_flex()
+                                .items_start()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .id("connection-field:topic-filter")
+                                        .test_support()
+                                        .v_flex()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .gap_1()
+                                        .child(div().text_sm().font_medium().child("Topic"))
+                                        .child(
+                                            InputGroup::new("field:topic-filter")
+                                                .small()
+                                                .w_full()
+                                                .invalid(error.is_some())
+                                                .input(Input::new(&input).id("topic-filter").aria_label("Topic")),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .v_flex()
+                                        .w_16()
+                                        .flex_none()
+                                        .gap_1()
+                                        .child(div().text_sm().font_medium().child("QoS"))
+                                        .child(Select::new(&qos).id("topic-qos").small().w_full().accessibility_label("QoS")),
+                                ),
+                        )
+                        .when_some(error.clone(), |editor, error| {
+                            editor.child(
+                                div()
+                                    .id("topics-error")
+                                    .test_support()
+                                    .role(Role::Alert)
+                                    .aria_label(error.clone())
+                                    .text_sm()
+                                    .text_color(cx.theme().danger)
+                                    .child(error),
+                            )
+                        })
+                        .child(
+                            div()
+                                .h_flex()
+                                .gap_2()
+                                .justify_end()
+                                .child(
+                                    Button::new("cancel-topic")
+                                        .small()
+                                        .ghost()
+                                        .label("Cancel")
+                                        .on_click(move |_, window, cx| {
+                                            _ = cancel_view.update(cx, |view, cx| view.cancel_topic_edit(window, cx));
+                                        }),
+                                )
+                                .child(Button::new("add-topic").small().label("Add").on_click(move |_, window, cx| {
+                                    _ = add_view.update(cx, |view, cx| view.add_topic_from_form(window, cx));
+                                })),
+                        ),
+                );
+            }
+            let toggle_view = view.clone();
+            let add_view = view.clone();
+            div().px_1().py_1().child(
+                div()
+                    .id("subscription-topics")
+                    .test_support()
+                    .aria_label("Topics")
+                    .aria_expanded(open)
+                    .w_full()
+                    .min_w_0()
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .rounded(cx.theme().radius)
+                    .p_2()
+                    .child(
+                        Collapsible::new()
+                            .open(open)
+                            .gap_2()
+                            .w_full()
+                            .child(
+                                div()
+                                    .h_flex()
+                                    .gap_2()
+                                    .child(
+                                        Button::new("toggle-topics")
+                                            .small()
+                                            .ghost()
+                                            .flex_none()
+                                            .font_semibold()
+                                            .icon(if open { IconName::ChevronDown } else { IconName::ChevronRight })
+                                            .label("Topics")
+                                            .accessibility_label(if open { "Collapse topics" } else { "Expand topics" })
+                                            .on_click(move |_, _, cx| {
+                                                _ = toggle_view.update(cx, |view, cx| {
+                                                    view.topics_open = !view.topics_open;
+                                                    cx.notify();
+                                                });
+                                            }),
+                                    )
+                                    .child(div().flex_1())
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(topics.len().to_string()),
+                                    )
+                                    .child(
+                                        Button::new("begin-add-topic")
+                                            .small()
+                                            .ghost()
+                                            .icon(IconName::Plus)
+                                            .accessibility_label("Add topic")
+                                            .tooltip("Add topic")
+                                            .on_click(move |_, window, cx| {
+                                                _ = add_view.update(cx, |view, cx| view.begin_topic_edit(window, cx));
+                                            }),
+                                    ),
+                            )
+                            .content(content),
+                    ),
+            )
+        })
+        .keywords(["Topics", "subscription", "QoS"])
     }
 
     fn connection_form_page(&self, cx: &mut Context<Self>) -> SettingPage {
@@ -475,7 +861,7 @@ impl Explorer {
         let tls = self.tls;
         let tls_item = SettingItem::render(move |_, _, _| {
             let view = view.clone();
-            div().p_2().child(
+            div().px_2().py_0().child(
                 Checkbox::new("tls")
                     .label("Use TLS")
                     .checked(tls)
@@ -494,7 +880,7 @@ impl Explorer {
         })
         .keywords(["TLS"]);
         let header_view = cx.weak_entity();
-        let header = SettingItem::render(move |_, _, cx| {
+        let header = SettingItem::render(move |_, _, _| {
             div()
                 .v_flex()
                 .px_1()
@@ -516,12 +902,6 @@ impl Explorer {
                         .font_semibold()
                         .child(if editing.is_some() { "Edit connection" } else { "New connection" }),
                 )
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .child("Broker details and optional credentials"),
-                )
         })
         .keywords(["connection", "server", "edit", "new"]);
         let actions_view = cx.weak_entity();
@@ -536,14 +916,14 @@ impl Explorer {
                 .p_1()
                 .gap_2()
                 .when_some(editing, |row, index| {
-                    row.child(Button::new("remove-connection").label("Remove").on_click({
+                    row.child(Button::new("remove-connection").small().label("Remove").on_click({
                         let view = actions_view.clone();
                         move |_, window, cx| {
                             _ = view.update(cx, |view, cx| view.confirm_remove_connection(index, window, cx));
                         }
                     }))
                 })
-                .child(Button::new("save-connection").label("Save").on_click({
+                .child(Button::new("save-connection").small().label("Save").on_click({
                     let view = actions_view.clone();
                     move |_, window, cx| {
                         _ = view.update(cx, |view, cx| view.save_from_form(window, cx));
@@ -551,6 +931,7 @@ impl Explorer {
                 }))
                 .child(
                     Button::new("connect")
+                        .small()
                         .primary()
                         .label("Save & connect")
                         .loading(connecting)
@@ -564,11 +945,12 @@ impl Explorer {
                 )
         })
         .keywords(["save", "connect", "remove"]);
-        let mut group = SettingGroup::new().item(header).items([
+        let mut group = SettingGroup::new().gap_1().item(header).items([
             self.setting_input("name", "Connection name", &self.name, Some(ConnectionField::Name)),
             self.setting_input("host", "Host", &self.host, Some(ConnectionField::Host)),
             self.setting_input("port", "Port", &self.port, Some(ConnectionField::Port)),
             tls_item,
+            self.subscription_topics_section(cx),
             self.setting_input("username", "Username", &self.username, Some(ConnectionField::Username)),
             self.setting_input("password", "Password", &self.password, None),
         ]);

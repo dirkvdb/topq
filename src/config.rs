@@ -8,17 +8,51 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
-use directories::ProjectDirs;
+use directories::{BaseDirs, ProjectDirs};
 use keyring::{Entry, Error as KeyringError};
 use serde::{Deserialize, Serialize};
 
+/// An MQTT topic filter and its requested maximum delivery QoS.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct TopicSubscription {
+    pub topic: String,
+    pub qos: u8,
+}
+
+impl Default for TopicSubscription {
+    fn default() -> Self {
+        Self { topic: "#".into(), qos: 0 }
+    }
+}
+
+impl TopicSubscription {
+    /// Rejects invalid MQTT filters, null characters, filters over 65535 bytes, and QoS outside 0..=2.
+    pub fn validate(&self) -> Result<(), ConnectionValidationError> {
+        if self.topic.len() > usize::from(u16::MAX) || self.topic.contains('\0') || !rumqttc::valid_filter(&self.topic) {
+            return Err(ConnectionValidationError {
+                field: ConnectionField::Topics,
+                message: "Enter a valid MQTT topic filter (e.g. # or home/#), up to 65535 bytes. Use + for one level and # only as the last level.",
+            });
+        }
+        if self.qos > 2 {
+            return Err(ConnectionValidationError {
+                field: ConnectionField::Topics,
+                message: "Choose a topic subscription QoS between 0 and 2.",
+            });
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, from = "DeserializedConnectionConfig")]
 #[non_exhaustive]
 pub struct ConnectionConfig {
     pub name: String,
     pub host: String,
     pub port: u16,
+    pub topics: Vec<TopicSubscription>,
     pub username: String,
     #[serde(skip)]
     pub password: String,
@@ -30,11 +64,12 @@ pub(crate) enum ConnectionField {
     Name,
     Host,
     Port,
+    Topics,
     Username,
 }
 
 #[derive(Debug)]
-pub(crate) struct ConnectionValidationError {
+pub struct ConnectionValidationError {
     field: ConnectionField,
     message: &'static str,
 }
@@ -59,9 +94,58 @@ impl Default for ConnectionConfig {
             name: String::new(),
             host: "localhost".into(),
             port: 1883,
+            topics: vec![TopicSubscription::default()],
             username: String::new(),
             password: String::new(),
             tls: false,
+        }
+    }
+}
+
+// Keep legacy fields confined to deserialization, and never accept a plaintext password.
+#[derive(Deserialize)]
+#[serde(default)]
+struct DeserializedConnectionConfig {
+    name: String,
+    host: String,
+    port: u16,
+    topics: Option<Vec<TopicSubscription>>,
+    base_topic: Option<String>,
+    username: String,
+    tls: bool,
+}
+
+impl Default for DeserializedConnectionConfig {
+    fn default() -> Self {
+        let config = ConnectionConfig::default();
+        Self {
+            name: config.name,
+            host: config.host,
+            port: config.port,
+            topics: None,
+            base_topic: None,
+            username: config.username,
+            tls: config.tls,
+        }
+    }
+}
+
+impl From<DeserializedConnectionConfig> for ConnectionConfig {
+    fn from(config: DeserializedConnectionConfig) -> Self {
+        let topics = config.topics.unwrap_or_else(|| {
+            config.base_topic.map_or_else(
+                || vec![TopicSubscription::default()],
+                |topic| vec![TopicSubscription { topic, qos: 2 }],
+            )
+        });
+        Self {
+            name: config.name,
+            host: config.host,
+            port: config.port,
+            topics,
+            username: config.username,
+            password: String::new(),
+            tls: config.tls,
         }
     }
 }
@@ -85,6 +169,22 @@ impl ConnectionConfig {
                 field: ConnectionField::Port,
                 message: "Enter a port between 1 and 65535.",
             });
+        }
+        if self.topics.is_empty() {
+            return Err(ConnectionValidationError {
+                field: ConnectionField::Topics,
+                message: "Add at least one topic subscription.",
+            });
+        }
+        let mut filters = HashSet::new();
+        for subscription in &self.topics {
+            subscription.validate()?;
+            if !filters.insert(subscription.topic.as_str()) {
+                return Err(ConnectionValidationError {
+                    field: ConnectionField::Topics,
+                    message: "Each topic filter may only be subscribed to once.",
+                });
+            }
         }
         if self.username.is_empty() && !self.password.is_empty() {
             return Err(ConnectionValidationError {
@@ -315,27 +415,74 @@ fn credential_error(error: KeyringError) -> anyhow::Error {
 #[derive(Default, Serialize, Deserialize)]
 struct LayoutPreferences {
     topics_width_rem: Option<f32>,
+    topics_width_fraction: Option<f32>,
 }
 
-pub(crate) fn load_topics_width() -> Result<Option<f32>> {
-    let path = config_path()?.with_file_name("layout.json");
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct TopicsLayout {
+    pub width_rem: Option<f32>,
+    pub width_fraction: Option<f32>,
+}
+
+fn state_path() -> Result<PathBuf> {
+    let state_dir = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .map(Ok)
+        .unwrap_or_else(|| {
+            BaseDirs::new()
+                .map(|dirs| dirs.home_dir().join(".local").join("state"))
+                .context("Could not locate your home directory.")
+        })?;
+    Ok(state_dir.join("topq").join("state.toml"))
+}
+
+pub(crate) fn load_topics_layout() -> Result<TopicsLayout> {
+    load_topics_layout_from(&state_path()?)
+}
+
+fn load_topics_layout_from(path: &Path) -> Result<TopicsLayout> {
     let data = match fs::read(path) {
         Ok(data) => data,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error).context("Could not read the pane layout."),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(TopicsLayout::default()),
+        Err(error) => return Err(error).context("Could not read the application state."),
     };
-    let preferences: LayoutPreferences = serde_json::from_slice(&data).context("Could not parse the pane layout.")?;
-    Ok(preferences.topics_width_rem.filter(|width| width.is_finite() && *width > 0.))
+    let preferences: LayoutPreferences = toml::from_str(std::str::from_utf8(&data).context("Application state is not valid UTF-8.")?)
+        .context("Could not parse the application state.")?;
+    Ok(TopicsLayout {
+        width_rem: preferences.topics_width_rem.filter(|width| width.is_finite() && *width > 0.),
+        width_fraction: preferences
+            .topics_width_fraction
+            .filter(|fraction| fraction.is_finite() && (0. ..=1.).contains(fraction)),
+    })
 }
 
-pub(crate) fn save_topics_width(width: f32) -> Result<()> {
-    let path = config_path()?.with_file_name("layout.json");
-    write_json(
-        &path,
+pub(crate) fn save_topics_width(width: f32, fraction: f32) -> Result<()> {
+    write_toml(
+        &state_path()?,
         &LayoutPreferences {
             topics_width_rem: Some(width),
+            topics_width_fraction: Some(fraction),
         },
     )
+}
+
+fn write_toml(path: &Path, value: &impl Serialize) -> Result<()> {
+    fs::create_dir_all(path.parent().context("Invalid state path.")?).context("Could not create the application state directory.")?;
+    let temp = path.with_extension("toml.tmp");
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temp).context("Could not open the temporary state file.")?;
+    file.write_all(toml::to_string_pretty(value)?.as_bytes())
+        .context("Could not write the application state.")?;
+    file.sync_all().context("Could not flush the application state to disk.")?;
+    fs::rename(&temp, path).context("Could not save the application state.")?;
+    Ok(())
 }
 
 pub(crate) fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
@@ -402,6 +549,150 @@ mod tests {
     }
 
     #[test]
+    fn topics_default_to_all_topics_at_qos_zero_for_new_and_existing_connections() {
+        let expected = vec![TopicSubscription { topic: "#".into(), qos: 0 }];
+        assert_eq!(ConnectionConfig::default().topics, expected);
+        let config: ConnectionConfig = serde_json::from_str(r#"{"host":"broker.example","port":1883}"#).unwrap();
+        assert_eq!(config.topics, expected);
+        let config: ConnectionConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.topics, expected);
+        assert_eq!(config.name, "");
+        assert_eq!(config.host, "localhost");
+        assert_eq!(config.port, 1883);
+        assert_eq!(config.username, "");
+        assert_eq!(config.password, "");
+        assert!(!config.tls);
+    }
+
+    #[test]
+    fn legacy_base_topic_migrates_to_a_single_qos_two_subscription() {
+        let config: ConnectionConfig = serde_json::from_str(r#"{"base_topic":"home/#"}"#).unwrap();
+        assert_eq!(
+            config.topics,
+            vec![TopicSubscription {
+                topic: "home/#".into(),
+                qos: 2
+            }]
+        );
+        assert!(config.validate().is_ok());
+        let json = serde_json::to_value(config).unwrap();
+        assert!(json.get("base_topic").is_none());
+        assert_eq!(json["topics"], serde_json::json!([{"topic":"home/#","qos":2}]));
+    }
+
+    #[test]
+    fn explicit_topics_take_precedence_over_legacy_base_topic_including_an_empty_list() {
+        let config: ConnectionConfig = serde_json::from_str(r#"{"base_topic":"old/#","topics":[{"topic":"new/#","qos":1}]}"#).unwrap();
+        assert_eq!(
+            config.topics,
+            vec![TopicSubscription {
+                topic: "new/#".into(),
+                qos: 1
+            }]
+        );
+        let config: ConnectionConfig = serde_json::from_str(r#"{"base_topic":"old/#","topics":[]}"#).unwrap();
+        assert!(config.topics.is_empty());
+        assert_eq!(config.validate().unwrap_err().field(), ConnectionField::Topics);
+    }
+
+    #[test]
+    fn invalid_legacy_filters_are_not_silently_replaced_with_defaults() {
+        for json in [r#"{"base_topic":""}"#, r#"{"base_topic":"home/#/value"}"#] {
+            let config: ConnectionConfig = serde_json::from_str(json).unwrap();
+            assert_eq!(config.validate().unwrap_err().field(), ConnectionField::Topics);
+        }
+    }
+
+    #[test]
+    fn deserialization_ignores_plaintext_passwords_in_both_configuration_shapes() {
+        for json in [
+            r#"{"username":"mqtt-user","password":"plaintext-secret","base_topic":"home/#"}"#,
+            r##"{"username":"mqtt-user","password":"plaintext-secret","topics":[{"topic":"#","qos":0}]}"##,
+        ] {
+            let config: ConnectionConfig = serde_json::from_str(json).unwrap();
+            assert!(config.password.is_empty());
+        }
+    }
+
+    #[test]
+    fn validate_rejects_invalid_topic_filters() {
+        for topic in ["", "home#", "home/#/value", "home+", "home/++", "home/\0"]
+            .map(String::from)
+            .into_iter()
+            .chain(["a".repeat(usize::from(u16::MAX) + 1), "é".repeat(32768)])
+        {
+            let subscription = TopicSubscription { topic, qos: 0 };
+            assert_eq!(subscription.validate().unwrap_err().field(), ConnectionField::Topics);
+            let config = ConnectionConfig {
+                topics: vec![subscription],
+                ..Default::default()
+            };
+            assert_eq!(config.validate().unwrap_err().field(), ConnectionField::Topics);
+        }
+    }
+
+    #[test]
+    fn validate_accepts_exact_topics_and_wildcard_filters() {
+        for topic in ["#", "home/#", "home/+/temperature", "$SYS/#", "/", "home/", " home/value "]
+            .map(String::from)
+            .into_iter()
+            .chain(["a".repeat(usize::from(u16::MAX))])
+        {
+            for qos in 0..=2 {
+                let subscription = TopicSubscription { topic: topic.clone(), qos };
+                assert!(subscription.validate().is_ok());
+                let config = ConnectionConfig {
+                    topics: vec![subscription],
+                    ..Default::default()
+                };
+                assert!(config.validate().is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn validate_rejects_invalid_subscription_qos() {
+        for qos in [3, u8::MAX] {
+            let subscription = TopicSubscription {
+                topic: "home/#".into(),
+                qos,
+            };
+            assert_eq!(subscription.validate().unwrap_err().field(), ConnectionField::Topics);
+            let config = ConnectionConfig {
+                topics: vec![TopicSubscription::default(), subscription],
+                ..Default::default()
+            };
+            assert_eq!(config.validate().unwrap_err().field(), ConnectionField::Topics);
+        }
+    }
+
+    #[test]
+    fn validate_requires_topics_and_rejects_duplicate_filters_regardless_of_qos() {
+        for topics in [
+            vec![],
+            vec![TopicSubscription::default(), TopicSubscription::default()],
+            vec![TopicSubscription::default(), TopicSubscription { topic: "#".into(), qos: 2 }],
+        ] {
+            let config = ConnectionConfig {
+                topics,
+                ..Default::default()
+            };
+            assert_eq!(config.validate().unwrap_err().field(), ConnectionField::Topics);
+        }
+        let config = ConnectionConfig {
+            topics: vec![
+                TopicSubscription::default(),
+                TopicSubscription {
+                    topic: "home/#".into(),
+                    qos: 1,
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok(), "overlapping but distinct filters are allowed");
+    }
+
+    #[test]
     fn serialization_never_includes_the_runtime_password() {
         let json = serde_json::to_value(authenticated_config()).unwrap();
         assert!(json.get("password").is_none());
@@ -457,6 +748,64 @@ mod tests {
     }
 
     #[test]
+    fn topics_width_roundtrips_through_toml_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("topq").join("state.toml");
+        write_toml(
+            &path,
+            &LayoutPreferences {
+                topics_width_rem: Some(31.5),
+                topics_width_fraction: Some(0.4),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            load_topics_layout_from(&path).unwrap(),
+            TopicsLayout {
+                width_rem: Some(31.5),
+                width_fraction: Some(0.4),
+            }
+        );
+        assert_eq!(
+            fs::read_to_string(path).unwrap(),
+            "topics_width_rem = 31.5\ntopics_width_fraction = 0.4\n"
+        );
+    }
+
+    #[test]
+    fn saved_connections_migrate_legacy_filters_and_ignore_plaintext_passwords() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("connections.json");
+        fs::write(
+            &path,
+            r#"{"connections":[{"host":"legacy-broker","base_topic":"home/#","password":"plaintext-secret"},{"host":"default-broker"}],"selected":0}"#,
+        ).unwrap();
+        let entries = mock_entries();
+        let saved = load_connections_from(&path, &entries).unwrap();
+        assert_eq!(saved.selected, Some(0));
+        assert_eq!(
+            saved.connections[0].topics,
+            vec![TopicSubscription {
+                topic: "home/#".into(),
+                qos: 2
+            }]
+        );
+        assert_eq!(saved.connections[1].topics, vec![TopicSubscription::default()]);
+        assert!(saved.connections.iter().all(|config| config.password.is_empty()));
+        save_connections_to(&path, &saved, &entries).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(
+            json["connections"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|config| { config.get("base_topic").is_none() && config.get("password").is_none() && config.get("topics").is_some() })
+        );
+        let loaded = load_connections_from(&path, &entries).unwrap();
+        assert_eq!(loaded.connections[0].topics, saved.connections[0].topics);
+    }
+
+    #[test]
     fn single_connection_shape_is_not_accepted_as_multi_connection_storage() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("connections.json");
@@ -473,9 +822,29 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("connection.json");
         let entries = mock_entries();
-        let first = authenticated_config();
+        let first = ConnectionConfig {
+            topics: vec![
+                TopicSubscription {
+                    topic: "home/#".into(),
+                    qos: 0,
+                },
+                TopicSubscription {
+                    topic: "office/+/temperature".into(),
+                    qos: 1,
+                },
+                TopicSubscription {
+                    topic: "$SYS/#".into(),
+                    qos: 2,
+                },
+            ],
+            ..authenticated_config()
+        };
         let second = ConnectionConfig {
             name: "Workshop".into(),
+            topics: vec![TopicSubscription {
+                topic: "$SYS/#".into(),
+                qos: 1,
+            }],
             host: "another-broker".into(),
             password: "another-secret".into(),
             ..first.clone()
@@ -496,6 +865,8 @@ mod tests {
         assert_eq!(loaded.connections[1].password, second.password);
         assert_eq!(loaded.connections[0].name, first.name);
         assert_eq!(loaded.connections[1].name, second.name);
+        assert_eq!(loaded.connections[0].topics, first.topics);
+        assert_eq!(loaded.connections[1].topics, second.topics);
         let bytes = fs::read(&path).unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(
@@ -503,7 +874,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .all(|item| item.get("password").is_none())
+                .all(|item| item.get("password").is_none() && item.get("base_topic").is_none())
         );
         assert!(!std::str::from_utf8(&bytes).unwrap().contains(&first.password));
         assert!(!std::str::from_utf8(&bytes).unwrap().contains(&second.password));
