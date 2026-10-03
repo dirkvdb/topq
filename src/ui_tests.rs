@@ -158,6 +158,8 @@ fn theme_menu_supports_keyboard_selection_dismissal_and_saved_preferences(cx: &m
         window.press("down", cx);
         window.press("down", cx);
         window.press("down", cx);
+        window.press("down", cx);
+        window.press("down", cx);
         window.press("enter", cx);
     })
     .unwrap();
@@ -740,7 +742,7 @@ fn topic_editor_buttons_support_keyboard_activation_and_cancel_restores_the_trig
         window.click("port", cx);
     })
     .unwrap();
-    for id in ["tls", "toggle-topics", "begin-add-topic"] {
+    for id in ["tls", "username", "password", "toggle-topics", "begin-add-topic"] {
         cx.update_window(handle, |_, window, cx| window.press("tab", cx)).unwrap();
         cx.run_until_parked();
         cx.update_window(handle, |_, window, cx| {
@@ -1175,15 +1177,15 @@ fn tabbing_between_connection_inputs_selects_values_and_visits_subscription_cont
         ("tab", "host", Some("broker.example")),
         ("tab", "port", Some("8883")),
         ("tab", "tls", None),
+        ("tab", "username", Some("another-reader")),
+        ("tab", "password", Some("new-password")),
         ("tab", "toggle-topics", None),
         ("tab", "begin-add-topic", None),
         ("tab", "remove-topic:#", None),
-        ("tab", "username", Some("another-reader")),
-        ("tab", "password", Some("new-password")),
-        ("shift-tab", "username", Some("replacement-reader")),
-        ("shift-tab", "remove-topic:#", None),
         ("shift-tab", "begin-add-topic", None),
         ("shift-tab", "toggle-topics", None),
+        ("shift-tab", "password", Some("replacement-password")),
+        ("shift-tab", "username", Some("replacement-reader")),
         ("shift-tab", "tls", None),
         ("shift-tab", "port", Some("1884")),
         ("shift-tab", "host", Some("other.example")),
