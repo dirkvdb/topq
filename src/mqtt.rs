@@ -102,7 +102,7 @@ impl Connection {
         if topics.is_empty() {
             return Ok(());
         }
-        ensure!(session % 2 == 1, "Cannot clear retained topics while disconnected.");
+        ensure!(session % 2 == 1, "Cannot delete retained topics while disconnected.");
         ensure!(
             self.session.load(Ordering::Acquire) == session,
             "Retained-topic deletion confirmation expired because the connection changed. Confirm again while connected."

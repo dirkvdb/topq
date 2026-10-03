@@ -380,7 +380,7 @@ impl Explorer {
                     self.status = ConnectionStatus::Connected;
                 }
                 BrokerEvent::Status(status) => self.status = ConnectionStatus::Failed(status),
-                BrokerEvent::OperationError(error) => self.error = Some(format!("Could not clear retained topics: {error}")),
+                BrokerEvent::OperationError(error) => self.error = Some(format!("Could not delete retained topics: {error}")),
                 BrokerEvent::Message(message) => {
                     let has_payload = !message.payload.is_empty();
                     payload_changed |= self.selected.as_ref() == Some(&message.topic);
@@ -582,7 +582,7 @@ impl Explorer {
                             } else {
                                 Err(anyhow::anyhow!("The broker disconnected. Confirm again while connected."))
                             };
-                            view.error = result.err().map(|error| format!("Could not clear retained topics: {error:#}"));
+                            view.error = result.err().map(|error| format!("Could not delete retained topics: {error:#}"));
                             cx.notify();
                         });
                     }
@@ -917,7 +917,7 @@ impl Explorer {
                         .small()
                         .icon(AssetIconName::Trash)
                         .accessibility_label("Delete topic and subtopics")
-                        .tooltip("Clear retained topic and subtopics")
+                        .tooltip("Delete retained topic and subtopics")
                         .disabled(!self.status.is_connected() || self.connection.is_none())
                         .on_click(cx.listener(|view, _, window, cx| view.confirm_clear_topic(window, cx))),
                 )
