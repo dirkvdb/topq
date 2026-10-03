@@ -1,0 +1,8 @@
+inputs:
+  nixpkgs:
+    url: github:NixOS/nixpkgs/nixos-26.05
+  rust-overlay:
+    url: github:oxalica/rust-overlay/stable
+  s-stack:
+    url: github:stolinski/s-stack/main
+    flake: false

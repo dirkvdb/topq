@@ -1,0 +1,7 @@
+[
+  {
+    "label": "Run application",
+    "command": "cargo",
+    "args": ["run"]
+  }
+]

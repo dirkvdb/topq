@@ -1,0 +1,33 @@
+[package]
+name = "mqtt-ui"
+version = "0.1.0"
+edition = "2024"
+description = "A minimal, read-only MQTT explorer built with GPUI Kit"
+
+[dependencies]
+anyhow = "1"
+bytes = "1"
+chrono = "0.4"
+directories = "6"
+gpui-kit = { version = "0.7", features = ["tree-sitter"] }
+keyring = { version = "4.2", default-features = false, features = ["v1"] }
+rumqttc = { version = "0.25", default-features = false, features = ["use-rustls"] }
+rustls-native-certs = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "time", "sync", "macros"] }
+
+[dev-dependencies]
+gpui-kit = { version = "0.7", features = ["test-support"] }
+keyring-core = "1"
+tempfile = "3"
+
+[lints.clippy]
+redundant_clone = "warn"
+needless_collect = "warn"
+
+[profile.dev]
+debug = 0
+
+[profile.test]
+debug = 0

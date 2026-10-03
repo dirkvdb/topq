@@ -1,0 +1,308 @@
+{
+  "name": "Tabulite collection",
+  "themes": [
+    {
+      "name": "Catppuccin Latte", "mode": "light",
+      "colors": {
+        "accent.background": "#D6DAE2", "accent.foreground": "#4c4f69",
+        "background": "#E5E9EF", "foreground": "#4c4f69", "border": "#CCD0DA",
+        "ring": "#7287fd", "input.border": "#acb0be",
+        "link.foreground": "#7287fd", "link.active.foreground": "#7287fd", "link.hover.foreground": "#7287fd",
+        "list.active.background": "#7287fd22", "list.active.border": "#7287fd",
+        "list.even.background": "#EFF1F5", "list.head.background": "#dce0e8",
+        "muted.background": "#dce0e8", "muted.foreground": "#9a9db2", "panel.background": "#dce0e8",
+        "popover.background": "#EFF1F5",
+        "primary.background": "#7287fd", "primary.active.background": "#7287fd", "primary.foreground": "#EFF1F5",
+        "scrollbar.background": "#EFF1F500", "scrollbar.thumb.background": "#acb0be",
+        "secondary.background": "#dce0e8", "secondary.foreground": "#4c4f69",
+        "secondary.active.background": "#CCD2DE", "secondary.hover.background": "#CCD2DE99",
+        "tab.active.background": "#E5E9EF", "tab.active.foreground": "#4c4f69",
+        "tab.background": "#D2D7E200", "tab.foreground": "#82848c", "tab_bar.background": "#DCE0E8",
+        "title_bar.background": "#DCE0E8", "title_bar.border": "#bec3d0",
+        "base.red": "#d26a53", "base.green": "#5aa93b", "base.yellow": "#df8e1d",
+        "base.blue": "#78acdc", "base.magenta": "#8778dc", "base.magenta.light": "#9978dc66", "base.cyan": "#53d2b0"
+      },
+      "highlight": {
+        "editor.foreground": "#4c4f69", "editor.background": "#EFF1F5",
+        "editor.active_line.background": "#dce0e8", "editor.line_number": "#9a9db2", "editor.active_line_number": "#4c4f69",
+        "syntax": {
+          "string": { "color": "#85dc78" }, "string.escape": { "color": "#ea76cb" },
+          "number": { "color": "#fe640b" }, "boolean": { "color": "#fe640b" },
+          "constant": { "color": "#fe640b" }, "keyword": { "color": "#8839ef" },
+          "property": { "color": "#1e66f5" }, "punctuation": { "color": "#7c7f93" },
+          "punctuation.bracket": { "color": "#7c7f93" }, "punctuation.delimiter": { "color": "#7c7f93" }
+        }
+      }
+    },
+    {
+      "name": "Catppuccin Frappe", "mode": "dark",
+      "colors": {
+        "accent.background": "#3b3f4f", "accent.foreground": "#c6d0f5",
+        "background": "#232634", "foreground": "#c6d0f5", "border": "#3e4255", "ring": "#f2d5cf", "input.border": "#51576d",
+        "list.active.background": "#8caaee15", "list.even.background": "#303446", "list.head.background": "#2A2C3C",
+        "muted.background": "#414559", "muted.foreground": "#979db5", "panel.background": "#414559",
+        "popover.background": "#1E202B", "popover.foreground": "#c6d0f5",
+        "primary.background": "#8caaee", "primary.active.background": "#8caaee", "primary.hover.background": "#8caaee", "primary.foreground": "#232634",
+        "scrollbar.background": "#30344600", "scrollbar.thumb.background": "#51576d",
+        "secondary.background": "#414559", "secondary.foreground": "#c6d0f5",
+        "secondary.active.background": "#313445", "secondary.hover.background": "#31344599",
+        "tab.active.background": "#232634", "tab.active.foreground": "#dce2f9",
+        "tab.background": "#1E202B00", "tab.foreground": "#abb5d9", "tab_bar.background": "#1E202B",
+        "title_bar.background": "#1D202B", "title_bar.border": "#30354b",
+        "base.red": "#e78284", "base.green": "#a6d189", "base.yellow": "#e7d682",
+        "base.blue": "#8caaee", "base.magenta": "#9882e7", "base.magenta.light": "#9882e766", "base.cyan": "#81c8be"
+      },
+      "highlight": {
+        "editor.foreground": "#c6d0f5", "editor.background": "#232634",
+        "editor.active_line.background": "#41455977", "editor.line_number": "#979db5", "editor.active_line_number": "#c6d0f5",
+        "syntax": {
+          "string": { "color": "#a6d189" }, "string.escape": { "color": "#a6d189" },
+          "number": { "color": "#e78284" }, "boolean": { "color": "#e78284" },
+          "constant": { "color": "#e7d682" }, "keyword": { "color": "#e78284" }, "property": { "color": "#c6d0f5" }
+        }
+      }
+    },
+    {
+      "name": "Catppuccin Macchiato", "mode": "dark",
+      "colors": {
+        "accent.background": "#24273a", "accent.foreground": "#cad3f5", "action_bar.background": "#1E2030",
+        "background": "#1E2030", "foreground": "#cad3f5", "border": "#494d64", "ring": "#f4dbd6", "input.border": "#494d64",
+        "danger.background": "#ed8796", "link.foreground": "#8aadf4", "link.active.foreground": "#8aadf4", "link.hover.foreground": "#8aadf4",
+        "list.active.background": "#8aadf420", "list.active.border": "#8aadf4", "list.even.background": "#24273a", "list.head.background": "#363a4f33",
+        "muted.background": "#363a4f", "muted.foreground": "#b8c0e0", "panel.background": "#363a4f",
+        "popover.background": "#171926", "popover.foreground": "#cad3f5",
+        "primary.background": "#8aadf4", "primary.active.background": "#8aadf499", "primary.hover.background": "#8aadf4", "primary.foreground": "#24273a",
+        "scrollbar.background": "#24273a00", "scrollbar.thumb.background": "#494d64",
+        "secondary.background": "#363a4f", "secondary.foreground": "#cad3f5",
+        "secondary.active.background": "#24273a", "secondary.hover.background": "#24273a99",
+        "tab.background": "#17192600", "tab.foreground": "#aeb8db", "tab_bar.background": "#171926",
+        "title_bar.background": "#171926", "title_bar.border": "#363A4F",
+        "base.red": "#ed8796", "base.green": "#a6da95", "base.yellow": "#eed49f",
+        "base.blue": "#8aadf4", "base.magenta": "#f5bde6", "base.magenta.light": "#f5bde666", "base.cyan": "#8bd5ca"
+      },
+      "highlight": {
+        "editor.foreground": "#cad3f5", "editor.background": "#1E2030",
+        "editor.active_line.background": "#363a4f", "editor.line_number": "#b8c0e0", "editor.active_line_number": "#cad3f5",
+        "syntax": {
+          "string": { "color": "#a6da95" }, "string.escape": { "color": "#a6da95" },
+          "number": { "color": "#eed49f" }, "boolean": { "color": "#f5bde6" },
+          "constant": { "color": "#eed49f" }, "keyword": { "color": "#f5bde6" }, "property": { "color": "#cad3f5" }
+        }
+      }
+    },
+    {
+      "name": "Catppuccin Mocha", "mode": "dark",
+      "colors": {
+        "accent.background": "#2e2e3e", "accent.foreground": "#cdd6f4",
+        "background": "#181825", "foreground": "#cdd6f4", "border": "#313244", "ring": "#cba6f7", "input.border": "#6c7086",
+        "danger.background": "#f38ba8", "danger.active.background": "#eba0ac", "danger.hover.background": "#f38ba8",
+        "link.foreground": "#89b4fa", "link.active.foreground": "#89b4fa", "link.hover.foreground": "#89b4fa",
+        "list.active.background": "#89b4fa15", "list.active.border": "#89b4fa77", "list.hover.background": "#202031",
+        "list.even.background": "#161622", "list.head.background": "#1E1E2E",
+        "muted.background": "#302d41", "muted.foreground": "#6c7086", "panel.background": "#302d41",
+        "popover.background": "#1e1e2e", "popover.foreground": "#cdd6f4",
+        "primary.background": "#89b4fa", "primary.active.background": "#89b4fa", "primary.hover.background": "#74c7ec", "primary.foreground": "#1e1e2e",
+        "scrollbar.background": "#1e1e2e00", "scrollbar.thumb.background": "#4e4e5e",
+        "secondary.background": "#302d41", "secondary.foreground": "#cdd6f4",
+        "secondary.active.background": "#45475a", "secondary.hover.background": "#575268",
+        "tab.background": "#0B0B1100", "tab.foreground": "#aeb7d5", "tab_bar.background": "#0B0B11",
+        "title_bar.background": "#11111B", "title_bar.border": "#313244",
+        "base.red": "#f38ba8", "base.green": "#a6e3a1", "base.yellow": "#f9e2af",
+        "base.blue": "#89b4fa", "base.magenta": "#f5c2e7", "base.magenta.light": "#f38ba866", "base.cyan": "#94e2d5"
+      },
+      "highlight": {
+        "editor.foreground": "#cdd6f4", "editor.background": "#181825",
+        "editor.active_line.background": "#222230AA", "editor.line_number": "#6c7086", "editor.active_line_number": "#cdd6f4",
+        "syntax": {
+          "string": { "color": "#a6e3a1" }, "string.escape": { "color": "#a6e3a1" },
+          "number": { "color": "#f9e2af" }, "boolean": { "color": "#f5c2e7" },
+          "constant": { "color": "#f9e2af" }, "keyword": { "color": "#f5c2e7" }, "property": { "color": "#cdd6f4" }
+        }
+      }
+    },
+    {
+      "name": "Gruvbox Light", "mode": "light",
+      "colors": {
+        "accent.background": "#ebdbb2", "accent.foreground": "#3c3836",
+        "background": "#fbf1c7", "foreground": "#3c3836", "border": "#d5c4a1", "ring": "#d79921", "input.border": "#d5c4a1",
+        "danger.background": "#fb4934", "danger.active.background": "#cc241d", "danger.foreground": "#fbf1c7",
+        "link.foreground": "#458588", "link.active.foreground": "#458588", "link.hover.foreground": "#458588",
+        "list.active.background": "#d7992122", "list.active.border": "#d79921", "list.hover.background": "#ebdbb2", "list.even.background": "#f9ecba",
+        "muted.background": "#d5c4a1", "muted.foreground": "#928374", "panel.background": "#ebdbb2",
+        "popover.background": "#fbf1c7", "popover.foreground": "#3c3836",
+        "primary.background": "#d79921", "primary.active.background": "#b7841f", "primary.hover.background": "#d79921ee", "primary.foreground": "#fbf1c7",
+        "scrollbar.background": "#fbf1c700", "scrollbar.thumb.background": "#d5c4a1",
+        "secondary.background": "#EBDBB2", "secondary.foreground": "#3c3836", "secondary.active.background": "#e8d5a6", "secondary.hover.background": "#d5c4a1",
+        "tab.active.background": "#fbf1c7", "tab.active.foreground": "#3c3836", "tab.background": "#ebdbb200", "tab.foreground": "#928374", "tab_bar.background": "#ebdbb2",
+        "title_bar.background": "#ebdbb2", "title_bar.border": "#d5c4a1",
+        "base.red": "#fb4934", "base.green": "#67a64f", "base.yellow": "#b57614", "base.blue": "#076678", "base.magenta": "#8f3f71", "base.magenta.light": "#D3869B66", "base.cyan": "#427b58"
+      },
+      "highlight": {
+        "editor.foreground": "#3c3836", "editor.background": "#fbf1c7", "editor.active_line.background": "#ebdbb2",
+        "editor.line_number": "#928374", "editor.active_line_number": "#3c3836",
+        "syntax": {
+          "string": { "color": "#79740e" }, "string.escape": { "color": "#79740e" },
+          "number": { "color": "#cc241d" }, "boolean": { "color": "#d79921" },
+          "constant": { "color": "#d79921" }, "keyword": { "color": "#cc241d" }, "property": { "color": "#3c3836" }
+        }
+      }
+    },
+    {
+      "name": "Gruvbox Dark", "mode": "dark",
+      "colors": {
+        "accent.background": "#282828", "accent.foreground": "#ebdbb2",
+        "background": "#1d2021", "foreground": "#ebdbb2", "border": "#3e3936", "ring": "#b17f1b", "input.border": "#504945",
+        "danger.active.background": "#fb4934",
+        "link.foreground": "#83a598", "link.active.foreground": "#83a598", "link.hover.foreground": "#83a598",
+        "list.active.background": "#d7992111", "list.active.border": "#b17f1b", "list.even.background": "#282828",
+        "muted.background": "#3c3836", "muted.foreground": "#928374", "panel.background": "#282828",
+        "popover.background": "#1d2021", "popover.foreground": "#ebdbb2",
+        "primary.background": "#d79921", "primary.hover.background": "#fabd2f", "primary.foreground": "#282828",
+        "scrollbar.background": "#1d202100", "scrollbar.thumb.background": "#504945",
+        "secondary.background": "#282828", "secondary.foreground": "#ebdbb2", "secondary.active.background": "#2E2E2D", "secondary.hover.background": "#2E2E2D99",
+        "tab.active.background": "#1d2021", "tab.active.foreground": "#ebdbb2", "tab.background": "#28282800", "tab.foreground": "#928374", "tab_bar.background": "#282828",
+        "title_bar.background": "#252525", "title_bar.border": "#3e3936",
+        "base.red": "#f06555", "base.green": "#98971a", "base.yellow": "#d79921", "base.blue": "#458588", "base.magenta": "#b16286", "base.magenta.light": "#D3869B66", "base.cyan": "#689d6a"
+      },
+      "highlight": {
+        "editor.foreground": "#DDDDDD", "editor.background": "#1d2021", "editor.active_line.background": "#131313",
+        "editor.line_number": "#8F8F8F", "editor.active_line_number": "#DDDDDD",
+        "syntax": {
+          "string": { "color": "#76BA53" }, "string.escape": { "color": "#76BA53" },
+          "number": { "color": "#E19773" }, "boolean": { "color": "#E1D797" },
+          "constant": { "color": "#E1D797" }, "keyword": { "color": "#E19773" }, "property": { "color": "#CACCCA" }
+        }
+      }
+    },
+    {
+      "name": "Solarized Light", "mode": "light",
+      "colors": {
+        "accent.background": "#EEE8D5", "accent.foreground": "#073642",
+        "background": "#FDF6E3", "foreground": "#586E75", "border": "#DCD4BC", "input.border": "#DCD4BC",
+        "link.foreground": "#587573", "list.active.background": "#586E75", "list.active.border": "#586E75", "list.even.background": "#EEE8D599",
+        "muted.background": "#eee8d5", "muted.foreground": "#93a1a1", "panel.background": "#fdf6e3",
+        "popover.background": "#fdf6e3", "popover.foreground": "#073642",
+        "primary.background": "#586E75", "primary.foreground": "#fdf6e3",
+        "scrollbar.background": "#EEE8D500", "scrollbar.thumb.background": "#d5cbaf",
+        "secondary.background": "#EEE8D5", "secondary.foreground": "#073642", "secondary.active.background": "#DCD4BC", "secondary.hover.background": "#DCD4BC88",
+        "tab.active.background": "#fdf6e3", "tab.active.foreground": "#073642", "tab.background": "#fdf6e300", "tab.foreground": "#657b83", "tab_bar.background": "#eee8d5",
+        "title_bar.background": "#f4ecd7", "title_bar.border": "#dcd4bc", "chart.grid": "#ebe5d4",
+        "base.red": "#755858", "base.green": "#717558", "base.yellow": "#756e58", "base.blue": "#586975", "base.magenta": "#755866", "base.cyan": "#587573"
+      },
+      "highlight": {
+        "editor.foreground": "#586E75", "editor.background": "#FDF6E3", "editor.active_line.background": "#EEE8D5",
+        "editor.line_number": "#93A1A1", "editor.active_line_number": "#073642",
+        "syntax": {
+          "string": { "color": "#859900" }, "string.escape": { "color": "#2AA198" },
+          "number": { "color": "#D33682" }, "boolean": { "color": "#CB4B16" },
+          "constant": { "color": "#268BD2" }, "keyword": { "color": "#DC322F" }, "property": { "color": "#586E75" }
+        }
+      }
+    },
+    {
+      "name": "Solarized Dark", "mode": "dark",
+      "colors": {
+        "accent.background": "#15333A", "accent.foreground": "#fdf6e3",
+        "background": "#002B36", "foreground": "#fdf6e3", "border": "#103a44", "input.border": "#083e4c",
+        "list.active.background": "#0d667d25", "list.active.border": "#0d667d", "list.even.background": "#15333A99",
+        "muted.background": "#073642", "muted.foreground": "#839496", "panel.background": "#002b36",
+        "popover.background": "#002b36", "popover.foreground": "#fdf6e3",
+        "primary.background": "#0d667d", "primary.foreground": "#fdf6e3",
+        "scrollbar.background": "#002b3600", "scrollbar.thumb.background": "#586e75",
+        "secondary.background": "#073642", "secondary.foreground": "#fdf6e3", "secondary.active.background": "#073945", "secondary.hover.background": "#083e4b",
+        "tab.active.background": "#002b36", "tab.active.foreground": "#fdf6e3", "tab.foreground": "#93a1a1",
+        "title_bar.background": "#09323d", "title_bar.border": "#16404b",
+        "base.red": "#7d2f0d", "base.green": "#0d7d3f", "base.yellow": "#7d650d", "base.blue": "#0d507d", "base.magenta": "#7d0d43", "base.cyan": "#0d7d70"
+      },
+      "highlight": {
+        "editor.foreground": "#DDDDDD", "editor.background": "#002B36", "editor.active_line.background": "#073642",
+        "editor.line_number": "#8F8F8F", "editor.active_line_number": "#DDDDDD",
+        "syntax": {
+          "string": { "color": "#76BA53" }, "string.escape": { "color": "#76BA53" },
+          "number": { "color": "#E19773" }, "boolean": { "color": "#E1D797" },
+          "constant": { "color": "#E1D797" }, "keyword": { "color": "#E19773" }, "property": { "color": "#CACCCA" }
+        }
+      }
+    },
+    {
+      "name": "Everforest Light", "mode": "light",
+      "colors": {
+        "accent.background": "#E7E5D4", "accent.foreground": "#5F6D75",
+        "background": "#FEFCEE", "foreground": "#5F6D75", "border": "#E7E5D4", "input.border": "#E7E5D4",
+        "danger.background": "#e67e80", "danger.foreground": "#ffffff",
+        "link.foreground": "#7fbbb3", "link.active.foreground": "#7fbbb3", "link.hover.foreground": "#7fbbb3",
+        "list.active.background": "#a7c08025", "list.active.border": "#a7c080", "list.even.background": "#F4F1E2", "list.head.background": "#F4F1E2",
+        "muted.background": "#e0e0e0", "muted.foreground": "#959a9d", "panel.background": "#e0e0e0",
+        "popover.background": "#FEFCEE", "popover.foreground": "#5F6D75",
+        "primary.background": "#e69875", "primary.foreground": "#FEFCEE",
+        "scrollbar.background": "#e0e0e000", "scrollbar.thumb.background": "#D7D5C4",
+        "secondary.background": "#EEEADA", "secondary.foreground": "#5F6D75",
+        "tab.active.background": "#FEFCEE", "tab.active.foreground": "#5F6D75", "tab.background": "#F4F1E200", "tab.foreground": "#6b7b84", "tab_bar.background": "#F4F1E2",
+        "title_bar.background": "#F9F5E4", "title_bar.border": "#E7E5D4",
+        "base.red": "#e67e80", "base.green": "#a7c080", "base.yellow": "#dbbc7f", "base.blue": "#7fbbb3", "base.magenta": "#d699b6", "base.magenta.light": "#d699b699", "base.cyan": "#83c092"
+      },
+      "highlight": {
+        "editor.foreground": "#5F6D75", "editor.background": "#FEFCEE", "editor.active_line.background": "#E7E5D4",
+        "editor.line_number": "#959a9d", "editor.active_line_number": "#5F6D75",
+        "syntax": {
+          "string": { "color": "#a7c080" }, "string.escape": { "color": "#a7c080" },
+          "number": { "color": "#e69875" }, "boolean": { "color": "#e69875" },
+          "constant": { "color": "#e69875" }, "keyword": { "color": "#e67e80" }, "property": { "color": "#5F6D75" }
+        }
+      }
+    },
+    {
+      "name": "Everforest Dark", "mode": "dark",
+      "colors": {
+        "accent.background": "#3c4448", "accent.foreground": "#d3c6aa",
+        "background": "#262E34", "foreground": "#d3c6aa", "border": "#40484c", "input.border": "#485156",
+        "link.foreground": "#7fbbb3", "link.active.foreground": "#7fbbb3", "link.hover.foreground": "#7fbbb3",
+        "list.active.background": "#a7c08022", "list.active.border": "#a7c08088", "list.even.background": "#2E383B", "list.head.background": "#2E383B",
+        "muted.background": "#2E383B", "muted.foreground": "#6D7873", "panel.background": "#2E383B",
+        "popover.background": "#262E34", "popover.foreground": "#d3c6aa",
+        "primary.background": "#e69875", "primary.foreground": "#262E34",
+        "scrollbar.background": "#2E383B00", "scrollbar.thumb.background": "#485156",
+        "secondary.background": "#2E383B", "secondary.foreground": "#849087", "secondary.active.background": "#2c3538", "secondary.hover.background": "#3E474B99",
+        "tab.active.background": "#262E34", "tab.active.foreground": "#d3c6aa", "tab.background": "#262E3400", "tab.foreground": "#849087", "tab_bar.background": "#2E383B",
+        "title_bar.background": "#1f262b", "title_bar.border": "#40484c",
+        "base.red": "#e67e80", "base.green": "#a7c080", "base.yellow": "#dbbc7f", "base.blue": "#7fbbb3", "base.magenta": "#844d64", "base.magenta.light": "#844d6499", "base.cyan": "#83c092"
+      },
+      "highlight": {
+        "editor.foreground": "#d3c6aa", "editor.background": "#262E34", "editor.active_line.background": "#3c4448",
+        "editor.line_number": "#8F8F8F", "editor.active_line_number": "#DDDDDD",
+        "syntax": {
+          "string": { "color": "#76BA53" }, "string.escape": { "color": "#76BA53" },
+          "number": { "color": "#E19773" }, "boolean": { "color": "#E1D797" },
+          "constant": { "color": "#E1D797" }, "keyword": { "color": "#E19773" }, "property": { "color": "#CACCCA" }
+        }
+      }
+    },
+    {
+      "name": "Matrix", "mode": "dark", "radius": 0, "radius.lg": 0,
+      "colors": {
+        "accent.background": "#002d00", "accent.foreground": "#00FF00",
+        "background": "#020D02", "foreground": "#88FF88", "border": "#12410E", "window_border": "#156B12", "ring": "#00FF00", "input.border": "#003200",
+        "danger.background": "#FF0000", "danger.active.background": "#FF0000", "danger.foreground": "#0D0208", "danger.hover.background": "#FF0000",
+        "link.foreground": "#00FF00", "link.active.foreground": "#00FF00", "link.hover.foreground": "#00FF00",
+        "list.active.background": "#00FF0011", "list.active.border": "#00FF00", "list.even.background": "#00190066",
+        "muted.background": "#001900", "muted.foreground": "#007700", "panel.background": "#001900",
+        "popover.background": "#020D02", "popover.foreground": "#00FF00",
+        "primary.background": "#00FF00", "primary.active.background": "#00FF0099", "primary.hover.background": "#00FF00AA", "primary.foreground": "#0D0208",
+        "scrollbar.background": "#0D020800", "scrollbar.thumb.background": "#003d00",
+        "secondary.background": "#002900", "secondary.foreground": "#3fd43a", "secondary.active.background": "#001B00", "secondary.hover.background": "#003300",
+        "tab.active.foreground": "#00FF00", "tab.background": "#0D020800", "tab.foreground": "#88FF88",
+        "title_bar.background": "#020d02", "title_bar.border": "#12410E",
+        "base.red": "#FF0000", "base.green": "#00FF00", "base.yellow": "#ffea00", "base.blue": "#0000ff", "base.magenta": "#FF00FF", "base.cyan": "#00ffd5"
+      },
+      "highlight": {
+        "editor.foreground": "#88FF88", "editor.background": "#020d02", "editor.active_line.background": "#001900",
+        "editor.line_number": "#007700", "editor.active_line_number": "#00FF00",
+        "syntax": {
+          "string": { "color": "#82d967" }, "string.escape": { "color": "#82d967" },
+          "number": { "color": "#FF0000" }, "boolean": { "color": "#ffd700" },
+          "constant": { "color": "#ffd700" }, "keyword": { "color": "#FF0000" }, "property": { "color": "#88FF88" }
+        }
+      }
+    }
+  ]
+}
