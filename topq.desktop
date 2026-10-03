@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Topq
+Comment=Explore MQTT topics and messages
+Exec=topq
+Icon=topq
+Terminal=false
+Type=Application
+Categories=Network;
+StartupNotify=true
