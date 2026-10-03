@@ -106,10 +106,15 @@ pub struct TopicStore {
 }
 
 impl TopicStore {
-    /// Updates the latest value and ancestor counts, returning whether new nodes were added.
+    /// Updates the latest value and ancestor counts, returning whether the tree changed.
     ///
+    /// Zero-length publishes remove cached values, matching retained-message deletion.
     /// Empty levels are preserved: `a`, `a/`, `/a` and `a//b` are distinct MQTT topics.
     pub fn receive(&mut self, message: Message, now: Instant) -> bool {
+        // Brokers normally unset retain when forwarding deletions to existing subscribers.
+        if message.payload.is_empty() {
+            return self.remove(&message.topic);
+        }
         let new_topic = self.nodes.get(&message.topic).is_none_or(|node| node.value.is_none());
         let mut new_nodes = false;
         let root = message.topic.split_once('/').map_or(message.topic.as_str(), |(root, _)| root);
@@ -146,6 +151,39 @@ impl TopicStore {
         self.topics += usize::from(new_topic);
         self.messages += 1;
         new_nodes
+    }
+
+    fn remove(&mut self, path: &str) -> bool {
+        let Some(node) = self.nodes.get_mut(path) else {
+            return false;
+        };
+        let Some(value) = node.value.take() else {
+            return false;
+        };
+        self.topics -= 1;
+        self.messages -= value.messages;
+
+        let mut current = path;
+        while let Some(node) = self.nodes.get_mut(current) {
+            node.topics -= 1;
+            node.messages -= value.messages;
+            let prune = node.value.is_none() && node.children.is_empty();
+            if prune {
+                self.nodes.remove(current);
+            }
+            if let Some((parent, _)) = current.rsplit_once('/') {
+                if prune && let Some(node) = self.nodes.get_mut(parent) {
+                    node.children.remove(current);
+                }
+                current = parent;
+            } else {
+                if prune {
+                    self.roots.remove(current);
+                }
+                break;
+            }
+        }
+        true
     }
 
     /// Exact publishable names in a branch, including intermediate levels but not the empty root.
@@ -244,11 +282,74 @@ mod tests {
     }
 
     #[test]
-    fn displays_json_text_empty_and_binary_payloads() {
+    fn empty_publishes_remove_values_and_prune_empty_ancestors_without_requiring_retain() {
+        let mut store = TopicStore::default();
+        let now = Instant::now();
+        for topic in ["home/branch/a", "home/branch/a", "home/branch/b", "home/sibling", "home2/a"] {
+            store.receive(message(topic, b"value"), now);
+        }
+        for topic in ["home", "home/branch", "home/branch/a", "home/branch/b"] {
+            let mut deletion = message(topic, b"");
+            deletion.retained = false;
+            store.receive(deletion, now);
+        }
+        assert_eq!(store.branch_paths("home"), ["home", "home/sibling"]);
+        assert_eq!(store.visible_paths(&BTreeSet::new()), ["home", "home2"]);
+        assert_eq!((store.topics, store.messages), (2, 2));
+        assert_eq!((store.nodes["home"].topics, store.nodes["home"].messages), (1, 1));
+        assert!(!store.receive(message("home/branch/a", b""), now));
+        assert!(!store.receive(message("unknown", b""), now));
+        assert_eq!((store.topics, store.messages), (2, 2));
+    }
+
+    #[test]
+    fn deleting_a_parent_value_preserves_its_children_and_deleting_children_preserves_a_parent_value() {
+        let mut store = TopicStore::default();
+        let now = Instant::now();
+        for topic in ["a", "a/b", "a/b/c", "a/b/c"] {
+            store.receive(message(topic, b"value"), now);
+        }
+        assert!(store.receive(message("a/b", b""), now));
+        assert!(store.nodes["a/b"].value.is_none());
+        assert!(store.nodes["a/b/c"].value.is_some());
+        assert_eq!((store.nodes["a"].topics, store.nodes["a"].messages), (2, 3));
+        assert!(store.receive(message("a/b/c", b""), now));
+        assert_eq!(store.branch_paths("a"), ["a"]);
+        assert_eq!((store.topics, store.messages), (1, 1));
+        assert!(store.nodes["a"].value.is_some());
+        assert!(store.receive(message("a", b""), now));
+        assert!(store.nodes.is_empty());
+        assert!(store.visible_paths(&BTreeSet::new()).is_empty());
+        assert_eq!((store.topics, store.messages), (0, 0));
+        assert!(store.receive(message("a/b/c", b"new"), now));
+        assert_eq!(store.branch_paths("a"), ["a", "a/b", "a/b/c"]);
+        assert_eq!((store.topics, store.messages), (1, 1));
+    }
+
+    #[test]
+    fn deleting_confirmed_names_preserves_new_descendants_and_empty_unicode_levels() {
+        let mut store = TopicStore::default();
+        let now = Instant::now();
+        for topic in ["/測定値/", "/測定値//温度", "other"] {
+            store.receive(message(topic, b"value"), now);
+        }
+        let confirmed = store.branch_paths("");
+        store.receive(message("/測定値//new", b"live"), now);
+        for topic in confirmed {
+            store.receive(message(&topic, b""), now);
+        }
+        assert_eq!(store.branch_paths(""), ["/測定値", "/測定値/", "/測定値//new"]);
+        assert_eq!((store.topics, store.messages), (2, 2));
+        store.receive(message("/測定値//new", b""), now);
+        assert!(!store.nodes.contains_key(""));
+        assert_eq!(store.visible_paths(&BTreeSet::new()), ["other"]);
+    }
+
+    #[test]
+    fn displays_json_text_and_binary_payloads() {
         for (payload, expected) in [
             (br#"{"on":true}"#.as_slice(), "{\n  \"on\": true\n}"),
             (b"hello".as_slice(), "hello"),
-            (b"".as_slice(), ""),
             (&[0xff, 0x00], "ff 00"),
         ] {
             let mut store = TopicStore::default();

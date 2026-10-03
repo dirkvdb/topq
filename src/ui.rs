@@ -1,16 +1,19 @@
 //! Connection configuration, live topic navigation, and selected-topic details.
 
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, BTreeSet},
+    rc::Rc,
     time::{Duration, Instant},
 };
 
 use gpui_kit::assets::IconName as AssetIconName;
 use gpui_kit::component::{
-    ActiveTheme, Disableable, Icon, IconName, IndexPath, Sizable, StyledExt, TitleBar,
-    button::{Button, ButtonVariants},
+    ActiveTheme, Disableable, Icon, IconName, IndexPath, Sizable, StyledExt, TitleBar, WindowExt,
+    button::{Button, ButtonVariant, ButtonVariants},
     input::{Editor, EditorState, InputEvent, InputState},
     list::ListItem,
+    marker::{Marker, MarkerContent},
     menu::{DropdownMenu, PopupMenuItem},
     resizable::{ResizablePanelEvent, ResizableState, h_resizable, resizable_panel},
     select::SelectState,
@@ -19,8 +22,8 @@ use gpui_kit::component::{
     tree::{Tree, TreeEntry, TreeEvent, TreeItem, TreeState},
 };
 use gpui_kit::{
-    App, ClipboardItem, Context, Entity, FocusHandle, IntoElement, KeyBinding, MouseButton, PromptButton, PromptLevel, Render, Role,
-    ScrollStrategy, SharedString, Subscription, Task, TestSupportExt, Window, div, prelude::*, relative, rems,
+    App, ClipboardItem, Context, Entity, FocusHandle, HighlightStyle, IntoElement, KeyBinding, MouseButton, Render, Role, ScrollStrategy,
+    SharedString, StyledText, Subscription, Task, TestSupportExt, Window, div, prelude::*, relative, rems,
 };
 
 use crate::{
@@ -379,9 +382,10 @@ impl Explorer {
                 BrokerEvent::Status(status) => self.status = ConnectionStatus::Failed(status),
                 BrokerEvent::OperationError(error) => self.error = Some(format!("Could not clear retained topics: {error}")),
                 BrokerEvent::Message(message) => {
+                    let has_payload = !message.payload.is_empty();
                     payload_changed |= self.selected.as_ref() == Some(&message.topic);
                     tree_changed |= self.topics.receive(message, now);
-                    if !cx.reduce_motion() {
+                    if has_payload && !cx.reduce_motion() {
                         self.flash_until = Some(now + FLASH_DURATION);
                     }
                 }
@@ -393,6 +397,11 @@ impl Explorer {
             changed = true;
         }
         if tree_changed {
+            self.expanded.retain(|path| self.topics.nodes.contains_key(path));
+            if self.selected.as_ref().is_some_and(|path| !self.topics.nodes.contains_key(path)) {
+                self.selected = None;
+                payload_changed = true;
+            }
             self.sync_tree(cx);
         }
         if payload_changed {
@@ -504,34 +513,82 @@ impl Explorer {
             format!("the {children} known topics under the empty topic level")
         } else {
             format!(
-                "\"{path}\" and {children} known child {}",
+                "{path} and {children} known child {}",
                 if children == 1 { "topic" } else { "topics" }
             )
         };
-        let detail = format!(
-            "Do you want to clear {scope}?\n\nThis will send an empty payload (QoS 0, retain) to each exact topic name in this branch, clearing retained messages on the broker. This cannot be undone and may affect other subscribers. Only use this function if you know what you are doing.\n\nOnly the topics known now are included. Live publishers may recreate them."
-        );
-        let answer = window.prompt(
-            PromptLevel::Warning,
-            "Confirm delete",
-            Some(&detail),
-            &[PromptButton::cancel("Cancel"), PromptButton::new("Delete")],
-            cx,
-        );
-        cx.spawn_in(window, async move |view, cx| {
-            if answer.await == Ok(1) {
-                _ = view.update_in(cx, |view, _, cx| {
-                    let result = if view.status.is_connected() {
-                        send(view, topics)
-                    } else {
-                        Err(anyhow::anyhow!("The broker disconnected. Confirm again while connected."))
-                    };
-                    view.error = result.err().map(|error| format!("Could not clear retained topics: {error:#}"));
-                    cx.notify();
-                });
-            }
-        })
-        .detach();
+        let scope = SharedString::from(format!("Delete {scope}."));
+        let topic_range = (!path.is_empty()).then(|| {
+            let start = "Delete ".len();
+            start..start + path.len()
+        });
+        let warning = "Clears retained messages on the broker. This cannot be undone and may affect other subscribers.";
+
+        let pending = Rc::new(RefCell::new(Some((send, topics))));
+        let view = cx.weak_entity();
+        window.open_alert_dialog(cx, move |dialog, window, cx| {
+            let pending = pending.clone();
+            let view = view.clone();
+            dialog
+                .width(rems(32.).to_pixels(window.rem_size()))
+                .p_4()
+                .icon(Icon::new(AssetIconName::Info).size_5().text_color(cx.theme().danger))
+                .title("Confirm delete")
+                .description(
+                    div()
+                        .id("delete-topic-scope")
+                        .test_support()
+                        .aria_label(scope.clone())
+                        .min_w_0()
+                        .child(StyledText::new(scope.clone()).with_highlights(topic_range.clone().map(|range| {
+                            (
+                                range,
+                                HighlightStyle {
+                                    color: Some(cx.theme().warning),
+                                    ..Default::default()
+                                },
+                            )
+                        }))),
+                )
+                .child(
+                    div().pl_7().child(
+                        div()
+                            .id("delete-topic-marker")
+                            .test_support()
+                            .p_3()
+                            .bg(cx.theme().muted.opacity(0.15))
+                            .border_1()
+                            .border_color(cx.theme().border.opacity(0.4))
+                            .rounded(cx.theme().radius_tokens().sm)
+                            .child(
+                                Marker::new().text_xs().text_color(cx.theme().foreground).content(
+                                    MarkerContent::new()
+                                        .w_full()
+                                        .child(div().id("delete-topic-warning").test_support().aria_label(warning).child(warning)),
+                                ),
+                            ),
+                    ),
+                )
+                .confirm()
+                .cancel_text("Cancel")
+                .ok_text("Delete")
+                .ok_variant(ButtonVariant::Danger)
+                .on_ok(move |_, _, cx| {
+                    // The dialog builder runs every frame; consume the frozen request only once.
+                    if let Some((send, topics)) = pending.borrow_mut().take() {
+                        _ = view.update(cx, |view, cx| {
+                            let result = if view.status.is_connected() {
+                                send(view, topics)
+                            } else {
+                                Err(anyhow::anyhow!("The broker disconnected. Confirm again while connected."))
+                            };
+                            view.error = result.err().map(|error| format!("Could not clear retained topics: {error:#}"));
+                            cx.notify();
+                        });
+                    }
+                    true
+                })
+        });
     }
 
     fn focus_topics(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -836,11 +893,6 @@ impl Explorer {
                     .font_medium()
                     .label(if level.is_empty() { "(empty level)" } else { level }.to_owned())
                     .accessibility_label(format!("Navigate to topic {prefix}"))
-                    .tooltip(if prefix.is_empty() {
-                        "(empty level)".to_owned()
-                    } else {
-                        prefix.clone()
-                    })
                     .on_click(cx.listener(move |view, _, window, cx| view.select_topic(&prefix, window, cx))),
             );
         }

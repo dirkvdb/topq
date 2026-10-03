@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use chrono::Local;
-use gpui_kit::component::{ActiveTheme, Theme, ThemeMode};
+use gpui_kit::component::{ActiveTheme, Theme, ThemeMode, WindowExt};
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{AnyWindowHandle, AppContext, Bounds, Entity, Styled, TestAppContext, WindowBounds, WindowOptions, px, size};
 
@@ -521,7 +521,7 @@ fn confirming_connection_deletion_preserves_topics_when_saving_fails(cx: &mut Te
 }
 
 #[gpui_kit::test]
-fn new_connection_topics_default_to_all_topics_with_qos_zero_before_credentials(cx: &mut TestAppContext) {
+fn new_connection_topics_default_to_all_topics_with_qos_zero_after_credentials(cx: &mut TestAppContext) {
     let (handle, view) = open(cx, true, 1200., 1200.);
     cx.update_window(handle, |_, window, cx| {
         window.render_frame(cx);
@@ -535,9 +535,9 @@ fn new_connection_topics_default_to_all_topics_with_qos_zero_before_credentials(
         assert_eq!(window.find("remove-topic:#").label(), Some("Remove topic #"));
         assert_eq!(window.find("begin-add-topic").label(), Some("Add topic"));
         assert!(window.try_find("topic-editor").is_none());
-        assert!(section.bounds().top() > window.find("tls").bounds().bottom());
-        assert!(section.bounds().bottom() < window.find("connection-field:username").bounds().top());
+        assert!(window.find("connection-field:username").bounds().top() > window.find("tls").bounds().bottom());
         assert!(window.find("field:username").bounds().bottom() < window.find("field:password").bounds().top());
+        assert!(section.bounds().top() > window.find("connection-field:password").bounds().bottom());
         assert_eq!(view.read(cx).subscription_topics, vec![subscription("#", 0)]);
     })
     .unwrap();
@@ -1694,8 +1694,18 @@ fn topic_breadcrumbs_preserve_empty_levels_and_unicode_prefixes(cx: &mut TestApp
     }
 }
 
+fn click_topic_deletion_button(cx: &mut TestAppContext, handle: AnyWindowHandle, button: &'static str) {
+    cx.update(|cx| cx.set_reduce_motion(true));
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.within("dialog").click(button, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+}
+
 #[gpui_kit::test]
-fn topic_delete_button_requires_confirmation_and_publishes_empty_retained_messages(cx: &mut TestAppContext) {
+fn topic_deletion_requires_confirmation_and_broker_updates_remove_it_in_both_clients(cx: &mut TestAppContext) {
     use std::{
         io::{Read, Write},
         net::{TcpListener, TcpStream},
@@ -1714,14 +1724,20 @@ fn topic_delete_button_requires_confirmation_and_publishes_empty_retained_messag
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (sent, received) = std::sync::mpsc::channel();
+    let (recreate, recreation_requested) = std::sync::mpsc::channel();
     let broker = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        assert_eq!(packet(&mut stream).0, 0x10);
-        stream.write_all(&[0x20, 2, 0, 0]).unwrap();
-        let (header, subscribe) = packet(&mut stream);
-        assert_eq!(header, 0x82);
-        stream.write_all(&[0x90, 3, subscribe[0], subscribe[1], 2]).unwrap();
+        let handshake = || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            assert_eq!(packet(&mut stream).0, 0x10);
+            stream.write_all(&[0x20, 2, 0, 0]).unwrap();
+            let (header, subscribe) = packet(&mut stream);
+            assert_eq!(header, 0x82);
+            stream.write_all(&[0x90, 3, subscribe[0], subscribe[1], 2]).unwrap();
+            stream
+        };
+        let mut stream = handshake();
+        let mut observer = handshake();
         let mut topics = Vec::new();
         for _ in 0..3 {
             let (header, body) = packet(&mut stream);
@@ -1729,54 +1745,126 @@ fn topic_delete_button_requires_confirmation_and_publishes_empty_retained_messag
             let length = usize::from(u16::from_be_bytes([body[0], body[1]]));
             assert_eq!(body.len(), length + 2, "deletion payload must be empty");
             topics.push(String::from_utf8(body[2..].to_vec()).unwrap());
+            // Existing subscriptions receive the empty publish with retain unset.
+            for subscriber in [&mut stream, &mut observer] {
+                subscriber.write_all(&[0x30, body.len() as u8]).unwrap();
+                subscriber.write_all(&body).unwrap();
+            }
         }
         sent.send(topics).unwrap();
+        recreation_requested.recv_timeout(Duration::from_secs(5)).unwrap();
+        let body = b"\x00\x06home/alive";
+        for subscriber in [&mut stream, &mut observer] {
+            subscriber.write_all(&[0x30, body.len() as u8]).unwrap();
+            subscriber.write_all(body).unwrap();
+        }
         assert_eq!(stream.read(&mut [0]).unwrap(), 0);
+        assert_eq!(observer.read(&mut [0]).unwrap(), 0);
     });
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-    let mut connection = crate::mqtt::connect(ConnectionConfig {
-        host: "127.0.0.1".into(),
-        port,
-        ..Default::default()
+    let mut connections = Vec::new();
+    for _ in 0..2 {
+        let mut connection = crate::mqtt::connect(ConnectionConfig {
+            host: "127.0.0.1".into(),
+            port,
+            ..Default::default()
+        })
+        .unwrap();
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match connection.events.recv().await.unwrap() {
+                        crate::mqtt::BrokerEvent::Connected => break,
+                        crate::mqtt::BrokerEvent::Status(error) => panic!("test broker failed: {error}"),
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .unwrap();
+        });
+        connections.push(connection);
+    }
+    let (observer_handle, observer) = open(cx, false, 1200., 760.);
+    cx.update_window(observer_handle, |_, window, cx| {
+        observer.update(cx, |view, cx| {
+            view.connection = connections.pop();
+            view.topics.receive(message("outside/a"), std::time::Instant::now());
+            view.expanded.insert("outside".into());
+            view.select_topic("home/a", window, cx);
+        });
     })
     .unwrap();
-    runtime.block_on(async {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                match connection.events.recv().await.unwrap() {
-                    crate::mqtt::BrokerEvent::Connected => break,
-                    crate::mqtt::BrokerEvent::Status(error) => panic!("test broker failed: {error}"),
-                    _ => {}
-                }
-            }
-        })
-        .await
-        .unwrap();
-    });
+    let connection = connections.pop().unwrap();
     let (handle, view) = open(cx, false, 1200., 760.);
     cx.update_window(handle, |_, window, cx| {
         view.update(cx, |view, cx| {
             view.connection = Some(connection);
+            view.topics.receive(message("outside/a"), std::time::Instant::now());
+            view.expanded.insert("outside".into());
             view.select_topic("home", window, cx);
         });
         window.render_frame(cx);
         window.click("delete-topic", cx);
     })
     .unwrap();
-    assert_eq!(cx.pending_prompt().unwrap().0, "Confirm delete");
+    assert!(
+        !cx.has_pending_prompt(),
+        "confirmation should use a GPUI Kit dialog, not a platform prompt"
+    );
     assert!(received.try_recv().is_err());
-    cx.simulate_prompt_answer("Cancel");
-    cx.run_until_parked();
+    click_topic_deletion_button(cx, handle, "cancel");
     assert!(received.try_recv().is_err());
     cx.update_window(handle, |_, window, cx| {
         window.render_frame(cx);
         window.click("delete-topic", cx);
     })
     .unwrap();
-    cx.simulate_prompt_answer("Delete");
-    cx.run_until_parked();
+    click_topic_deletion_button(cx, handle, "ok");
     assert_eq!(received.recv_timeout(Duration::from_secs(5)).unwrap(), ["home", "home/a", "home/b"]);
+    let clients = [(handle, view.clone()), (observer_handle, observer.clone())];
+    for recreated in [false, true] {
+        if recreated {
+            recreate.send(()).unwrap();
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut ready = true;
+            for (handle, view) in &clients {
+                ready &= cx
+                    .update_window(*handle, |_, window, cx| {
+                        view.update(cx, |view, cx| view.poll(window, cx));
+                        window.render_frame(cx);
+                        view.read(cx).topics.nodes.contains_key("home") == recreated
+                    })
+                    .unwrap();
+            }
+            if ready {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "both clients must process the broker update");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        cx.update(|cx| {
+            for (_, view) in &clients {
+                let view = view.read(cx);
+                assert_eq!(view.topics.topics, if recreated { 2 } else { 1 });
+                assert_eq!(view.topics.messages, if recreated { 2 } else { 1 });
+                assert_eq!(view.tree_state.read(cx).index_of(&"home".into()).is_some(), recreated);
+                assert!(view.selected.is_none());
+                assert!(view.payload.read(cx).value().is_empty());
+                assert!(view.expanded.contains("outside"));
+                assert!(!view.expanded.contains("home"));
+                assert!(view.topics.nodes["outside/a"].value.is_some());
+                assert!(view.error.is_none());
+                if recreated {
+                    assert_eq!(view.topics.nodes["home/a"].value.as_ref().unwrap().payload.as_ref(), b"live");
+                }
+            }
+        });
+    }
     view.update(cx, |view, _| view.connection = None);
+    observer.update(cx, |view, _| view.connection = None);
     broker.join().unwrap();
 }
 
@@ -1795,14 +1883,25 @@ fn canceling_topic_deletion_preserves_topics_and_does_not_publish(cx: &mut TestA
         });
     })
     .unwrap();
-    let (title, detail) = cx.pending_prompt().expect("deletion must require confirmation");
-    assert_eq!(title, "Confirm delete");
-    assert!(detail.contains("\"home\" and 2 known child topics"));
-    assert!(detail.contains("empty payload (QoS 0, retain)"));
-    assert!(detail.contains("cannot be undone"));
-    assert_eq!(sends.get(), 0);
-    cx.simulate_prompt_answer("Cancel");
-    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.has_active_dialog(cx));
+        assert_eq!(
+            window.find("delete-topic-scope").label(),
+            Some("Delete home and 2 known child topics.")
+        );
+        let warning = window.find("delete-topic-warning");
+        assert_eq!(
+            warning.label(),
+            Some("Clears retained messages on the broker. This cannot be undone and may affect other subscribers.")
+        );
+        assert!(window.try_find("delete-topic-note").is_none());
+        assert_eq!(sends.get(), 0);
+    })
+    .unwrap();
+    click_topic_deletion_button(cx, handle, "cancel");
+    cx.update_window(handle, |_, window, cx| assert!(!window.has_active_dialog(cx)))
+        .unwrap();
     cx.update(|cx| {
         let view = view.read(cx);
         assert_eq!(sends.get(), 0);
@@ -1810,6 +1909,143 @@ fn canceling_topic_deletion_preserves_topics_and_does_not_publish(cx: &mut TestA
         assert_eq!(view.selected.as_deref(), Some("home"));
         assert!(view.error.is_none());
     });
+}
+
+#[gpui_kit::test]
+fn topic_deletion_dialog_escape_cancels_and_restores_focus(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, false, 760., 540.);
+    let mut previous_focus = None;
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.select_topic("home", window, cx);
+            previous_focus = window.focused(cx);
+            view.confirm_clear_topic_with_send("home".into(), window, cx, |_, _| panic!("Escape must not publish"));
+        });
+        window.render_frame(cx);
+        assert!(window.has_active_dialog(cx));
+        assert!(!previous_focus.as_ref().unwrap().is_focused(window));
+        window.press("escape", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(!window.has_active_dialog(cx));
+        assert!(previous_focus.as_ref().unwrap().is_focused(window));
+        assert!(view.read(cx).error.is_none());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn topic_deletion_dialog_enter_confirms_only_once(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, false, 760., 540.);
+    let sends = std::rc::Rc::new(std::cell::Cell::new(0));
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.select_topic("home", window, cx);
+            let sends = sends.clone();
+            view.confirm_clear_topic_with_send("home".into(), window, cx, move |_, _| {
+                sends.set(sends.get() + 1);
+                Ok(())
+            });
+        });
+        window.render_frame(cx);
+        window.press("enter", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(!window.has_active_dialog(cx));
+        window.press("enter", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(sends.get(), 1);
+}
+
+#[gpui_kit::test]
+fn topic_deletion_dialog_wraps_content_and_keeps_actions_visible_across_themes_and_zoom(cx: &mut TestAppContext) {
+    cx.update(|cx| cx.set_reduce_motion(true));
+    for mode in [ThemeMode::Light, ThemeMode::Dark] {
+        for (width, height, font_size) in [(760., 540., 16.), (760., 540., 20.), (480., 400., 20.)] {
+            let (handle, view) = open(cx, false, width, height);
+            cx.update(|cx| {
+                Theme::change(mode, None, cx);
+                Theme::update(cx, |theme| theme.font_size = px(font_size));
+            });
+            cx.update_window(handle, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    let path = "homeassistant/binary_sensor/very_long_device_identifier/living_room/occupancy/state";
+                    view.topics.receive(message(path), std::time::Instant::now());
+                    view.select_topic(path, window, cx);
+                    view.confirm_clear_topic_with_send(path.into(), window, cx, |_, _| panic!("layout test must not publish"));
+                });
+                window.render_frame(cx);
+                let surface = window.within("dialog").find(0usize).bounds();
+                let scope = window.find("delete-topic-scope");
+                let marker = window.find("delete-topic-marker");
+                let warning = window.find("delete-topic-warning");
+
+                let cancel = window.within("dialog").find("cancel");
+                let delete = window.within("dialog").find("ok");
+                assert!(scope.visible());
+                assert!(marker.visible());
+                assert!(warning.visible());
+
+                assert_eq!(scope.bounds().left(), marker.bounds().left(), "marker should align under the title");
+                assert!(warning.bounds().size.height > window.rem_size() * 2., "warning should wrap");
+                assert!(warning.bounds().left() > marker.bounds().left());
+                assert!(warning.bounds().right() < marker.bounds().right());
+                assert!(warning.bounds().top() > marker.bounds().top());
+                assert!(warning.bounds().bottom() < marker.bounds().bottom());
+                assert!(marker.bounds().bottom() <= cancel.bounds().top());
+                assert!(marker.bounds().right() <= surface.right());
+                for content in [scope.bounds(), cancel.bounds(), delete.bounds()] {
+                    assert!(content.left() >= surface.left());
+                    assert!(content.right() <= surface.right());
+                    assert!(content.bottom() <= surface.bottom());
+                }
+                assert!(surface.left() >= px(0.) && surface.right() <= px(width));
+                assert!(surface.top() >= px(0.) && surface.bottom() <= px(height));
+                assert!(cancel.visible() && delete.visible());
+                assert_eq!(cancel.label(), Some("Cancel"));
+                assert_eq!(delete.label(), Some("Delete"));
+                assert_eq!(cancel.bounds().top(), delete.bounds().top());
+                assert!(cancel.bounds().right() <= delete.bounds().left());
+
+                window.press("escape", cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+        }
+    }
+}
+
+#[gpui_kit::test]
+fn topic_deletion_scope_renders_unicode_and_empty_topic_levels(cx: &mut TestAppContext) {
+    cx.update(|cx| cx.set_reduce_motion(true));
+    for (path, message_topic, expected) in [
+        ("home/測定値", "home/測定値", "Delete home/測定値 and 0 known child topics."),
+        ("", "/測定値", "Delete the 1 known topics under the empty topic level."),
+    ] {
+        let (handle, view) = open(cx, false, 760., 540.);
+        cx.update_window(handle, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                view.topics.receive(message(message_topic), std::time::Instant::now());
+                view.select_topic(path, window, cx);
+                view.confirm_clear_topic_with_send(path.into(), window, cx, |_, _| panic!("rendering must not publish"));
+            });
+            window.render_frame(cx);
+            let scope = window.find("delete-topic-scope");
+            assert!(scope.visible());
+            assert_eq!(scope.label(), Some(expected));
+            window.press("escape", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+    }
 }
 
 #[gpui_kit::test]
@@ -1830,8 +2066,7 @@ fn confirming_topic_deletion_sends_only_the_scope_shown_in_the_warning(cx: &mut 
     })
     .unwrap();
     assert!(sent.borrow().is_empty());
-    cx.simulate_prompt_answer("Delete");
-    cx.run_until_parked();
+    click_topic_deletion_button(cx, handle, "ok");
     cx.update(|cx| {
         let view = view.read(cx);
         assert_eq!(*sent.borrow(), ["home", "home/a", "home/b"]);
@@ -1853,9 +2088,12 @@ fn failed_topic_deletion_reports_the_error_without_losing_topic_data(cx: &mut Te
         });
     })
     .unwrap();
-    assert!(cx.pending_prompt().unwrap().1.contains("0 known child topics"));
-    cx.simulate_prompt_answer("Delete");
-    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.find("delete-topic-scope").label().unwrap().contains("0 known child topics"));
+    })
+    .unwrap();
+    click_topic_deletion_button(cx, handle, "ok");
     cx.update(|cx| {
         let view = view.read(cx);
         assert!(view.error.as_ref().unwrap().contains("queue full"));
@@ -1875,8 +2113,7 @@ fn disconnecting_during_topic_deletion_confirmation_prevents_publishing(cx: &mut
         });
     })
     .unwrap();
-    cx.simulate_prompt_answer("Delete");
-    cx.run_until_parked();
+    click_topic_deletion_button(cx, handle, "ok");
     cx.update(|cx| {
         let view = view.read(cx);
         assert!(view.error.as_ref().unwrap().contains("disconnected"));
@@ -1885,7 +2122,7 @@ fn disconnecting_during_topic_deletion_confirmation_prevents_publishing(cx: &mut
 }
 
 #[gpui_kit::test]
-fn disconnected_topic_deletion_does_not_open_a_prompt(cx: &mut TestAppContext) {
+fn disconnected_topic_deletion_does_not_open_a_dialog(cx: &mut TestAppContext) {
     let (handle, view) = open(cx, false, 1200., 760.);
     cx.update_window(handle, |_, window, cx| {
         view.update(cx, |view, cx| {
@@ -1897,7 +2134,8 @@ fn disconnected_topic_deletion_does_not_open_a_prompt(cx: &mut TestAppContext) {
         window.click("delete-topic", cx);
     })
     .unwrap();
-    assert!(!cx.has_pending_prompt());
+    cx.update_window(handle, |_, window, cx| assert!(!window.has_active_dialog(cx)))
+        .unwrap();
 }
 
 #[gpui_kit::test]

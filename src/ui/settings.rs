@@ -950,9 +950,9 @@ impl Explorer {
             self.setting_input("host", "Host", &self.host, Some(ConnectionField::Host)),
             self.setting_input("port", "Port", &self.port, Some(ConnectionField::Port)),
             tls_item,
-            self.subscription_topics_section(cx),
             self.setting_input("username", "Username", &self.username, Some(ConnectionField::Username)),
             self.setting_input("password", "Password", &self.password, None),
+            self.subscription_topics_section(cx),
         ]);
         if let Some(error) = self.error.clone() {
             group = group.item(
