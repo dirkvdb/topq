@@ -15,7 +15,7 @@ use gpui_kit::component::{
     list::ListItem,
     marker::{Marker, MarkerContent},
     menu::{DropdownMenu, PopupMenuItem},
-    resizable::{ResizablePanelEvent, ResizableState, h_resizable, resizable_panel},
+    resizable::{ResizablePanelEvent, ResizableState, h_resizable, resizable_panel, v_resizable},
     select::{SelectEvent, SelectState},
     spinner::Spinner,
     tag::Tag,
@@ -47,7 +47,9 @@ gpui_kit::actions!(
         LastTopic,
         NarrowTopics,
         WidenTopics,
-        PublishMessage
+        PublishMessage,
+        GrowPublish,
+        ShrinkPublish
     ]
 );
 
@@ -66,6 +68,8 @@ pub(crate) fn init(cx: &mut App) {
         KeyBinding::new("ctrl-alt-left", NarrowTopics, Some("Explorer")),
         KeyBinding::new("ctrl-alt-right", WidenTopics, Some("Explorer")),
         KeyBinding::new("ctrl-enter", PublishMessage, Some("PublishPanel")),
+        KeyBinding::new("ctrl-alt-up", GrowPublish, Some("PublishPanel")),
+        KeyBinding::new("ctrl-alt-down", ShrinkPublish, Some("PublishPanel")),
     ]);
 }
 
@@ -151,10 +155,16 @@ pub struct Explorer {
     publish_open: bool,
     publish_topic: Entity<InputState>,
     publish_payload: Entity<EditorState>,
+    publish_content: publish::PayloadContent,
     publish_qos: Entity<SelectState<Vec<&'static str>>>,
     publish_retain: bool,
     publish_pending: bool,
     publish_feedback: Option<Result<String, String>>,
+    publish_panes: Entity<ResizableState>,
+    publish_panel_height: gpui_kit::Pixels,
+    publish_height_rem: Option<f32>,
+    publish_height_fraction: Option<f32>,
+    restore_publish_height: bool,
     panes: Entity<ResizableState>,
     topics_width_rem: Option<f32>,
     topics_width_fraction: Option<f32>,
@@ -174,7 +184,12 @@ impl Explorer {
             Err(error) => (SavedConnections::default(), Some(format!("{error:#}"))),
         };
         let layout = config::load_topics_layout().unwrap_or_default();
-        Self::with_connections(saved_connections, error, layout.width_rem, layout.width_fraction, window, cx)
+        let publish_layout = config::load_publish_layout().unwrap_or_default();
+        let mut view = Self::with_connections(saved_connections, error, layout.width_rem, layout.width_fraction, window, cx);
+        view.publish_height_rem = publish_layout.height_rem;
+        view.publish_height_fraction = publish_layout.height_fraction;
+        view.restore_publish_height = publish_layout.height_rem.is_some() || publish_layout.height_fraction.is_some();
+        view
     }
 
     #[cfg(test)]
@@ -256,6 +271,7 @@ impl Explorer {
         tree_state.update(cx, |state, cx| state.focus(window, cx));
         let _tree_focus = window.focused(cx).map(|handle| handle.tab_stop(true));
         let panes = cx.new(|_| ResizableState::default());
+        let publish_panes = cx.new(|_| ResizableState::default());
         let mut subscriptions: Vec<_> = [&name, &host, &port, &client_id, &username, &password]
             .into_iter()
             .map(|input| {
@@ -272,6 +288,11 @@ impl Explorer {
                 })
             })
             .collect();
+        subscriptions.push(cx.subscribe_in(&publish_payload, window, |view, _, event, _, cx| {
+            if matches!(event, InputEvent::Change) {
+                view.update_publish_content(cx);
+            }
+        }));
         subscriptions.push(cx.subscribe_in(&protocol, window, |view, _, event, window, cx| {
             let SelectEvent::Confirm(Some(protocol)) = event else { return };
             let port = view.port.read(cx).value();
@@ -332,6 +353,11 @@ impl Explorer {
         subscriptions.push(cx.subscribe_in(&panes, window, |view, state, _: &ResizablePanelEvent, window, cx| {
             view.persist_split(state, window, cx);
         }));
+        subscriptions.push(
+            cx.subscribe_in(&publish_panes, window, |view, state, _: &ResizablePanelEvent, window, cx| {
+                view.persist_publish_split(state, window, cx);
+            }),
+        );
         let poll = cx.spawn_in(window, async move |view, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_millis(50)).await;
@@ -360,10 +386,16 @@ impl Explorer {
             publish_open: false,
             publish_topic,
             publish_payload,
+            publish_content: publish::PayloadContent::default(),
             publish_qos,
             publish_retain: false,
             publish_pending: false,
             publish_feedback: None,
+            publish_panes,
+            publish_panel_height: gpui_kit::Pixels::ZERO,
+            publish_height_rem: None,
+            publish_height_fraction: None,
+            restore_publish_height: false,
             tree_state,
             panes,
             topics_width_fraction: width_fraction,
@@ -909,8 +941,7 @@ impl Explorer {
             )
     }
 
-    fn tree(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let view = cx.weak_entity();
+    fn tree(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("topics-pane")
             .test_support()
@@ -919,6 +950,49 @@ impl Explorer {
             .min_h_0()
             .min_w_0()
             .bg(cx.theme().sidebar)
+            .child(
+                div().size_full().min_w_0().min_h_0().child(
+                    v_resizable("publish-panes")
+                        .with_state(&self.publish_panes)
+                        .child(
+                            resizable_panel()
+                                .size_range(rems(4.5).to_pixels(window.rem_size())..gpui_kit::Pixels::MAX)
+                                .min_w_0()
+                                .child(self.topic_list(cx)),
+                        )
+                        .child(
+                            resizable_panel()
+                                .size(
+                                    rems(if self.publish_open {
+                                        self.publish_height_rem.unwrap_or(19.).max(19.)
+                                    } else {
+                                        2.5
+                                    })
+                                    .to_pixels(window.rem_size()),
+                                )
+                                .size_range(
+                                    rems(if self.publish_open { 19. } else { 2.5 }).to_pixels(window.rem_size())..if self.publish_open {
+                                        gpui_kit::Pixels::MAX
+                                    } else {
+                                        rems(2.5).to_pixels(window.rem_size())
+                                    },
+                                )
+                                .min_w_0()
+                                .flex_grow_0()
+                                .flex_shrink_1()
+                                .child(self.publish_panel(cx)),
+                        ),
+                ),
+            )
+    }
+
+    fn topic_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = cx.weak_entity();
+        div()
+            .v_flex()
+            .size_full()
+            .min_h_0()
+            .min_w_0()
             .child(
                 div()
                     .id("topics-heading")
@@ -1009,7 +1083,6 @@ impl Explorer {
                     )
                 }
             })
-            .child(self.publish_panel(cx))
     }
 
     fn details(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1195,7 +1268,7 @@ impl Explorer {
                             resizable_panel()
                                 .size(rems(width).to_pixels(rem))
                                 .size_range(rems(15.).to_pixels(rem)..rems(50.).to_pixels(rem))
-                                .child(self.tree(cx)),
+                                .child(self.tree(window, cx)),
                         )
                         .child(
                             resizable_panel()
@@ -1242,6 +1315,29 @@ impl Explorer {
 
 impl Render for Explorer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.restore_publish_height && self.publish_open && !self.show_config {
+            self.restore_publish_height = false;
+            let height_rem = self.publish_height_rem.unwrap_or(19.).max(19.);
+            let height_fraction = self.publish_height_fraction;
+            let view = cx.weak_entity();
+            window.defer(cx, move |window, cx| {
+                if let Some(view) = view.upgrade() {
+                    view.update(cx, |view, cx| {
+                        view.publish_panes.update(cx, |state, cx| {
+                            let height = height_fraction
+                                .map(|fraction| state.container_size() * fraction)
+                                .unwrap_or_else(|| rems(height_rem).to_pixels(window.rem_size()));
+                            let height = height.clamp(
+                                rems(19.).to_pixels(window.rem_size()),
+                                (state.container_size() - rems(4.5).to_pixels(window.rem_size()))
+                                    .max(rems(19.).to_pixels(window.rem_size())),
+                            );
+                            state.resize_panel(0, state.container_size() - height, window, cx);
+                        });
+                    });
+                }
+            });
+        }
         if self.restore_topics_width {
             self.restore_topics_width = false;
             let width_rem = self.topics_width_rem.unwrap_or(24.).clamp(15., 50.);

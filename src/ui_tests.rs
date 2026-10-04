@@ -2,7 +2,9 @@ use bytes::Bytes;
 use chrono::Local;
 use gpui_kit::component::{ActiveTheme, Theme, ThemeMode, WindowExt};
 use gpui_kit::test::TestWindowExt;
-use gpui_kit::{AnyWindowHandle, AppContext, Bounds, Entity, Styled, TestAppContext, WindowBounds, WindowOptions, px, size};
+use gpui_kit::{
+    AnyWindowHandle, App, AppContext, Bounds, Entity, Focusable, Styled, TestAppContext, Window, WindowBounds, WindowOptions, px, size,
+};
 
 use super::{ConnectionStatus, Explorer};
 use crate::{
@@ -108,6 +110,212 @@ fn publish_disclosure_preserves_draft_and_options_across_keyboard_and_pointer_to
     cx.update(|cx| assert_eq!(view.read(cx).publish_qos.read(cx).selected_value(), Some(&"1")));
 }
 
+fn assert_publish_payload_detection(
+    window: &mut Window,
+    cx: &mut App,
+    view: &Entity<Explorer>,
+    raw: &str,
+    error: Option<&str>,
+    cursor: usize,
+) {
+    window.render_frame(cx);
+    let json = raw.starts_with('{');
+    let view = view.read(cx);
+    let editor = view.publish_payload.read(cx);
+    assert_eq!(editor.value().as_str(), raw);
+    assert_eq!(editor.selected_range(), cursor..cursor);
+    assert!(editor.focus_handle(cx).is_focused(window));
+    assert_eq!(editor.language_name().as_str(), if json { "json" } else { "plaintext" });
+    let diagnostics = editor.diagnostics().expect("publish payload editor must expose diagnostics");
+    match error {
+        Some(message) => assert!(
+            diagnostics.iter().any(|diagnostic| {
+                diagnostic.severity == gpui_kit::base::input::DiagnosticSeverity::Error
+                    && diagnostic.message.as_str() == message
+                    && !diagnostic.range.is_empty()
+                    && raw.is_char_boundary(diagnostic.range.start)
+                    && raw.is_char_boundary(diagnostic.range.end)
+            }),
+            "expected an error diagnostic with message {message:?}"
+        ),
+        None => assert!(diagnostics.is_empty()),
+    }
+    let content_type = window.find("publish-content-type");
+    assert!(content_type.visible());
+    assert_eq!(content_type.label(), Some(if json { "JSON" } else { "Text" }));
+    assert!(window.try_find("publish-validation").is_none());
+    assert!(view.publish_feedback.is_none());
+    assert!(!view.publish_pending);
+}
+
+#[gpui_kit::test]
+fn publish_payload_native_input_detects_json_and_errors_then_returns_to_plaintext_without_losing_focus(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, false, 1200., 760.);
+    let plain = "online é";
+    let json = "{ \"label\":\"é\",\"count\":1 }";
+    let malformed = json.strip_suffix('}').unwrap();
+    let error = serde_json::from_str::<serde_json::Value>(malformed).unwrap_err().to_string();
+    cx.update_window(handle, |_, window, _| window.activate_window()).unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("toggle-publish", cx);
+        window.click("publish-payload", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        assert_publish_payload_detection(window, cx, &view, "", None, 0);
+        window.input(plain, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        assert_publish_payload_detection(window, cx, &view, plain, None, plain.len());
+        window.press("secondary-a", cx);
+        window.input(json, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        assert_publish_payload_detection(window, cx, &view, json, None, json.len());
+        window.press("backspace", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        assert_publish_payload_detection(window, cx, &view, malformed, Some(&error), malformed.len());
+        window.input("}", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        assert_publish_payload_detection(window, cx, &view, json, None, json.len());
+        window.press("secondary-a", cx);
+        window.press("backspace", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        assert_publish_payload_detection(window, cx, &view, "", None, 0);
+        window.input(plain, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        assert_publish_payload_detection(window, cx, &view, plain, None, plain.len());
+    })
+    .unwrap();
+    cx.run_until_parked();
+}
+
+#[gpui_kit::test]
+fn publish_payload_native_input_does_not_validate_content_without_a_literal_leading_brace(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, false, 1200., 760.);
+    cx.update_window(handle, |_, window, _| window.activate_window()).unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("toggle-publish", cx);
+        window.click("publish-topic", cx);
+        window.input("home/command", cx);
+        window.click("publish-payload", cx);
+        window.input("{\"a\":1}", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        assert_publish_payload_detection(window, cx, &view, "{\"a\":1}", None, 7);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    for raw in [
+        "42",
+        "-1.25e+2",
+        "true",
+        "false",
+        "null",
+        "\"hello é\"",
+        "[1,false,null]",
+        " {\"a\":1}",
+        "  {\"a\":1}  ",
+        " {\"a\":",
+        "[1,",
+        "\"unterminated",
+        "  [1,",
+        "  \"unterminated",
+        "nullish",
+        "42 bottles",
+        "   ",
+        "",
+    ] {
+        cx.update_window(handle, |_, window, cx| {
+            window.press("secondary-a", cx);
+            window.press("backspace", cx);
+            window.input(raw, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            assert_publish_payload_detection(window, cx, &view, raw, None, raw.len());
+            assert_eq!(window.find("publish-topic").value(), Some("home/command"));
+        })
+        .unwrap();
+        cx.run_until_parked();
+    }
+}
+
+#[gpui_kit::test]
+fn publish_payload_keyboard_editing_undo_and_redo_preserve_detection_and_cursor(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, false, 1200., 760.);
+    cx.update_window(handle, |_, window, _| window.activate_window()).unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("toggle-publish", cx);
+        window.click("publish-payload", cx);
+        window.input("{}", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        assert_publish_payload_detection(window, cx, &view, "{}", None, 2);
+        window.press("home", cx);
+        window.input(" ", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        assert_publish_payload_detection(window, cx, &view, " {}", None, 1);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let redo = if cfg!(target_os = "macos") {
+        "secondary-shift-z"
+    } else {
+        "secondary-y"
+    };
+    let error = serde_json::from_str::<serde_json::Value>("{").unwrap_err().to_string();
+    for (key, raw, diagnostic_error, cursor) in [
+        ("secondary-z", "{}", None, 0),
+        (redo, " {}", None, 1),
+        ("backspace", "{}", None, 0),
+        ("end", "{}", None, 2),
+        ("backspace", "{", Some(error.as_str()), 1),
+        ("secondary-z", "{}", None, 2),
+        (redo, "{", Some(error.as_str()), 1),
+        ("secondary-z", "{}", None, 2),
+    ] {
+        cx.update_window(handle, |_, window, cx| window.press(key, cx)).unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            assert_publish_payload_detection(window, cx, &view, raw, diagnostic_error, cursor);
+        })
+        .unwrap();
+        cx.run_until_parked();
+    }
+}
+
 #[gpui_kit::test]
 fn publish_is_disabled_offline_and_shortcut_reports_error_without_losing_draft(cx: &mut TestAppContext) {
     let (handle, view) = open(cx, false, 900., 640.);
@@ -131,6 +339,595 @@ fn publish_is_disabled_offline_and_shortcut_reports_error_without_losing_draft(c
         );
         assert_eq!(window.find("publish-topic").value(), Some("home/command"));
         assert!(!view.read(cx).publish_pending);
+    })
+    .unwrap();
+}
+
+fn drag_publish_divider(window: &mut Window, delta: gpui_kit::Pixels, cx: &mut App) {
+    window.render_frame(cx);
+    let panel = window.find("publish-panel").bounds();
+    let from = gpui_kit::point(panel.center().x, panel.top());
+    window.drag(from, from + gpui_kit::point(px(0.), delta), cx);
+}
+
+fn assert_publish_resize_layout(window: &mut Window, cx: &mut App) {
+    window.render_frame(cx);
+    let pane = window.find("topics-pane").bounds();
+    let panel = window.within("topics-pane").within("publish-panes").find("publish-panel");
+    assert!(panel.visible());
+    let panel = panel.bounds();
+    let heading = window.within("topics-pane").within("publish-panes").find("topics-heading");
+    assert!(heading.visible());
+    assert!(heading.bounds().top() >= pane.top());
+    assert!(heading.bounds().bottom() < panel.top());
+    let row = window.find("topic:home");
+    assert!(row.visible(), "the topic tree must remain visible above the publish panel");
+    assert!(row.bounds().top() >= heading.bounds().bottom());
+    assert!(row.bounds().bottom() <= panel.top());
+    assert!(panel.left() >= pane.left());
+    assert!(panel.right() <= pane.right(), "panel {panel:?}, pane {pane:?}");
+    assert!(
+        panel.bottom() <= pane.bottom(),
+        "panel {panel:?}, pane {pane:?}, rem {:?}",
+        window.rem_size()
+    );
+    assert!(panel.bottom() <= window.find("status").bounds().top());
+    for id in [
+        "toggle-publish",
+        "publish-topic",
+        "publish-payload",
+        "publish-qos",
+        "publish-retain",
+        "publish-message",
+    ] {
+        let control = window.find(id);
+        let bounds = control.bounds();
+        assert!(control.visible(), "{id} is not visible");
+        assert!(bounds.left() >= panel.left(), "{id}: {bounds:?}, panel: {panel:?}");
+        assert!(bounds.right() <= panel.right(), "{id}: {bounds:?}, panel: {panel:?}");
+        assert!(bounds.top() >= panel.top(), "{id}: {bounds:?}, panel: {panel:?}");
+        assert!(bounds.bottom() <= panel.bottom(), "{id}: {bounds:?}, panel: {panel:?}");
+    }
+    assert!(window.find("publish-payload").bounds().size.height > px(0.));
+}
+
+#[gpui_kit::test]
+fn publish_divider_drag_grows_and_shrinks_the_editor_and_reopening_preserves_size_and_draft(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, false, 1200., 850.);
+    cx.update_window(handle, |_, window, _| window.activate_window()).unwrap();
+    cx.run_until_parked();
+    let publish_panes = cx.update(|cx| view.read(cx).publish_panes.clone());
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("publish-form").is_none());
+        window.click("toggle-publish", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    settle_publish_resize(handle, cx);
+    let (initial_height, initial_payload_height, horizontal_sizes) = cx
+        .update_window(handle, |_, window, cx| {
+            assert_publish_resize_layout(window, cx);
+            let panel = window.find("publish-panel").bounds();
+            assert!((panel.size.height - window.rem_size() * 19.).abs() <= px(1.));
+            assert!(panel.top() - window.find("topics-pane").bounds().top() >= window.rem_size() * 4.5);
+            let initial = (
+                panel.size.height,
+                window.find("publish-payload").bounds().size.height,
+                view.read(cx).panes.read(cx).sizes().clone(),
+            );
+            window.click("publish-topic", cx);
+            window.input("home/command/é", cx);
+            window.click("publish-payload", cx);
+            window.input("{\"enabled\":true}", cx);
+            window.click("publish-retain", cx);
+            window.click("publish-qos", cx);
+            initial
+        })
+        .unwrap();
+    cx.run_until_parked();
+    for key in ["down", "down", "enter"] {
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.press(key, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+    }
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(view.read(cx).publish_qos.read(cx).selected_value(), Some(&"1"));
+        drag_publish_divider(window, px(-160.), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let (grown_height, grown_payload_height) = cx
+        .update_window(handle, |_, window, cx| {
+            assert_publish_resize_layout(window, cx);
+            let height = window.find("publish-panel").bounds().size.height;
+            let payload_height = window.find("publish-payload").bounds().size.height;
+            assert!(height > initial_height + px(80.), "dragging up must enlarge the bottom panel");
+            assert!(
+                payload_height > initial_payload_height + px(80.),
+                "the editor must use the added height"
+            );
+            assert_eq!(view.read(cx).panes.read(cx).sizes(), &horizontal_sizes);
+            drag_publish_divider(window, px(64.), cx);
+            (height, payload_height)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let (saved_height, saved_payload_height, saved_layout) = cx
+        .update_window(handle, |_, window, cx| {
+            assert_publish_resize_layout(window, cx);
+            let height = window.find("publish-panel").bounds().size.height;
+            let payload_height = window.find("publish-payload").bounds().size.height;
+            assert!(height < grown_height && height > initial_height);
+            assert!(payload_height < grown_payload_height && payload_height > initial_payload_height);
+            let saved_layout = (view.read(cx).publish_height_rem, view.read(cx).publish_height_fraction);
+            assert!(saved_layout.0.is_some() && saved_layout.1.is_some());
+            assert_eq!(publish_panes.read(cx).sizes().len(), 2);
+            assert_eq!(view.read(cx).publish_panes.entity_id(), publish_panes.entity_id());
+            window.click("toggle-publish", cx);
+            (height, payload_height, saved_layout)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    settle_publish_resize(handle, cx);
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("publish-form").is_none());
+        for id in ["topics-heading", "publish-panel"] {
+            let element = window.within("topics-pane").within("publish-panes").find(id);
+            assert!(element.visible());
+        }
+        assert!((window.find("publish-panel").bounds().size.height - window.rem_size() * 2.5).abs() <= px(1.));
+        assert_eq!(view.read(cx).publish_panes.entity_id(), publish_panes.entity_id());
+        assert_eq!(view.read(cx).publish_height_rem, saved_layout.0);
+        assert_eq!(view.read(cx).publish_height_fraction, saved_layout.1);
+        window.click("toggle-publish", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    settle_publish_resize(handle, cx);
+    cx.update_window(handle, |_, window, cx| {
+        assert_publish_resize_layout(window, cx);
+        assert!((window.find("publish-panel").bounds().size.height - saved_height).abs() <= px(1.));
+        assert!((window.find("publish-payload").bounds().size.height - saved_payload_height).abs() <= px(1.));
+        assert_eq!(view.read(cx).publish_panes.entity_id(), publish_panes.entity_id());
+        assert_eq!(view.read(cx).panes.read(cx).sizes(), &horizontal_sizes);
+        assert_eq!(window.find("publish-topic").value(), Some("home/command/é"));
+        assert_eq!(view.read(cx).publish_payload.read(cx).value().as_str(), "{\"enabled\":true}");
+        assert_eq!(view.read(cx).publish_qos.read(cx).selected_value(), Some(&"1"));
+        assert!(view.read(cx).publish_retain);
+        assert_eq!(window.find("publish-retain").checked(), Some(true));
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn publish_divider_drag_limits_keep_topics_and_controls_on_screen_at_minimum_size_across_themes_and_zoom(cx: &mut TestAppContext) {
+    for mode in [ThemeMode::Light, ThemeMode::Dark] {
+        for font_size in [16., 20.] {
+            let (handle, _) = open(cx, false, 760., 540.);
+            cx.update(|cx| {
+                Theme::change(mode, None, cx);
+                Theme::update(cx, |theme| theme.font_size = px(font_size));
+            });
+            cx.update_window(handle, |_, window, cx| {
+                window.activate_window();
+                window.render_frame(cx);
+                window.click("toggle-publish", cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            for delta in [-1000., 1000., 1000.] {
+                cx.update_window(handle, |_, window, cx| {
+                    assert_publish_resize_layout(window, cx);
+                    drag_publish_divider(window, px(delta), cx);
+                })
+                .unwrap();
+                cx.run_until_parked();
+                cx.update_window(handle, |_, window, cx| {
+                    assert_publish_resize_layout(window, cx);
+                    if delta > 0. {
+                        let height = window.find("publish-panel").bounds().size.height;
+                        assert!(
+                            (height - window.rem_size() * 19.).abs() <= px(1.),
+                            "downward drag must clamp at the minimum: height {height:?}, font {font_size}, theme {mode:?}"
+                        );
+                    }
+                })
+                .unwrap();
+                cx.run_until_parked();
+            }
+        }
+    }
+}
+
+#[gpui_kit::test]
+fn publish_keyboard_resize_changes_height_by_two_rem_in_topic_and_payload_focus_and_clamps_at_minimum(cx: &mut TestAppContext) {
+    for font_size in [16., 20.] {
+        let (handle, view) = open(cx, false, 1200., 850.);
+        cx.update(|cx| Theme::update(cx, |theme| theme.font_size = px(font_size)));
+        cx.update_window(handle, |_, window, cx| {
+            window.activate_window();
+            window.render_frame(cx);
+            window.click("toggle-publish", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        for id in ["publish-topic", "publish-payload"] {
+            let (height, payload_height) = cx
+                .update_window(handle, |_, window, cx| {
+                    assert_publish_resize_layout(window, cx);
+                    window.click(id, cx);
+                    let before = (
+                        window.find("publish-panel").bounds().size.height,
+                        window.find("publish-payload").bounds().size.height,
+                    );
+                    window.press("ctrl-alt-up", cx);
+                    before
+                })
+                .unwrap();
+            cx.run_until_parked();
+            cx.update_window(handle, |_, window, cx| {
+                assert_publish_resize_layout(window, cx);
+                let step = window.rem_size() * 2.;
+                assert!(
+                    (window.find("publish-panel").bounds().size.height - height - step).abs() <= px(1.),
+                    "height {:?}, before {height:?}, step {step:?}, sizes {:?}",
+                    window.find("publish-panel").bounds().size.height,
+                    view.read(cx).publish_panes.read(cx).sizes()
+                );
+                assert!((window.find("publish-payload").bounds().size.height - payload_height - step).abs() <= px(1.));
+                if id == "publish-topic" {
+                    assert_eq!(window.find(id).focused(), Some(true));
+                } else {
+                    assert!(view.read(cx).publish_payload.read(cx).focus_handle(cx).is_focused(window));
+                }
+                window.press("ctrl-alt-down", cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.update_window(handle, |_, window, cx| {
+                assert_publish_resize_layout(window, cx);
+                assert!((window.find("publish-panel").bounds().size.height - height).abs() <= px(1.));
+                assert!((window.find("publish-payload").bounds().size.height - payload_height).abs() <= px(1.));
+                window.press("ctrl-alt-down", cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.update_window(handle, |_, window, cx| {
+                assert_publish_resize_layout(window, cx);
+                assert!((window.find("publish-panel").bounds().size.height - window.rem_size() * 19.).abs() <= px(1.));
+            })
+            .unwrap();
+            cx.run_until_parked();
+        }
+        let sizes = cx.update(|cx| view.read(cx).publish_panes.read(cx).sizes().clone());
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("topic-search", cx);
+            window.press("ctrl-alt-up", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            assert_publish_resize_layout(window, cx);
+            assert_eq!(view.read(cx).publish_panes.read(cx).sizes(), &sizes);
+            assert_eq!(window.find("topic-search").focused(), Some(true));
+        })
+        .unwrap();
+    }
+}
+
+#[gpui_kit::test]
+fn expanded_publish_panel_fits_after_the_same_window_shrinks_across_themes_and_zoom(cx: &mut TestAppContext) {
+    for mode in [ThemeMode::Light, ThemeMode::Dark] {
+        for font_size in [16., 20.] {
+            let (handle, view) = open(cx, false, 1200., 850.);
+            cx.update(|cx| {
+                Theme::change(mode, None, cx);
+                Theme::update(cx, |theme| theme.font_size = px(font_size));
+            });
+            cx.update_window(handle, |_, window, cx| {
+                window.activate_window();
+                window.render_frame(cx);
+                window.click("toggle-publish", cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.update_window(handle, |_, window, cx| {
+                assert_publish_resize_layout(window, cx);
+                drag_publish_divider(window, px(-1000.), cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            let (expanded_height, state_id) = cx
+                .update_window(handle, |_, window, cx| {
+                    assert_publish_resize_layout(window, cx);
+                    let pane = window.find("topics-pane").bounds();
+                    let panel = window.find("publish-panel").bounds();
+                    assert!((panel.top() - pane.top() - window.rem_size() * 4.5).abs() <= px(1.));
+                    assert!(panel.size.height > window.rem_size() * 19.);
+                    (panel.size.height, view.read(cx).publish_panes.entity_id())
+                })
+                .unwrap();
+            cx.simulate_window_resize(handle, size(px(760.), px(540.)));
+            cx.run_until_parked();
+            cx.update_window(handle, |_, window, cx| window.render_frame(cx)).unwrap();
+            cx.run_until_parked();
+            cx.update_window(handle, |_, window, cx| {
+                assert_publish_resize_layout(window, cx);
+                assert!(window.find("publish-panel").bounds().size.height < expanded_height);
+                assert_eq!(view.read(cx).publish_panes.entity_id(), state_id);
+                drag_publish_divider(window, px(1000.), cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.update_window(handle, |_, window, cx| {
+                assert_publish_resize_layout(window, cx);
+                assert!((window.find("publish-panel").bounds().size.height - window.rem_size() * 19.).abs() <= px(1.));
+            })
+            .unwrap();
+            cx.run_until_parked();
+        }
+    }
+}
+
+fn settle_publish_resize(handle: AnyWindowHandle, cx: &mut TestAppContext) {
+    for _ in 0..3 {
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx)).unwrap();
+        cx.run_until_parked();
+    }
+}
+
+fn assert_cached_publish_height(window: &mut Window, cx: &mut App, view: &Entity<Explorer>) -> (f32, f32) {
+    assert_publish_resize_layout(window, cx);
+    let view = view.read(cx);
+    let state = view.publish_panes.read(cx);
+    let height = state.sizes()[1];
+    let height_rem = view.publish_height_rem.expect("resizing must cache the expanded height in rem");
+    let height_fraction = view
+        .publish_height_fraction
+        .expect("resizing must cache the expanded height fraction");
+    assert!((height - window.find("publish-panel").bounds().size.height).abs() <= px(1.));
+    assert!((window.rem_size() * height_rem - height).abs() <= px(1.));
+    assert!((height_fraction - height / state.container_size()).abs() < 0.001);
+    (height_rem, height_fraction)
+}
+
+#[gpui_kit::test]
+fn saved_publish_height_restores_fraction_in_preference_to_rem_when_first_expanded(cx: &mut TestAppContext) {
+    for font_size in [16., 20.] {
+        let (handle, view) = open(cx, false, 1200., 850.);
+        cx.update(|cx| Theme::update(cx, |theme| theme.font_size = px(font_size)));
+        view.update(cx, |view, cx| {
+            view.publish_height_rem = Some(19.);
+            view.publish_height_fraction = Some(0.65);
+            view.restore_publish_height = true;
+            cx.notify();
+        });
+        settle_publish_resize(handle, cx);
+        cx.update_window(handle, |_, window, cx| {
+            window.activate_window();
+            window.render_frame(cx);
+            assert!(window.try_find("publish-form").is_none());
+            assert!(
+                view.read(cx).restore_publish_height,
+                "restoration must wait until the disclosure opens"
+            );
+            assert_eq!(view.read(cx).publish_height_rem, Some(19.));
+            assert_eq!(view.read(cx).publish_height_fraction, Some(0.65));
+            window.click("toggle-publish", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        settle_publish_resize(handle, cx);
+        cx.update_window(handle, |_, window, cx| {
+            assert_publish_resize_layout(window, cx);
+            let height = window.find("publish-panel").bounds().size.height;
+            let expected = view.read(cx).publish_panes.read(cx).container_size() * 0.65;
+            assert!(
+                (height - expected).abs() <= px(1.),
+                "saved fraction must determine the initial height: height {height:?}, expected {expected:?}, sizes {:?}",
+                view.read(cx).publish_panes.read(cx).sizes()
+            );
+            assert!(height > window.rem_size() * 19. + window.rem_size() * 2.);
+            assert!(!view.read(cx).restore_publish_height);
+        })
+        .unwrap();
+        cx.run_until_parked();
+    }
+}
+
+#[gpui_kit::test]
+fn saved_publish_height_restores_rem_when_no_fraction_is_cached(cx: &mut TestAppContext) {
+    for font_size in [16., 20.] {
+        let (handle, view) = open(cx, false, 1200., 850.);
+        cx.update(|cx| Theme::update(cx, |theme| theme.font_size = px(font_size)));
+        view.update(cx, |view, cx| {
+            view.publish_height_rem = Some(26.);
+            view.publish_height_fraction = None;
+            view.restore_publish_height = true;
+            cx.notify();
+        });
+        settle_publish_resize(handle, cx);
+        cx.update_window(handle, |_, window, cx| {
+            window.activate_window();
+            window.render_frame(cx);
+            assert!(view.read(cx).restore_publish_height);
+            assert_eq!(view.read(cx).publish_height_fraction, None);
+            window.click("toggle-publish", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        settle_publish_resize(handle, cx);
+        cx.update_window(handle, |_, window, cx| {
+            assert_publish_resize_layout(window, cx);
+            let height = window.find("publish-panel").bounds().size.height;
+            assert!(
+                (height - window.rem_size() * 26.).abs() <= px(1.),
+                "legacy rem-only height must use the current zoom: height {height:?}, rem {:?}, sizes {:?}",
+                window.rem_size(),
+                view.read(cx).publish_panes.read(cx).sizes()
+            );
+            assert!(!view.read(cx).restore_publish_height);
+        })
+        .unwrap();
+        cx.run_until_parked();
+    }
+}
+
+#[gpui_kit::test]
+fn publish_height_cache_tracks_native_resizing_and_survives_collapse_and_a_simulated_restart(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, false, 1200., 850.);
+    let publish_panes_id = cx.update(|cx| view.read(cx).publish_panes.entity_id());
+    cx.update(|cx| Theme::update(cx, |theme| theme.font_size = px(16.)));
+    cx.update_window(handle, |_, window, cx| {
+        window.activate_window();
+        window.render_frame(cx);
+        window.click("toggle-publish", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    settle_publish_resize(handle, cx);
+    for delta in [-80., 32.] {
+        let previous_height = cx
+            .update_window(handle, |_, window, cx| {
+                assert_publish_resize_layout(window, cx);
+                let height = window.find("publish-panel").bounds().size.height;
+                drag_publish_divider(window, px(delta), cx);
+                height
+            })
+            .unwrap();
+        cx.run_until_parked();
+        settle_publish_resize(handle, cx);
+        cx.update_window(handle, |_, window, cx| {
+            let (height_rem, _) = assert_cached_publish_height(window, cx, &view);
+            assert!((window.rem_size() * height_rem - previous_height + px(delta)).abs() <= px(1.));
+        })
+        .unwrap();
+        cx.run_until_parked();
+    }
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("publish-payload", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    for (key, delta_rem) in [("ctrl-alt-up", 2.), ("ctrl-alt-down", -2.)] {
+        let previous = cx
+            .update_window(handle, |_, window, cx| {
+                let cached = assert_cached_publish_height(window, cx, &view);
+                window.press(key, cx);
+                cached
+            })
+            .unwrap();
+        cx.run_until_parked();
+        settle_publish_resize(handle, cx);
+        cx.update_window(handle, |_, window, cx| {
+            let cached = assert_cached_publish_height(window, cx, &view);
+            assert!((window.rem_size() * (cached.0 - previous.0 - delta_rem)).abs() <= px(1.));
+            assert!(
+                (cached.1 - previous.1) * delta_rem > 0.,
+                "keyboard resizing must update the saved fraction too"
+            );
+            assert!(view.read(cx).publish_payload.read(cx).focus_handle(cx).is_focused(window));
+        })
+        .unwrap();
+        cx.run_until_parked();
+    }
+    let saved = cx
+        .update_window(handle, |_, window, cx| {
+            let cached = assert_cached_publish_height(window, cx, &view);
+            window.click("toggle-publish", cx);
+            cached
+        })
+        .unwrap();
+    cx.run_until_parked();
+    settle_publish_resize(handle, cx);
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("publish-form").is_none());
+        let panel = window.within("topics-pane").within("publish-panes").find("publish-panel");
+        assert!(panel.visible());
+        assert!((panel.bounds().size.height - window.rem_size() * 2.5).abs() <= px(1.));
+        assert_eq!(view.read(cx).publish_panes.entity_id(), publish_panes_id);
+        assert_eq!(
+            view.read(cx).publish_height_rem,
+            Some(saved.0),
+            "collapse must not cache the disclosure's height"
+        );
+        assert_eq!(view.read(cx).publish_height_fraction, Some(saved.1));
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    // Seed a fresh view like Explorer::new, without accessing the state file or environment.
+    let (restarted_handle, restarted_view) = open(cx, false, 1200., 1000.);
+    restarted_view.update(cx, |view, cx| {
+        view.publish_height_rem = Some(saved.0);
+        view.publish_height_fraction = Some(saved.1);
+        view.restore_publish_height = true;
+        cx.notify();
+    });
+    settle_publish_resize(restarted_handle, cx);
+    cx.update_window(restarted_handle, |_, window, cx| {
+        window.activate_window();
+        window.render_frame(cx);
+        assert!(window.try_find("publish-form").is_none());
+        assert!(restarted_view.read(cx).restore_publish_height);
+        window.click("toggle-publish", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    settle_publish_resize(restarted_handle, cx);
+    cx.update_window(restarted_handle, |_, window, cx| {
+        assert_publish_resize_layout(window, cx);
+        let height = window.find("publish-panel").bounds().size.height;
+        let expected = restarted_view.read(cx).publish_panes.read(cx).container_size() * saved.1;
+        assert!((height - expected).abs() <= px(1.));
+        assert!(
+            height > window.rem_size() * saved.0 + window.rem_size(),
+            "restart must preserve the split proportion"
+        );
+        assert!(!restarted_view.read(cx).restore_publish_height);
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn oversized_saved_publish_fraction_clamps_on_initial_restoration_at_minimum_window_size(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, false, 760., 540.);
+    cx.update(|cx| Theme::update(cx, |theme| theme.font_size = px(16.)));
+    view.update(cx, |view, cx| {
+        view.publish_height_rem = Some(80.);
+        view.publish_height_fraction = Some(0.99);
+        view.restore_publish_height = true;
+        cx.notify();
+    });
+    settle_publish_resize(handle, cx);
+    cx.update_window(handle, |_, window, cx| {
+        window.activate_window();
+        window.render_frame(cx);
+        assert!(view.read(cx).restore_publish_height);
+        window.click("toggle-publish", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    settle_publish_resize(handle, cx);
+    cx.update_window(handle, |_, window, cx| {
+        assert_publish_resize_layout(window, cx);
+        let pane = window.find("topics-pane").bounds();
+        let panel = window.find("publish-panel").bounds();
+        let top_minimum = window.rem_size() * 4.5;
+        assert!((panel.top() - pane.top() - top_minimum).abs() <= px(1.));
+        assert!((panel.size.height - (pane.size.height - top_minimum)).abs() <= px(1.));
+        assert!(panel.size.height >= window.rem_size() * 19. - px(1.));
+        assert!(panel.size.height < view.read(cx).publish_panes.read(cx).container_size() * 0.99);
+        assert!(!view.read(cx).restore_publish_height);
     })
     .unwrap();
 }
@@ -171,7 +968,11 @@ fn publish_panel_keeps_topic_tree_and_controls_visible_at_minimum_size_across_th
                 let action = window.find("publish-message").bounds();
                 assert_eq!(topic.left(), payload.left());
                 assert_eq!(topic.right(), action.right());
-                assert!(payload.size.height > window.rem_size() * 2.);
+                assert!(
+                    payload.size.height > window.rem_size() * 2.,
+                    "payload {payload:?}, panel {panel:?}, rem {:?}",
+                    window.rem_size()
+                );
             })
             .unwrap();
         }

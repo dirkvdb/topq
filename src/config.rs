@@ -10,7 +10,9 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
-use directories::{BaseDirs, ProjectDirs};
+#[cfg(not(test))]
+use directories::BaseDirs;
+use directories::ProjectDirs;
 use keyring::{Entry, Error as KeyringError};
 use serde::{Deserialize, Serialize};
 
@@ -464,9 +466,12 @@ fn credential_error(error: KeyringError) -> anyhow::Error {
 }
 
 #[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
 struct LayoutPreferences {
     topics_width_rem: Option<f32>,
     topics_width_fraction: Option<f32>,
+    publish_height_rem: Option<f32>,
+    publish_height_fraction: Option<f32>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -475,6 +480,22 @@ pub(crate) struct TopicsLayout {
     pub width_fraction: Option<f32>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct PublishLayout {
+    pub height_rem: Option<f32>,
+    pub height_fraction: Option<f32>,
+}
+
+#[cfg(test)]
+fn state_path() -> Result<PathBuf> {
+    std::thread_local! {
+        static TEST_STATE_DIR: tempfile::TempDir = tempfile::tempdir()
+            .expect("Could not create a temporary application state directory.");
+    }
+    Ok(TEST_STATE_DIR.with(|dir| dir.path().join("topq").join("state.toml")))
+}
+
+#[cfg(not(test))]
 fn state_path() -> Result<PathBuf> {
     let state_dir = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
@@ -492,14 +513,18 @@ pub(crate) fn load_topics_layout() -> Result<TopicsLayout> {
     load_topics_layout_from(&state_path()?)
 }
 
-fn load_topics_layout_from(path: &Path) -> Result<TopicsLayout> {
+fn load_layout_preferences_from(path: &Path) -> Result<LayoutPreferences> {
     let data = match fs::read(path) {
         Ok(data) => data,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(TopicsLayout::default()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(LayoutPreferences::default()),
         Err(error) => return Err(error).context("Could not read the application state."),
     };
-    let preferences: LayoutPreferences = toml::from_str(std::str::from_utf8(&data).context("Application state is not valid UTF-8.")?)
-        .context("Could not parse the application state.")?;
+    toml::from_str(std::str::from_utf8(&data).context("Application state is not valid UTF-8.")?)
+        .context("Could not parse the application state.")
+}
+
+fn load_topics_layout_from(path: &Path) -> Result<TopicsLayout> {
+    let preferences = load_layout_preferences_from(path)?;
     Ok(TopicsLayout {
         width_rem: preferences.topics_width_rem.filter(|width| width.is_finite() && *width > 0.),
         width_fraction: preferences
@@ -508,14 +533,40 @@ fn load_topics_layout_from(path: &Path) -> Result<TopicsLayout> {
     })
 }
 
+pub(crate) fn load_publish_layout() -> Result<PublishLayout> {
+    load_publish_layout_from(&state_path()?)
+}
+
+fn load_publish_layout_from(path: &Path) -> Result<PublishLayout> {
+    let preferences = load_layout_preferences_from(path)?;
+    Ok(PublishLayout {
+        height_rem: preferences.publish_height_rem.filter(|height| height.is_finite() && *height > 0.),
+        height_fraction: preferences
+            .publish_height_fraction
+            .filter(|fraction| fraction.is_finite() && (0. ..=1.).contains(fraction)),
+    })
+}
+
 pub(crate) fn save_topics_width(width: f32, fraction: f32) -> Result<()> {
-    write_toml(
-        &state_path()?,
-        &LayoutPreferences {
-            topics_width_rem: Some(width),
-            topics_width_fraction: Some(fraction),
-        },
-    )
+    save_topics_width_to(&state_path()?, width, fraction)
+}
+
+fn save_topics_width_to(path: &Path, width: f32, fraction: f32) -> Result<()> {
+    let mut preferences = load_layout_preferences_from(path)?;
+    preferences.topics_width_rem = Some(width);
+    preferences.topics_width_fraction = Some(fraction);
+    write_toml(path, &preferences)
+}
+
+pub(crate) fn save_publish_height(height_rem: f32, fraction: f32) -> Result<()> {
+    save_publish_height_to(&state_path()?, height_rem, fraction)
+}
+
+fn save_publish_height_to(path: &Path, height_rem: f32, fraction: f32) -> Result<()> {
+    let mut preferences = load_layout_preferences_from(path)?;
+    preferences.publish_height_rem = Some(height_rem);
+    preferences.publish_height_fraction = Some(fraction);
+    write_toml(path, &preferences)
 }
 
 fn write_toml(path: &Path, value: &impl Serialize) -> Result<()> {
@@ -946,14 +997,7 @@ mod tests {
     fn topics_width_roundtrips_through_toml_state() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("topq").join("state.toml");
-        write_toml(
-            &path,
-            &LayoutPreferences {
-                topics_width_rem: Some(31.5),
-                topics_width_fraction: Some(0.4),
-            },
-        )
-        .unwrap();
+        save_topics_width_to(&path, 31.5, 0.4).unwrap();
         assert_eq!(
             load_topics_layout_from(&path).unwrap(),
             TopicsLayout {
@@ -965,6 +1009,189 @@ mod tests {
             fs::read_to_string(path).unwrap(),
             "topics_width_rem = 31.5\ntopics_width_fraction = 0.4\n"
         );
+    }
+
+    #[test]
+    fn publish_height_roundtrips_through_toml_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("topq").join("state.toml");
+        for fraction in [0., 0.25, 1.] {
+            save_publish_height_to(&path, 18.5, fraction).unwrap();
+            assert_eq!(
+                load_publish_layout_from(&path).unwrap(),
+                PublishLayout {
+                    height_rem: Some(18.5),
+                    height_fraction: Some(fraction),
+                }
+            );
+        }
+        let state = fs::read_to_string(path).unwrap();
+        assert_eq!(state, "publish_height_rem = 18.5\npublish_height_fraction = 1.0\n");
+    }
+
+    #[test]
+    fn interleaved_layout_saves_preserve_both_panes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        save_topics_width_to(&path, 31.5, 0.4).unwrap();
+        save_publish_height_to(&path, 18.5, 0.25).unwrap();
+        assert_eq!(
+            load_topics_layout_from(&path).unwrap(),
+            TopicsLayout {
+                width_rem: Some(31.5),
+                width_fraction: Some(0.4),
+            }
+        );
+        save_topics_width_to(&path, 28., 0.3).unwrap();
+        assert_eq!(
+            load_publish_layout_from(&path).unwrap(),
+            PublishLayout {
+                height_rem: Some(18.5),
+                height_fraction: Some(0.25),
+            }
+        );
+        save_publish_height_to(&path, 20., 0.5).unwrap();
+        assert_eq!(
+            load_topics_layout_from(&path).unwrap(),
+            TopicsLayout {
+                width_rem: Some(28.),
+                width_fraction: Some(0.3),
+            }
+        );
+        assert_eq!(
+            load_publish_layout_from(&path).unwrap(),
+            PublishLayout {
+                height_rem: Some(20.),
+                height_fraction: Some(0.5),
+            }
+        );
+    }
+
+    #[test]
+    fn legacy_topics_only_state_defaults_publish_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        fs::write(&path, "topics_width_rem = 31.5\ntopics_width_fraction = 0.4\n").unwrap();
+        assert_eq!(load_publish_layout_from(&path).unwrap(), PublishLayout::default());
+        assert_eq!(
+            load_topics_layout_from(&path).unwrap(),
+            TopicsLayout {
+                width_rem: Some(31.5),
+                width_fraction: Some(0.4),
+            }
+        );
+    }
+
+    #[test]
+    fn state_path_is_stable_within_a_thread_and_isolated_between_threads() {
+        let path = state_path().unwrap();
+        assert_eq!(state_path().unwrap(), path);
+        let other_path = std::thread::spawn(|| {
+            let path = state_path().unwrap();
+            assert_eq!(state_path().unwrap(), path);
+            path
+        })
+        .join()
+        .unwrap();
+        assert_ne!(path, other_path);
+    }
+
+    #[test]
+    fn missing_layout_state_defaults_both_panes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        assert_eq!(load_topics_layout_from(&path).unwrap(), TopicsLayout::default());
+        assert_eq!(load_publish_layout_from(&path).unwrap(), PublishLayout::default());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn invalid_optional_layout_sizes_are_filtered_independently() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        for invalid in [0., -1., f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            write_toml(
+                &path,
+                &LayoutPreferences {
+                    topics_width_rem: Some(invalid),
+                    topics_width_fraction: Some(0.4),
+                    publish_height_rem: Some(invalid),
+                    publish_height_fraction: Some(0.25),
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                load_topics_layout_from(&path).unwrap(),
+                TopicsLayout {
+                    width_rem: None,
+                    width_fraction: Some(0.4),
+                }
+            );
+            assert_eq!(
+                load_publish_layout_from(&path).unwrap(),
+                PublishLayout {
+                    height_rem: None,
+                    height_fraction: Some(0.25),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_optional_layout_fractions_are_filtered_independently() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        for invalid in [-0.1, 1.1, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            write_toml(
+                &path,
+                &LayoutPreferences {
+                    topics_width_rem: Some(31.5),
+                    topics_width_fraction: Some(invalid),
+                    publish_height_rem: Some(18.5),
+                    publish_height_fraction: Some(invalid),
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                load_topics_layout_from(&path).unwrap(),
+                TopicsLayout {
+                    width_rem: Some(31.5),
+                    width_fraction: None,
+                }
+            );
+            assert_eq!(
+                load_publish_layout_from(&path).unwrap(),
+                PublishLayout {
+                    height_rem: Some(18.5),
+                    height_fraction: None,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn layout_saves_leave_malformed_state_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        for original in ["topics_width_rem = [", "publish_height_rem = \"invalid\""] {
+            fs::write(&path, original).unwrap();
+            assert!(save_topics_width_to(&path, 31.5, 0.4).is_err());
+            assert_eq!(fs::read_to_string(&path).unwrap(), original);
+            assert!(save_publish_height_to(&path, 18.5, 0.25).is_err());
+            assert_eq!(fs::read_to_string(&path).unwrap(), original);
+            assert!(!path.with_extension("toml.tmp").exists());
+        }
+    }
+
+    #[test]
+    fn layout_saves_propagate_read_errors_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        fs::create_dir(&path).unwrap();
+        assert!(save_topics_width_to(&path, 31.5, 0.4).is_err());
+        assert!(save_publish_height_to(&path, 18.5, 0.25).is_err());
+        assert!(path.is_dir());
+        assert!(!path.with_extension("toml.tmp").exists());
     }
 
     #[test]
