@@ -8,7 +8,7 @@ use std::{
 use bytes::Bytes;
 use chrono::{DateTime, Local};
 
-pub const FLASH_DURATION: Duration = Duration::from_millis(450);
+pub const FLASH_DURATION: Duration = Duration::from_millis(600);
 const FLASH_FADE_IN: Duration = Duration::from_millis(100);
 
 pub struct Message {
@@ -84,16 +84,19 @@ impl TopicNode {
         let Some(updated) = self.updated else {
             return 0.;
         };
-        let elapsed = now.saturating_duration_since(updated);
-        let smooth = |progress: f32| {
-            let progress = progress.clamp(0., 1.);
-            progress * progress * (3. - 2. * progress)
-        };
-        if elapsed < FLASH_FADE_IN {
-            self.flash_from + (1. - self.flash_from) * smooth(elapsed.as_secs_f32() / FLASH_FADE_IN.as_secs_f32())
-        } else {
-            1. - smooth((elapsed - FLASH_FADE_IN).as_secs_f32() / (FLASH_DURATION - FLASH_FADE_IN).as_secs_f32())
-        }
+        flash_amount(now.saturating_duration_since(updated), self.flash_from)
+    }
+}
+
+pub(crate) fn flash_amount(elapsed: Duration, from: f32) -> f32 {
+    let smooth = |progress: f32| {
+        let progress = progress.clamp(0., 1.);
+        progress * progress * (3. - 2. * progress)
+    };
+    if elapsed < FLASH_FADE_IN {
+        from + (1. - from) * smooth(elapsed.as_secs_f32() / FLASH_FADE_IN.as_secs_f32())
+    } else {
+        1. - smooth((elapsed - FLASH_FADE_IN).as_secs_f32() / (FLASH_DURATION - FLASH_FADE_IN).as_secs_f32())
     }
 }
 

@@ -2886,6 +2886,190 @@ fn pane_headings_align_in_both_themes_at_minimum_size_and_larger_text(cx: &mut T
     }
 }
 
+fn receive_payload(view: &mut Explorer, topic: &str, payload: &str, window: &mut Window, cx: &mut gpui_kit::Context<Explorer>) {
+    let mut update = message(topic);
+    update.payload = Bytes::copy_from_slice(payload.as_bytes());
+    view.topics.receive(update, std::time::Instant::now());
+    view.refresh_details(window, cx);
+    cx.notify();
+}
+
+#[gpui_kit::test]
+fn live_payload_updates_preserve_scrolled_viewport_and_focus(cx: &mut TestAppContext) {
+    for mode in [ThemeMode::Light, ThemeMode::Dark] {
+        let (handle, view) = open(cx, false, 1200., 760.);
+        let mut json = serde_json::json!({"items": (0..200).collect::<Vec<_>>(), "reading": 1});
+        cx.update(|cx| Theme::change(mode, None, cx));
+        cx.update_window(handle, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                receive_payload(view, "home/a", &json.to_string(), window, cx);
+                view.select_topic("home/a", window, cx);
+            });
+            window.render_frame(cx);
+            window.simulate_next_frame(cx);
+            window.click("payload", cx);
+            window.scroll("payload", gpui_kit::ScrollDelta::Lines(gpui_kit::point(0., -30.)), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let offset = view.read(cx).payload.read(cx).scroll_offset();
+            assert!(offset.y < px(0.), "wheel input must scroll the large payload");
+            let rows = view.read(cx).payload.read(cx).visible_row_range();
+            json["reading"] = 2.into();
+            view.update(cx, |view, cx| receive_payload(view, "home/a", &json.to_string(), window, cx));
+            json["reading"] = 3.into();
+            view.update(cx, |view, cx| receive_payload(view, "home/a", &json.to_string(), window, cx));
+            window.render_frame(cx);
+            let editor = view.read(cx).payload.read(cx);
+            assert_eq!(editor.scroll_offset(), offset);
+            assert_eq!(editor.visible_row_range(), rows);
+            assert!(editor.focus_handle(cx).is_focused(window));
+            assert!(editor.value().as_str().ends_with("\"reading\": 3\n}"));
+            window.simulate_next_frame(cx);
+            window.scroll("payload", gpui_kit::ScrollDelta::Lines(gpui_kit::point(0., -10.)), cx);
+            let new_offset = view.read(cx).payload.read(cx).scroll_offset();
+            assert!(new_offset.y < offset.y);
+            json["reading"] = 4.into();
+            view.update(cx, |view, cx| receive_payload(view, "home/a", &json.to_string(), window, cx));
+            window.render_frame(cx);
+            assert_eq!(view.read(cx).payload.read(cx).scroll_offset(), new_offset);
+        })
+        .unwrap();
+    }
+}
+
+#[gpui_kit::test]
+fn identical_payload_updates_do_not_reset_selection_or_restart_highlights(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, false, 1200., 760.);
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            receive_payload(view, "home/a", r#"{"reading":1}"#, window, cx);
+            view.select_topic("home/a", window, cx);
+            receive_payload(view, "home/a", r#"{"reading":2}"#, window, cx);
+            view.payload_highlight
+                .refresh(std::time::Instant::now() + crate::topics::FLASH_DURATION, cx);
+        });
+        window.render_frame(cx);
+        window.click("payload", cx);
+        window.press("secondary-a", cx);
+        let selection = view.read(cx).payload.read(cx).selected_range();
+        assert!(!selection.is_empty());
+        view.update(cx, |view, cx| receive_payload(view, "home/a", r#"{ "reading" : 2 }"#, window, cx));
+        window.render_frame(cx);
+        assert_eq!(view.read(cx).payload.read(cx).selected_range(), selection);
+        assert!(view.read(cx).payload_highlight.ranges(cx).is_empty());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn json_payload_highlights_only_changed_and_added_content_then_expires(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, false, 1200., 760.);
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            receive_payload(view, "home/a", r#"{"device":{"reading":1,"stable":true},"removed":0}"#, window, cx);
+            view.select_topic("home/a", window, cx);
+        });
+        assert!(
+            view.read(cx).payload_highlight.ranges(cx).is_empty(),
+            "selecting a topic is not an update"
+        );
+        view.update(cx, |view, cx| {
+            receive_payload(view, "home/a", r#"{"added":"é","device":{"reading":2,"stable":true}}"#, window, cx);
+        });
+        window.render_frame(cx);
+        let text = view.read(cx).payload.read(cx).value();
+        let ranges = view.read(cx).payload_highlight.ranges(cx);
+        let highlighted: Vec<_> = ranges.iter().map(|range| &text[range.clone()]).collect();
+        assert_eq!(highlighted, ["\"added\": \"é\"", "2"]);
+        view.update(cx, |view, cx| {
+            view.payload_highlight
+                .refresh(std::time::Instant::now() + crate::topics::FLASH_DURATION, cx);
+        });
+        window.render_frame(cx);
+        assert!(view.read(cx).payload_highlight.ranges(cx).is_empty());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn switching_topics_resets_payload_scroll_and_clears_previous_highlights(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, false, 1200., 760.);
+    let json = serde_json::json!({"items": (0..200).collect::<Vec<_>>(), "reading": 1});
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            receive_payload(view, "home/a", &json.to_string(), window, cx);
+            view.select_topic("home/a", window, cx);
+        });
+        window.render_frame(cx);
+        window.simulate_next_frame(cx);
+        window.scroll("payload", gpui_kit::ScrollDelta::Lines(gpui_kit::point(0., -30.)), cx);
+        assert!(view.read(cx).payload.read(cx).scroll_offset().y < px(0.));
+        let mut updated = json.clone();
+        updated["reading"] = 2.into();
+        view.update(cx, |view, cx| receive_payload(view, "home/a", &updated.to_string(), window, cx));
+        assert!(!view.read(cx).payload_highlight.ranges(cx).is_empty());
+        view.update(cx, |view, cx| {
+            receive_payload(view, "home/b", &updated.to_string(), window, cx);
+            view.select_topic("home/b", window, cx);
+        });
+        window.render_frame(cx);
+        assert_eq!(view.read(cx).payload.read(cx).scroll_offset(), gpui_kit::point(px(0.), px(0.)));
+        assert!(view.read(cx).payload_highlight.ranges(cx).is_empty());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn shorter_payload_clamps_scroll_and_plaintext_updates_keep_the_viewport(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, false, 1200., 760.);
+    let text = "line of plaintext\n".repeat(200);
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            receive_payload(view, "home/a", &text, window, cx);
+            view.select_topic("home/a", window, cx);
+        });
+        window.render_frame(cx);
+        window.simulate_next_frame(cx);
+        window.scroll("payload", gpui_kit::ScrollDelta::Lines(gpui_kit::point(0., -30.)), cx);
+        let offset = view.read(cx).payload.read(cx).scroll_offset();
+        assert!(offset.y < px(0.));
+        view.update(cx, |view, cx| {
+            receive_payload(view, "home/a", &format!("{text}new line"), window, cx)
+        });
+        window.render_frame(cx);
+        assert_eq!(view.read(cx).payload.read(cx).scroll_offset(), offset);
+        assert!(view.read(cx).payload_highlight.ranges(cx).is_empty());
+        view.update(cx, |view, cx| receive_payload(view, "home/a", "short", window, cx));
+        window.render_frame(cx);
+        assert_eq!(view.read(cx).payload.read(cx).scroll_offset().y, px(0.));
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn reduced_motion_clears_payload_highlights_and_keeps_updates_visible(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, false, 1200., 760.);
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            receive_payload(view, "home/a", r#"{"reading":1}"#, window, cx);
+            view.select_topic("home/a", window, cx);
+            receive_payload(view, "home/a", r#"{"reading":2}"#, window, cx);
+        });
+        assert!(!view.read(cx).payload_highlight.ranges(cx).is_empty());
+        cx.set_reduce_motion(true);
+        view.update(cx, |view, cx| view.poll(window, cx));
+        assert!(view.read(cx).payload_highlight.ranges(cx).is_empty());
+        view.update(cx, |view, cx| receive_payload(view, "home/a", r#"{"reading":3}"#, window, cx));
+        window.render_frame(cx);
+        assert!(view.read(cx).payload_highlight.ranges(cx).is_empty());
+        assert_eq!(view.read(cx).payload.read(cx).value().as_str(), "{\n  \"reading\": 3\n}");
+    })
+    .unwrap();
+}
+
 #[gpui_kit::test]
 fn reduced_motion_hides_update_flashes_without_losing_selection(cx: &mut TestAppContext) {
     let (handle, view) = open(cx, false, 1200., 760.);

@@ -33,6 +33,8 @@ use crate::{
     topics::{FLASH_DURATION, TopicStore},
 };
 
+mod payload;
+mod payload_diff;
 mod publish;
 mod settings;
 
@@ -152,6 +154,9 @@ pub struct Explorer {
     selected: Option<String>,
     payload: Entity<EditorState>,
     payload_format: &'static str,
+    payload_topic: Option<String>,
+    payload_pending_scroll: Option<gpui_kit::Point<gpui_kit::Pixels>>,
+    payload_highlight: payload::PayloadHighlight,
     publish_open: bool,
     publish_topic: Entity<InputState>,
     publish_payload: Entity<EditorState>,
@@ -256,6 +261,8 @@ impl Explorer {
                 .indent_guides(false)
                 .folding(false)
         });
+        let payload_highlight =
+            payload::PayloadHighlight::new(payload.update(cx, |editor, cx| editor.create_range_decorations_collection(Vec::new(), cx)));
         let publish_topic = cx.new(|cx| InputState::new(window, cx).placeholder("example/topic"));
         let publish_payload = cx.new(|cx| {
             EditorState::new(window, cx)
@@ -383,6 +390,9 @@ impl Explorer {
             password,
             payload,
             payload_format: "Text",
+            payload_topic: None,
+            payload_pending_scroll: None,
+            payload_highlight,
             publish_open: false,
             publish_topic,
             publish_payload,
@@ -529,6 +539,7 @@ impl Explorer {
         if payload_changed {
             self.refresh_details(window, cx);
         }
+        self.payload_highlight.refresh(now, cx);
         if let Some(deadline) = self.flash_until {
             changed = true;
             if now >= deadline || cx.reduce_motion() {
@@ -585,23 +596,6 @@ impl Explorer {
         self.tree_state.update(cx, |state, cx| {
             state.set_items(items.into_values().collect::<Vec<_>>(), cx);
             state.set_selected_index(selected.as_ref().and_then(|id| state.index_of(id)), cx);
-        });
-    }
-
-    fn refresh_details(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let value = self
-            .selected
-            .as_ref()
-            .and_then(|path| self.topics.nodes.get(path))
-            .and_then(|node| node.value.as_ref());
-        self.payload_format = value.map_or("Text", |value| value.format_label());
-        let value = value.map(|value| value.display_payload()).unwrap_or_default();
-        let language = if self.payload_format == "JSON" { "json" } else { "plaintext" };
-        self.payload.update(cx, |input, cx| {
-            if input.language_name() != language {
-                input.set_highlighter(language, cx);
-            }
-            input.set_value(value, window, cx);
         });
     }
 
