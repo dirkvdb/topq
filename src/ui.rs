@@ -16,7 +16,7 @@ use gpui_kit::component::{
     marker::{Marker, MarkerContent},
     menu::{DropdownMenu, PopupMenuItem},
     resizable::{ResizablePanelEvent, ResizableState, h_resizable, resizable_panel},
-    select::SelectState,
+    select::{SelectEvent, SelectState},
     spinner::Spinner,
     tag::Tag,
     tree::{Tree, TreeEntry, TreeEvent, TreeItem, TreeState},
@@ -41,6 +41,7 @@ gpui_kit::actions!(
         OpenConnection,
         CancelConnection,
         FocusTopics,
+        FocusTopicFilter,
         FirstTopic,
         LastTopic,
         NarrowTopics,
@@ -51,7 +52,9 @@ gpui_kit::actions!(
 pub(crate) fn init(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("secondary-,", OpenConnection, Some("Explorer")),
-        KeyBinding::new("escape", CancelConnection, Some("Explorer")),
+        KeyBinding::new("escape", FocusTopics, Some("TopicFilter")),
+        KeyBinding::new("/", FocusTopicFilter, Some("Tree")),
+        KeyBinding::new("ctrl-f", FocusTopicFilter, Some("Tree")),
         KeyBinding::new("secondary-1", FocusTopics, Some("Explorer")),
         KeyBinding::new("home", FirstTopic, Some("Tree")),
         KeyBinding::new("end", LastTopic, Some("Tree")),
@@ -76,7 +79,9 @@ fn connection_label(config: &ConnectionConfig) -> String {
     if !config.username.is_empty() {
         label.push_str(&format!(" · {}", config.username));
     }
-    if config.tls {
+    if config.websocket {
+        label.insert_str(0, "ws://");
+    } else if config.tls {
         label.push_str(" · TLS");
     }
     label
@@ -112,6 +117,7 @@ pub struct Explorer {
     name: Entity<InputState>,
     host: Entity<InputState>,
     port: Entity<InputState>,
+    protocol: Entity<SelectState<Vec<&'static str>>>,
     client_id: Entity<InputState>,
     topic_input: Entity<InputState>,
     topic_filter: Entity<InputState>,
@@ -122,7 +128,6 @@ pub struct Explorer {
     topic_editor_restore_focus: Option<FocusHandle>,
     username: Entity<InputState>,
     password: Entity<InputState>,
-    tls: bool,
     show_config: bool,
     active_config: Option<ConnectionConfig>,
     connection: Option<Connection>,
@@ -198,12 +203,17 @@ impl Explorer {
             .and_then(|index| saved_connections.connections.get(index))
             .cloned();
         let initial = saved_config.clone().unwrap_or_default();
+        let protocol = cx.new(|cx| {
+            let mut state = SelectState::new(vec!["mqtt://", "mqtts://", "ws://"], None, window, cx);
+            state.set_selected_value(&initial.protocol(), window, cx);
+            state
+        });
         let name = cx.new(|cx| InputState::new(window, cx).placeholder("e.g. Home").default_value(initial.name));
         let host = cx.new(|cx| InputState::new(window, cx).default_value(initial.host));
         let port = cx.new(|cx| InputState::new(window, cx).default_value(initial.port.to_string()));
         let client_id = cx.new(|cx| InputState::new(window, cx).default_value(initial.client_id));
         let topic_input = cx.new(|cx| InputState::new(window, cx).placeholder("e.g. home/#"));
-        let topic_filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter").clean_on_escape());
+        let topic_filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter"));
         let topic_qos = cx.new(|cx| SelectState::new(vec!["0", "1", "2"], Some(IndexPath::default()), window, cx));
         let username = cx.new(|cx| InputState::new(window, cx).placeholder("Optional").default_value(initial.username));
         let password = cx.new(|cx| {
@@ -241,6 +251,19 @@ impl Explorer {
                 })
             })
             .collect();
+        subscriptions.push(cx.subscribe_in(&protocol, window, |view, _, event, window, cx| {
+            let SelectEvent::Confirm(Some(protocol)) = event else { return };
+            let port = view.port.read(cx).value();
+            let default_port = match (*protocol, port.as_str()) {
+                ("mqtts://", "1883") => Some("8883"),
+                ("mqtt://", "8883") => Some("1883"),
+                _ => None,
+            };
+            if let Some(port) = default_port {
+                view.port.update(cx, |input, cx| input.set_value(port, window, cx));
+            }
+            cx.notify();
+        }));
         subscriptions.push(cx.subscribe_in(&topic_filter, window, |view, _, event, _, cx| {
             if matches!(event, InputEvent::Change) {
                 view.sync_tree(cx);
@@ -300,6 +323,7 @@ impl Explorer {
             name,
             host,
             port,
+            protocol,
             client_id,
             topic_input,
             topic_filter,
@@ -316,7 +340,7 @@ impl Explorer {
             panes,
             topics_width_fraction: width_fraction,
             restore_topics_width: width.is_some() || width_fraction.is_some(),
-            tls: initial.tls,
+
             show_config: saved_config.is_none(),
             active_config: None,
             connection: None,
@@ -645,6 +669,10 @@ impl Explorer {
         self.tree_state.update(cx, |state, cx| state.focus(window, cx));
     }
 
+    fn focus_topic_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.topic_filter.update(cx, |state, cx| state.focus(window, cx));
+    }
+
     fn select_boundary(&mut self, last: bool, cx: &mut Context<Self>) {
         let filter = self.topic_filter.read(cx).value().to_lowercase();
         let count = if filter.trim().is_empty() {
@@ -853,13 +881,15 @@ impl Explorer {
                     .child("Topics")
                     .child(
                         div().h_flex().flex_1().min_w_0().ml_4().justify_end().child(
-                            Input::new(&self.topic_filter)
-                                .id("topic-search")
-                                .small()
-                                .w_full()
-                                .max_w(rems(11.5))
-                                .prefix(Icon::new(IconName::Search).small())
-                                .aria_label("Filter topics"),
+                            div().key_context("TopicFilter").w_full().max_w(rems(11.5)).child(
+                                Input::new(&self.topic_filter)
+                                    .id("topic-search")
+                                    .small()
+                                    .cleanable(true)
+                                    .w_full()
+                                    .prefix(Icon::new(IconName::Search).small())
+                                    .aria_label("Filter topics"),
+                            ),
                         ),
                     ),
             )
@@ -1186,6 +1216,7 @@ impl Render for Explorer {
             .on_action(cx.listener(|view, _: &OpenConnection, window, cx| view.open_connection(window, cx)))
             .on_action(cx.listener(|view, _: &CancelConnection, window, cx| view.cancel_connection(window, cx)))
             .on_action(cx.listener(|view, _: &FocusTopics, window, cx| view.focus_topics(window, cx)))
+            .on_action(cx.listener(|view, _: &FocusTopicFilter, window, cx| view.focus_topic_filter(window, cx)))
             .on_action(cx.listener(|view, _: &FirstTopic, _, cx| view.select_boundary(false, cx)))
             .on_action(cx.listener(|view, _: &LastTopic, _, cx| view.select_boundary(true, cx)))
             .on_action(cx.listener(|view, _: &NarrowTopics, window, cx| view.resize_topics(false, window, cx)))

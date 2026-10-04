@@ -60,6 +60,9 @@ pub struct ConnectionConfig {
     #[serde(skip)]
     pub password: String,
     pub tls: bool,
+    /// Use unencrypted MQTT over WebSocket, taking precedence over `tls`.
+    #[serde(default)]
+    pub websocket: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -103,6 +106,7 @@ impl Default for ConnectionConfig {
             username: String::new(),
             password: String::new(),
             tls: false,
+            websocket: false,
         }
     }
 }
@@ -119,6 +123,7 @@ struct DeserializedConnectionConfig {
     base_topic: Option<String>,
     username: String,
     tls: bool,
+    websocket: bool,
 }
 
 impl Default for DeserializedConnectionConfig {
@@ -133,6 +138,7 @@ impl Default for DeserializedConnectionConfig {
             base_topic: None,
             username: config.username,
             tls: config.tls,
+            websocket: config.websocket,
         }
     }
 }
@@ -154,6 +160,7 @@ impl From<DeserializedConnectionConfig> for ConnectionConfig {
             username: config.username,
             password: String::new(),
             tls: config.tls,
+            websocket: config.websocket,
         }
     }
 }
@@ -170,6 +177,17 @@ fn default_client_id() -> String {
 }
 
 impl ConnectionConfig {
+    /// Returns the broker protocol prefix; WebSocket takes precedence over TLS.
+    pub fn protocol(&self) -> &'static str {
+        if self.websocket {
+            "ws://"
+        } else if self.tls {
+            "mqtts://"
+        } else {
+            "mqtt://"
+        }
+    }
+
     pub fn validate(&self) -> Result<(), ConnectionValidationError> {
         if self.host.trim().is_empty() {
             return Err(ConnectionValidationError {
@@ -407,13 +425,21 @@ struct SavedConnection {
 }
 
 fn credential_account(config: &ConnectionConfig) -> String {
+    // Preserve legacy TCP/TLS keys; WebSocket uses a separate protocol scope.
+    let transport = if config.websocket {
+        "ws"
+    } else if config.tls {
+        "true"
+    } else {
+        "false"
+    };
     // Length prefixes keep host and username delimiters from colliding.
     format!(
         "{}:{}:{}:{}:{}:{}",
         config.host.len(),
         config.host,
         config.port,
-        config.tls,
+        transport,
         config.username.len(),
         config.username
     )
@@ -597,6 +623,33 @@ mod tests {
     }
 
     #[test]
+    fn protocol_selects_tcp_tls_or_websocket_with_websocket_taking_precedence() {
+        for (tls, websocket, expected) in [
+            (false, false, "mqtt://"),
+            (true, false, "mqtts://"),
+            (false, true, "ws://"),
+            (true, true, "ws://"),
+        ] {
+            let config = ConnectionConfig {
+                tls,
+                websocket,
+                ..Default::default()
+            };
+            assert_eq!(config.protocol(), expected);
+        }
+    }
+
+    #[test]
+    fn legacy_configs_default_to_non_websocket_without_changing_tls() {
+        for (json, expected) in [("{}", "mqtt://"), (r#"{"tls":false}"#, "mqtt://"), (r#"{"tls":true}"#, "mqtts://")] {
+            let config: ConnectionConfig = serde_json::from_str(json).unwrap();
+            assert!(!config.websocket);
+            assert_eq!(config.protocol(), expected);
+        }
+        assert!(!ConnectionConfig::default().websocket);
+    }
+
+    #[test]
     fn generated_client_ids_are_unique_and_legacy_configs_receive_a_default() {
         let first = ConnectionConfig::default().client_id;
         let second = ConnectionConfig::default().client_id;
@@ -768,6 +821,102 @@ mod tests {
         ] {
             assert_ne!(credential_account(&changed), key);
         }
+    }
+
+    #[test]
+    fn tcp_and_tls_credential_keys_keep_the_legacy_format() {
+        let mut config = authenticated_config();
+        assert_eq!(credential_account(&config), "9:localhost:1883:false:9:mqtt-user");
+        config.tls = true;
+        assert_eq!(credential_account(&config), "9:localhost:1883:true:9:mqtt-user");
+    }
+
+    #[test]
+    fn websocket_credentials_are_separate_and_ignore_the_tls_flag() {
+        let mut config = authenticated_config();
+        let tcp = credential_account(&config);
+        config.tls = true;
+        let tls = credential_account(&config);
+        config.websocket = true;
+        let websocket = credential_account(&config);
+        assert_eq!(websocket, "9:localhost:1883:ws:9:mqtt-user");
+        assert_ne!(websocket, tcp);
+        assert_ne!(websocket, tls);
+        config.tls = false;
+        assert_eq!(credential_account(&config), websocket);
+    }
+
+    #[test]
+    fn legacy_saved_protocols_restore_passwords_and_persist_websocket_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("connections.json");
+        let entries = mock_entries();
+        let tcp = authenticated_config();
+        let tls = ConnectionConfig {
+            tls: true,
+            password: "tls-secret".into(),
+            ..tcp.clone()
+        };
+        entries(&tcp).unwrap().set_password(&tcp.password).unwrap();
+        entries(&tls).unwrap().set_password(&tls.password).unwrap();
+        fs::write(&path, r#"{"connections":[{"host":"localhost","username":"mqtt-user","password_in_keyring":true},{"host":"localhost","username":"mqtt-user","tls":true,"password_in_keyring":true}],"selected":1}"#).unwrap();
+        let saved = load_connections_from(&path, &entries).unwrap();
+        assert_eq!(saved.connections[0].password, tcp.password);
+        assert_eq!(saved.connections[1].password, tls.password);
+        assert_eq!(saved.connections[0].protocol(), "mqtt://");
+        assert_eq!(saved.connections[1].protocol(), "mqtts://");
+        save_connections_to(&path, &saved, &entries).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(
+            json["connections"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|config| config["websocket"] == false)
+        );
+    }
+
+    #[test]
+    fn websocket_roundtrip_and_removal_leave_tcp_and_tls_credentials_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("connections.json");
+        let entries = mock_entries();
+        let tcp = authenticated_config();
+        let tls = ConnectionConfig {
+            tls: true,
+            password: "tls-secret".into(),
+            ..tcp.clone()
+        };
+        let websocket = ConnectionConfig {
+            websocket: true,
+            password: "ws-secret".into(),
+            ..tcp.clone()
+        };
+        let saved = SavedConnections {
+            connections: vec![tcp.clone(), tls.clone(), websocket.clone()],
+            selected: Some(2),
+        };
+        save_connections_to(&path, &saved, &entries).unwrap();
+        let mut loaded = load_connections_from(&path, &entries).unwrap();
+        assert_eq!(loaded.selected, Some(2));
+        assert!(loaded.connections[2].websocket);
+        assert!(!loaded.connections[2].tls);
+        assert_eq!(loaded.connections[2].password, websocket.password);
+        let json: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(json["connections"][2]["websocket"], true);
+        assert!(
+            json["connections"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|config| config.get("password").is_none())
+        );
+        loaded.connections.pop();
+        loaded.selected = Some(0);
+        save_connections_to(&path, &loaded, &entries).unwrap();
+        assert!(matches!(entries(&websocket).unwrap().get_password(), Err(KeyringError::NoEntry)));
+        assert_eq!(entries(&tcp).unwrap().get_password().unwrap(), tcp.password);
+        assert_eq!(entries(&tls).unwrap().get_password().unwrap(), tls.password);
     }
 
     #[test]

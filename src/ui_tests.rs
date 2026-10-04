@@ -367,7 +367,9 @@ fn connection_cards_open_a_full_width_form_and_return_to_the_overview(cx: &mut T
         window.render_frame(cx);
         assert!(window.try_find("connections-overview").is_none());
         assert!(window.find("name").bounds().size.width > px(250.));
-        assert!(window.find("host").bounds().size.width > px(250.));
+        let broker = window.find("broker-settings").bounds();
+        assert!(broker.size.width > px(250.));
+        assert!(window.find("host").bounds().size.width > window.find("port").bounds().size.width);
         window.click("back-to-connections", cx);
         window.render_frame(cx);
         assert!(window.find("connection-card:0").visible());
@@ -539,7 +541,8 @@ fn new_connection_topics_default_to_all_topics_with_qos_zero_after_credentials(c
         assert_eq!(window.find("begin-add-topic").label(), Some("Add topic"));
         assert!(window.try_find("topic-editor").is_none());
         assert!(window.find("connection-field:client-id").bounds().top() > window.find("field:port").bounds().bottom());
-        assert!(window.find("connection-field:username").bounds().top() > window.find("tls").bounds().bottom());
+        assert!(window.find("connection-field:username").bounds().top() > window.find("broker-settings").bounds().bottom());
+        assert!(window.try_find("tls").is_none());
         assert!(window.find("field:username").bounds().bottom() < window.find("field:password").bounds().top());
         assert!(section.bounds().top() > window.find("connection-field:password").bounds().bottom());
         assert_eq!(view.read(cx).subscription_topics, vec![subscription("#", 0)]);
@@ -744,7 +747,7 @@ fn topic_editor_buttons_support_keyboard_activation_and_cancel_restores_the_trig
         window.click("port", cx);
     })
     .unwrap();
-    for id in ["client-id", "tls", "username", "password", "toggle-topics", "begin-add-topic"] {
+    for id in ["client-id", "username", "password", "toggle-topics", "begin-add-topic"] {
         cx.update_window(handle, |_, window, cx| window.press("tab", cx)).unwrap();
         cx.run_until_parked();
         cx.update_window(handle, |_, window, cx| {
@@ -1056,7 +1059,11 @@ fn connection_inputs_leave_room_for_their_focus_rings(cx: &mut TestAppContext) {
                 window.render_frame(cx);
                 window.click(id, cx);
                 window.render_frame(cx);
-                let field = window.find(format!("connection-field:{id}")).bounds();
+                let field = if matches!(id, "host" | "port") {
+                    window.find("broker-settings").bounds()
+                } else {
+                    window.find(format!("connection-field:{id}")).bounds()
+                };
                 let input = window.find(format!("field:{id}")).bounds();
                 let ring = px(3.);
                 assert!(input.left() - ring >= field.left(), "{id} focus ring is clipped on the left");
@@ -1092,21 +1099,154 @@ fn connection_form_actions_are_below_the_fields_and_aligned_right(cx: &mut TestA
 }
 
 #[gpui_kit::test]
-fn tls_checkbox_has_room_for_its_focus_ring_and_toggles_from_the_form(cx: &mut TestAppContext) {
-    let (handle, view) = open(cx, true, 760., 540.);
+fn broker_settings_align_protocol_host_and_port_across_themes_and_text_sizes(cx: &mut TestAppContext) {
+    for mode in [ThemeMode::Light, ThemeMode::Dark] {
+        for font_size in [16., 20.] {
+            let (handle, _) = open(cx, true, 760., 800.);
+            cx.update(|cx| {
+                Theme::change(mode, None, cx);
+                Theme::update(cx, |theme| theme.font_size = px(font_size));
+            });
+            cx.update_window(handle, |_, window, cx| {
+                window.render_frame(cx);
+                assert_eq!(window.find("broker-settings").label(), Some("Broker settings"));
+                assert!(window.try_find("tls").is_none());
+                let protocol = window.find("broker-protocol");
+                let host = window.find("field:host").bounds();
+                let port = window.find("field:port").bounds();
+                assert_eq!(protocol.label(), Some("Protocol"));
+                assert_eq!(protocol.value(), Some("mqtt://"));
+                assert_eq!(protocol.bounds().top(), host.top());
+                assert_eq!(host.top(), port.top());
+                assert_eq!(protocol.bounds().size.height, host.size.height);
+                assert_eq!(host.size.height, port.size.height);
+                assert!(protocol.bounds().right() < host.left());
+                assert!(host.right() < port.left());
+                assert!((host.left() - protocol.bounds().right() - (port.left() - host.right())).abs() < px(1.));
+                assert_eq!(protocol.bounds().left(), window.find("field:name").bounds().left());
+                assert_eq!(port.right(), window.find("field:name").bounds().right());
+                assert!(host.size.width > px(0.));
+            })
+            .unwrap();
+        }
+    }
+}
+
+#[gpui_kit::test]
+fn editing_connections_restores_broker_protocol_and_preserves_custom_ports(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, false, 1200., 1200.);
     cx.update_window(handle, |_, window, cx| {
         window.render_frame(cx);
-        window.scroll("name", gpui_kit::ScrollDelta::Lines(gpui_kit::point(0., -6.)), cx);
-        let input_left = window.find("port").bounds().left();
-        let checkbox_left = window.find("tls").bounds().left();
-        assert!(
-            checkbox_left >= input_left + px(3.),
-            "TLS focus ring touches the clipped edge: {checkbox_left:?} vs {input_left:?}"
-        );
-        window.click("tls", cx);
+        window.click("settings", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    for (tls, websocket, expected) in [(false, false, "mqtt://"), (true, false, "mqtts://"), (false, true, "ws://")] {
+        view.update(cx, |view, cx| {
+            let config = &mut view.saved_connections.connections[0];
+            config.tls = tls;
+            config.websocket = websocket;
+            config.port = 9001;
+            cx.notify();
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("edit-connection:0", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find("broker-protocol").value(), Some(expected));
+            assert_eq!(view.read(cx).protocol.read(cx).selected_value(), Some(&expected));
+            assert_eq!(window.find("port").value(), Some("9001"));
+            window.click("back-to-connections", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+    }
+    cx.update_window(handle, |_, window, cx| {
         window.render_frame(cx);
-        assert!(view.read(cx).tls);
+        window.click("new-connection", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("broker-protocol").value(), Some("mqtt://"));
+        assert_eq!(window.find("port").value(), Some("1883"));
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn broker_protocol_supports_keyboard_selection_default_ports_and_tab_order(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, true, 1200., 1200.);
+    cx.update_window(handle, |_, window, _| window.activate_window()).unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("name", cx);
+        window.press("tab", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("broker-protocol").focused(), Some(true));
+        window.press("enter", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| window.press("down", cx)).unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| window.press("enter", cx)).unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("broker-protocol").value(), Some("mqtts://"));
+        assert_eq!(window.find("broker-protocol").expanded(), Some(false));
+        assert_eq!(view.read(cx).protocol.read(cx).selected_value(), Some(&"mqtts://"));
         assert_eq!(window.find("port").value(), Some("8883"));
+        window.press("tab", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("host").focused(), Some(true));
+        window.press("tab", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("port").focused(), Some(true));
+        window.input("9001", cx);
+        window.click("broker-protocol", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| window.press("down", cx)).unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| window.press("enter", cx)).unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("broker-protocol").value(), Some("ws://"));
+        assert_eq!(view.read(cx).protocol.read(cx).selected_value(), Some(&"ws://"));
+        assert_eq!(window.find("port").value(), Some("9001"));
+        window.click("broker-protocol", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| window.press("escape", cx)).unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("broker-protocol").focused(), Some(true));
+        assert_eq!(window.find("broker-protocol").expanded(), Some(false));
+        assert!(window.find("settings-dialog").visible());
     })
     .unwrap();
 }
@@ -1184,10 +1324,10 @@ fn tabbing_between_connection_inputs_selects_values_and_visits_subscription_cont
     })
     .unwrap();
     for (key, id, replacement) in [
+        ("tab", "broker-protocol", None),
         ("tab", "host", Some("broker.example")),
         ("tab", "port", Some("8883")),
         ("tab", "client-id", Some("topq-next-client")),
-        ("tab", "tls", None),
         ("tab", "username", Some("another-reader")),
         ("tab", "password", Some("new-password")),
         ("tab", "toggle-topics", None),
@@ -1197,10 +1337,10 @@ fn tabbing_between_connection_inputs_selects_values_and_visits_subscription_cont
         ("shift-tab", "toggle-topics", None),
         ("shift-tab", "password", Some("replacement-password")),
         ("shift-tab", "username", Some("replacement-reader")),
-        ("shift-tab", "tls", None),
         ("shift-tab", "client-id", Some("topq-previous-client")),
         ("shift-tab", "port", Some("1884")),
         ("shift-tab", "host", Some("other.example")),
+        ("shift-tab", "broker-protocol", None),
         ("shift-tab", "name", Some("Workshop")),
     ] {
         cx.update_window(handle, |_, window, cx| window.press(key, cx)).unwrap();
@@ -1276,6 +1416,7 @@ fn enter_keeps_invalid_port_next_to_its_field_and_returns_focus(cx: &mut TestApp
         window.render_frame(cx);
         window.click("name", cx);
         window.input("Home", cx);
+        window.press("tab", cx);
         window.press("tab", cx);
         window.press("tab", cx);
         assert_eq!(window.find("port").focused(), Some(true));
@@ -2255,6 +2396,43 @@ fn metadata_tags_leave_room_for_json_at_minimum_size_in_both_themes(cx: &mut Tes
 }
 
 #[gpui_kit::test]
+fn topic_filter_shortcuts_focus_it_and_clear_button_resets_it(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, false, 900., 640.);
+
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("topic-search").focused(), Some(false));
+        window.press("/", cx);
+        window.render_frame(cx);
+        assert_eq!(window.find("topic-search").focused(), Some(true));
+        window.input("home", cx);
+    })
+    .unwrap();
+
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(view.read(cx).topic_filter.read(cx).value().as_str(), "home");
+        assert!(window.find("clean").visible());
+        window.click("clean", cx);
+    })
+    .unwrap();
+
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(view.read(cx).topic_filter.read(cx).value().as_str(), "");
+        assert_eq!(window.find("topic-search").focused(), Some(true));
+        assert!(window.try_find("clean").is_none());
+        window.press("escape", cx);
+        window.press("ctrl-f", cx);
+        window.render_frame(cx);
+        assert_eq!(window.find("topic-search").focused(), Some(true));
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
 fn topic_filter_shows_matching_paths_and_ancestors_then_restores_the_tree(cx: &mut TestAppContext) {
     let (handle, view) = open(cx, false, 900., 640.);
     view.update(cx, |view, cx| {
@@ -2266,7 +2444,9 @@ fn topic_filter_shows_matching_paths_and_ancestors_then_restores_the_tree(cx: &m
     cx.update_window(handle, |_, window, cx| {
         view.update(cx, |view, cx| view.select_topic("home/b", window, cx));
         window.render_frame(cx);
+        assert!(window.find("topic-search").bounds().size.width >= window.rem_size() * 10.);
         window.click("topic-search", cx);
+        assert_eq!(window.find("topic-search").focused(), Some(true));
         window.input("HOME/A", cx);
     })
     .unwrap();
@@ -2292,9 +2472,21 @@ fn topic_filter_shows_matching_paths_and_ancestors_then_restores_the_tree(cx: &m
     cx.run_until_parked();
     cx.update_window(handle, |_, window, cx| {
         window.render_frame(cx);
+        assert_eq!(view.read(cx).topic_filter.read(cx).value().as_str(), "missing");
+        assert_eq!(window.find("topic-search").focused(), Some(false));
+        assert!(window.find("topics-filter-empty").visible());
+        assert!(window.try_find("topic:home/a").is_none());
+        assert!(window.try_find("topic:home/b").is_none());
+        window.click("clean", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(view.read(cx).topic_filter.read(cx).value().as_str(), "");
+        assert!(window.try_find("topics-filter-empty").is_none());
         assert!(window.find("topic:home/a").visible());
         assert!(window.find("topic:home/b").visible());
-        assert!(window.try_find("topics-filter-empty").is_none());
     })
     .unwrap();
 }

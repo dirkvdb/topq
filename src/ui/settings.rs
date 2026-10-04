@@ -9,7 +9,6 @@ use gpui_kit::assets::IconName as AssetIconName;
 use gpui_kit::component::{
     ActiveTheme, Disableable, Icon, IconName, Sizable, StyledExt, ThemeRegistry,
     button::{Button, ButtonVariants},
-    checkbox::Checkbox,
     collapsible::Collapsible,
     input::{Input, InputGroup, InputState},
     menu::{DropdownMenu, PopupMenuItem},
@@ -213,7 +212,8 @@ impl Explorer {
             topics: self.subscription_topics.clone(),
             username: self.username.read(cx).value().to_string(),
             password: self.password.read(cx).value().to_string(),
-            tls: self.tls,
+            tls: self.protocol.read(cx).selected_value() == Some(&"mqtts://"),
+            websocket: self.protocol.read(cx).selected_value() == Some(&"ws://"),
         };
         if let Err(error) = config.validate() {
             self.invalid_field(error.field(), error.to_string(), window, cx);
@@ -271,7 +271,8 @@ impl Explorer {
             .update(cx, |input, cx| input.set_value(config.username.clone(), window, cx));
         self.password
             .update(cx, |input, cx| input.set_value(config.password.clone(), window, cx));
-        self.tls = config.tls;
+        self.protocol
+            .update(cx, |state, cx| state.set_selected_value(&config.protocol(), window, cx));
         self.field_error = None;
         self.error = None;
         self.name.update(cx, |input, cx| input.focus(window, cx));
@@ -430,37 +431,103 @@ impl Explorer {
             .as_ref()
             .filter(|(which, _)| Some(*which) == field)
             .map(|(_, message)| message.clone());
+        SettingItem::render(move |_, _, cx| Self::connection_input(id, label, &input, error.clone(), cx).px_1().pb_1()).keywords([label])
+    }
+
+    fn connection_input(
+        id: &'static str,
+        label: &'static str,
+        input: &Entity<InputState>,
+        error: Option<String>,
+        cx: &App,
+    ) -> impl IntoElement + Styled + use<> {
+        div()
+            .id(SharedString::from(format!("connection-field:{id}")))
+            .test_support()
+            .v_flex()
+            .w_full()
+            .min_w_0()
+            .gap_1()
+            .child(div().text_sm().font_medium().child(label))
+            .child(
+                InputGroup::new(SharedString::from(format!("field:{id}")))
+                    .w_full()
+                    .invalid(error.is_some())
+                    .input(Input::new(input).id(id).aria_label(label)),
+            )
+            .when_some(error, |row, error| {
+                row.child(
+                    div()
+                        .id(SharedString::from(format!("{id}-error")))
+                        .test_support()
+                        .role(Role::Alert)
+                        .aria_label(error.clone())
+                        .text_sm()
+                        .text_color(cx.theme().danger)
+                        .child(error),
+                )
+            })
+    }
+
+    fn broker_settings(&self) -> SettingItem {
+        let protocol = self.protocol.clone();
+        let host = self.host.clone();
+        let port = self.port.clone();
+        let field_error = self.field_error.clone();
         SettingItem::render(move |_, _, cx| {
+            let error_for = |field| {
+                field_error
+                    .as_ref()
+                    .filter(|(which, _)| *which == field)
+                    .map(|(_, message)| message.clone())
+            };
             div()
-                .id(SharedString::from(format!("connection-field:{id}")))
+                .id("broker-settings")
                 .test_support()
+                .aria_label("Broker settings")
                 .v_flex()
                 .w_full()
                 .px_1()
-                .py_0()
                 .pb_1()
-                .gap_1()
-                .child(div().text_sm().font_medium().child(label))
+                .gap_2()
+                .child(div().text_sm().font_semibold().child("Broker settings"))
                 .child(
-                    InputGroup::new(SharedString::from(format!("field:{id}")))
+                    div()
+                        .h_flex()
+                        .items_start()
                         .w_full()
-                        .invalid(error.is_some())
-                        .input(Input::new(&input).id(id).aria_label(label)),
+                        .gap_2()
+                        .child(
+                            div()
+                                .v_flex()
+                                .w_32()
+                                .flex_none()
+                                .gap_1()
+                                .child(div().text_sm().font_medium().child("Protocol"))
+                                .child(
+                                    Select::new(&protocol)
+                                        .id("broker-protocol")
+                                        .w_full()
+                                        .accessibility_label("Protocol"),
+                                ),
+                        )
+                        .child(div().flex_1().min_w_0().child(Self::connection_input(
+                            "host",
+                            "Host",
+                            &host,
+                            error_for(ConnectionField::Host),
+                            cx,
+                        )))
+                        .child(div().w_24().flex_none().child(Self::connection_input(
+                            "port",
+                            "Port",
+                            &port,
+                            error_for(ConnectionField::Port),
+                            cx,
+                        ))),
                 )
-                .when_some(error.clone(), |row, error| {
-                    row.child(
-                        div()
-                            .id(SharedString::from(format!("{id}-error")))
-                            .test_support()
-                            .role(Role::Alert)
-                            .aria_label(error.clone())
-                            .text_sm()
-                            .text_color(cx.theme().danger)
-                            .child(error),
-                    )
-                })
         })
-        .keywords([label])
+        .keywords(["Broker settings", "Protocol", "Host", "Port", "MQTT", "TLS", "WebSocket"])
     }
 
     fn connections_page(&self, cx: &mut Context<Self>) -> SettingPage {
@@ -477,7 +544,7 @@ impl Explorer {
             .iter()
             .enumerate()
             .map(|(index, config)| {
-                let details = format!("{}:{} · {}", config.host, config.port, if config.tls { "TLS" } else { "No TLS" });
+                let details = format!("{}{}:{}", config.protocol(), config.host, config.port);
                 (index, connection_label(config), details)
             })
             .collect();
@@ -859,30 +926,8 @@ impl Explorer {
     }
 
     fn connection_form_page(&self, cx: &mut Context<Self>) -> SettingPage {
-        let view = cx.weak_entity();
         let editing = self.editing;
         let connecting = self.status.is_connecting();
-        let tls = self.tls;
-        let tls_item = SettingItem::render(move |_, _, _| {
-            let view = view.clone();
-            div().px_2().py_0().child(
-                Checkbox::new("tls")
-                    .label("Use TLS")
-                    .checked(tls)
-                    .on_change(move |checked, window, cx| {
-                        _ = view.update(cx, |view, cx| {
-                            view.tls = *checked;
-                            let port = view.port.read(cx).value();
-                            if port == "1883" && *checked || port == "8883" && !checked {
-                                view.port
-                                    .update(cx, |input, cx| input.set_value(if *checked { "8883" } else { "1883" }, window, cx));
-                            }
-                            cx.notify();
-                        });
-                    }),
-            )
-        })
-        .keywords(["TLS"]);
         let header_view = cx.weak_entity();
         let header = SettingItem::render(move |_, _, _| {
             div()
@@ -951,10 +996,8 @@ impl Explorer {
         .keywords(["save", "connect", "remove"]);
         let mut group = SettingGroup::new().gap_1().item(header).items([
             self.setting_input("name", "Connection name", &self.name, Some(ConnectionField::Name)),
-            self.setting_input("host", "Host", &self.host, Some(ConnectionField::Host)),
-            self.setting_input("port", "Port", &self.port, Some(ConnectionField::Port)),
+            self.broker_settings(),
             self.setting_input("client-id", "Client ID", &self.client_id, Some(ConnectionField::ClientId)),
-            tls_item,
             self.setting_input("username", "Username", &self.username, Some(ConnectionField::Username)),
             self.setting_input("password", "Password", &self.password, None),
             self.subscription_topics_section(cx),

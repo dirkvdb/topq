@@ -169,6 +169,36 @@ fn tls_transport(roots: RootCertStore) -> Result<Transport> {
     Ok(Transport::tls_with_config(config.into()))
 }
 
+fn mqtt_options(config: &ConnectionConfig) -> Result<MqttOptions> {
+    // rumqttc requires the full URL for WebSocket and reads its port from that URL.
+    let host = if config.websocket {
+        let host = &config.host;
+        if host.parse::<std::net::Ipv6Addr>().is_ok() {
+            format!("ws://[{host}]:{}/mqtt", config.port)
+        } else {
+            format!("ws://{host}:{}/mqtt", config.port)
+        }
+    } else {
+        config.host.clone()
+    };
+    let mut options = MqttOptions::new(&config.client_id, host, config.port);
+    options.set_keep_alive(Duration::from_secs(30));
+    options.set_clean_session(true);
+    options.set_max_packet_size(16 * 1024 * 1024, 16 * 1024 * 1024);
+    if !config.username.is_empty() {
+        options.set_credentials(&config.username, &config.password);
+    }
+    if config.websocket {
+        options.set_transport(Transport::ws());
+    } else if config.tls {
+        // The default transport helper panics when platform certificate loading fails.
+        let mut roots = RootCertStore::empty();
+        roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
+        options.set_transport(tls_transport(roots)?);
+    }
+    Ok(options)
+}
+
 async fn publish_clear_retained(client: AsyncClient, topics: Vec<String>) -> Result<()> {
     for topic in topics {
         client
@@ -185,19 +215,7 @@ async fn run(
     mut commands: mpsc::Receiver<ClearRetained>,
     session: &AtomicU64,
 ) -> Result<()> {
-    let mut options = MqttOptions::new(config.client_id, config.host, config.port);
-    options.set_keep_alive(Duration::from_secs(30));
-    options.set_clean_session(true);
-    options.set_max_packet_size(16 * 1024 * 1024, 16 * 1024 * 1024);
-    if !config.username.is_empty() {
-        options.set_credentials(config.username, config.password);
-    }
-    if config.tls {
-        // The default transport helper panics when platform certificate loading fails.
-        let mut roots = RootCertStore::empty();
-        roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
-        options.set_transport(tls_transport(roots)?);
-    }
+    let options = mqtt_options(&config)?;
     let (client, mut event_loop) = AsyncClient::new(options, 16);
     event_loop.network_options.set_connection_timeout(10);
     let mut operation = None;
@@ -414,6 +432,143 @@ mod tests {
     }
 
     #[test]
+    fn mqtt_options_keep_plain_tcp_host_and_port() {
+        let config = ConnectionConfig {
+            host: "broker.example".into(),
+            port: 1884,
+            ..Default::default()
+        };
+        let options = mqtt_options(&config).unwrap();
+        assert_eq!(options.broker_address(), ("broker.example".into(), 1884));
+        assert!(matches!(options.transport(), Transport::Tcp));
+    }
+
+    #[test]
+    fn mqtt_options_use_system_trusted_tls_for_mqtts() {
+        let config = ConnectionConfig {
+            tls: true,
+            ..Default::default()
+        };
+        let options = mqtt_options(&config).unwrap();
+        assert!(matches!(options.transport(), Transport::Tls(_)));
+    }
+
+    #[test]
+    fn mqtt_options_use_websocket_urls_for_hostnames_ipv4_and_ipv6() {
+        for (host, expected) in [
+            ("broker.example", "ws://broker.example:9001/mqtt"),
+            ("127.0.0.1", "ws://127.0.0.1:9001/mqtt"),
+            ("::1", "ws://[::1]:9001/mqtt"),
+            ("[::1]", "ws://[::1]:9001/mqtt"),
+        ] {
+            let config = ConnectionConfig {
+                host: host.into(),
+                port: 9001,
+                websocket: true,
+                ..Default::default()
+            };
+            let options = mqtt_options(&config).unwrap();
+            assert_eq!(options.broker_address(), (expected.into(), 9001));
+            assert!(matches!(options.transport(), Transport::Ws));
+        }
+    }
+
+    #[test]
+    fn mqtt_options_prefer_unencrypted_websocket_over_tls_and_keep_mqtt_settings() {
+        let config = ConnectionConfig {
+            websocket: true,
+            tls: true,
+            client_id: "ws-client".into(),
+            username: "mqtt-user".into(),
+            password: "mqtt-secret".into(),
+            ..Default::default()
+        };
+        let options = mqtt_options(&config).unwrap();
+        assert!(matches!(options.transport(), Transport::Ws));
+        assert_eq!(options.client_id(), config.client_id);
+        assert_eq!(options.credentials(), Some(rumqttc::Login::new(config.username, config.password)));
+        assert_eq!(options.keep_alive(), Duration::from_secs(30));
+        assert!(options.clean_session());
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "tungstenite's handshake callback requires an unboxed HTTP error response"
+    )]
+    fn websocket_broker_roundtrip(listener: TcpListener, host: &str) {
+        use tungstenite::{
+            Message as WsMessage, accept_hdr,
+            handshake::server::{Request, Response},
+        };
+
+        let port = listener.local_addr().unwrap().port();
+        let broker = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut socket = accept_hdr(stream, |request: &Request, mut response: Response| {
+                assert_eq!(request.uri().path(), "/mqtt");
+                assert!(request.headers()["host"].to_str().unwrap().ends_with(&format!(":{port}")));
+                assert_eq!(request.headers()["sec-websocket-protocol"], "mqtt");
+                response.headers_mut().insert("sec-websocket-protocol", "mqtt".parse().unwrap());
+                Ok(response)
+            })
+            .unwrap();
+            let connect = socket.read().unwrap().into_data();
+            assert_eq!(connect[0], 0x10);
+            assert_eq!(connect_client_id(&connect[2..]), "ws-client");
+            socket.send(WsMessage::Binary(vec![0x20, 2, 0, 0].into())).unwrap();
+            let subscribe = socket.read().unwrap().into_data();
+            assert_eq!(subscribe[0], 0x82);
+            assert_eq!(&subscribe[4..], b"\0\x01#\0");
+            socket
+                .send(WsMessage::Binary(vec![0x90, 3, subscribe[2], subscribe[3], 0].into()))
+                .unwrap();
+            socket.send(WsMessage::Binary(b"\x30\x0b\0\x05topicdata".to_vec().into())).unwrap();
+            // Keep the broker alive until the client has consumed the message and stops.
+            let _ = socket.read();
+        });
+        let runtime = runtime();
+        let mut connection = connect(ConnectionConfig {
+            host: host.into(),
+            port,
+            websocket: true,
+            client_id: "ws-client".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(matches!(next_event(&runtime, &mut connection), BrokerEvent::Connected));
+        match next_matching_event(&runtime, &mut connection, |event| matches!(event, BrokerEvent::Message(_))) {
+            BrokerEvent::Message(message) => {
+                assert_eq!(message.topic, "topic");
+                assert_eq!(message.payload.as_ref(), b"data");
+            }
+            _ => unreachable!(),
+        }
+        drop(connection);
+        broker.join().unwrap();
+    }
+
+    #[test]
+    fn websocket_transport_connects_subscribes_and_receives_messages_over_ipv4() {
+        websocket_broker_roundtrip(TcpListener::bind("127.0.0.1:0").unwrap(), "127.0.0.1");
+    }
+
+    #[test]
+    fn websocket_transport_connects_subscribes_and_receives_messages_over_ipv6() {
+        let listener = match TcpListener::bind("[::1]:0") {
+            Ok(listener) => listener,
+            Err(error) if matches!(error.kind(), std::io::ErrorKind::AddrNotAvailable | std::io::ErrorKind::Unsupported) => {
+                eprintln!("Skipping IPv6 WebSocket roundtrip: IPv6 loopback is unavailable ({error}).");
+                return;
+            }
+            Err(error) => panic!("Could not bind IPv6 loopback: {error}"),
+        };
+        websocket_broker_roundtrip(listener, "::1");
+        websocket_broker_roundtrip(TcpListener::bind("[::1]:0").unwrap(), "[::1]");
+    }
+
+    #[test]
     fn connect_uses_the_configured_client_id() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -427,6 +582,9 @@ mod tests {
             let (header, subscribe) = read_packet(&mut stream);
             assert_eq!(header, 0x82);
             stream.write_all(&[0x90, 3, subscribe[0], subscribe[1], 0]).unwrap();
+            // Closing now can race with the client reading SUBACK; wait for client teardown.
+            let mut byte = [0];
+            assert_eq!(stream.read(&mut byte).unwrap(), 0, "dropping the connection must close its socket");
         });
         let runtime = runtime();
         let mut connection = connect(ConnectionConfig {
