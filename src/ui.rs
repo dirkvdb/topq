@@ -1189,7 +1189,6 @@ impl Explorer {
                         )
                     })
                     .child(div().flex_1().min_w_0().child(status))
-                    .child(div().flex_none().text_color(cx.theme().muted_foreground).child("Readonly"))
                     .child(div().flex_none().child(topic_summary(self.topics.topics, self.topics.messages))),
             )
     }
