@@ -44,6 +44,12 @@
             ++ pkgs.lib.optionals pkgs.stdenv.isLinux linuxRuntimeDeps
             ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [ pkgs.apple-sdk_15 ];
 
+          nativeCheckInputs = [ pkgs.cacert ];
+          preCheck = ''
+            # The build sandbox does not expose the host's trusted certificates.
+            export SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt
+          '';
+
           postInstall = pkgs.lib.optionalString pkgs.stdenv.isLinux ''
             install -Dm644 topq.desktop $out/share/applications/topq.desktop
             install -d $out/share/icons/hicolor/512x512/apps
