@@ -618,25 +618,20 @@ impl Explorer {
         cx.notify();
     }
 
-    fn confirm_clear_topic(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn confirm_delete_topic(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(path) = self.selected.clone() else {
             return;
         };
-        let Some(session) = self.connection.as_ref().and_then(Connection::retained_clear_session) else {
-            self.error = Some("Connect to the broker before clearing retained topics.".into());
-            cx.notify();
-            return;
-        };
-        self.confirm_clear_topic_with_send(path, window, cx, move |view, topics| {
+        self.show_confirm_topic_deletion_dialog(path, window, cx, move |view, topics| {
             let connection = view
                 .connection
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("The broker connection has closed."))?;
-            connection.clear_retained_in_session(topics, &session)
+            connection.delete_topics(topics)
         });
     }
 
-    fn confirm_clear_topic_with_send(
+    fn show_confirm_topic_deletion_dialog(
         &mut self,
         path: String,
         window: &mut Window,
@@ -665,7 +660,7 @@ impl Explorer {
             let start = "Delete ".len();
             start..start + path.len()
         });
-        let warning = "Clears retained messages on the broker. This cannot be undone and may affect other subscribers.";
+        let warning = "Deletes retained messages on the broker. This cannot be undone and may affect other subscribers.";
 
         let pending = Rc::new(RefCell::new(Some((send, topics))));
         let view = cx.weak_entity();
@@ -720,11 +715,7 @@ impl Explorer {
                     // The dialog builder runs every frame; consume the frozen request only once.
                     if let Some((send, topics)) = pending.borrow_mut().take() {
                         _ = view.update(cx, |view, cx| {
-                            let result = if view.status.is_connected() {
-                                send(view, topics)
-                            } else {
-                                Err(anyhow::anyhow!("The broker disconnected. Confirm again while connected."))
-                            };
+                            let result = send(view, topics);
                             view.error = result.err().map(|error| format!("Could not delete retained topics: {error:#}"));
                             cx.notify();
                         });
@@ -1145,7 +1136,7 @@ impl Explorer {
                         .accessibility_label("Delete topic and subtopics")
                         .tooltip("Delete retained topic and subtopics")
                         .disabled(!self.status.is_connected() || self.connection.is_none())
-                        .on_click(cx.listener(|view, _, window, cx| view.confirm_clear_topic(window, cx))),
+                        .on_click(cx.listener(|view, _, window, cx| view.confirm_delete_topic(window, cx))),
                 )
                 .child(
                     Button::new("copy-topic")

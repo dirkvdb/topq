@@ -3436,7 +3436,7 @@ fn canceling_topic_deletion_preserves_topics_and_does_not_publish(cx: &mut TestA
         view.update(cx, |view, cx| {
             view.select_topic("home", window, cx);
             let sends = sends.clone();
-            view.confirm_clear_topic_with_send("home".into(), window, cx, move |_, _| {
+            view.show_confirm_topic_deletion_dialog("home".into(), window, cx, move |_, _| {
                 sends.set(sends.get() + 1);
                 Ok(())
             });
@@ -3453,7 +3453,7 @@ fn canceling_topic_deletion_preserves_topics_and_does_not_publish(cx: &mut TestA
         let warning = window.find("delete-topic-warning");
         assert_eq!(
             warning.label(),
-            Some("Clears retained messages on the broker. This cannot be undone and may affect other subscribers.")
+            Some("Deletes retained messages on the broker. This cannot be undone and may affect other subscribers.")
         );
         assert!(window.try_find("delete-topic-note").is_none());
         assert_eq!(sends.get(), 0);
@@ -3479,7 +3479,7 @@ fn topic_deletion_dialog_escape_cancels_and_restores_focus(cx: &mut TestAppConte
         view.update(cx, |view, cx| {
             view.select_topic("home", window, cx);
             previous_focus = window.focused(cx);
-            view.confirm_clear_topic_with_send("home".into(), window, cx, |_, _| panic!("Escape must not publish"));
+            view.show_confirm_topic_deletion_dialog("home".into(), window, cx, |_, _| panic!("Escape must not publish"));
         });
         window.render_frame(cx);
         assert!(window.has_active_dialog(cx));
@@ -3505,7 +3505,7 @@ fn topic_deletion_dialog_enter_confirms_only_once(cx: &mut TestAppContext) {
         view.update(cx, |view, cx| {
             view.select_topic("home", window, cx);
             let sends = sends.clone();
-            view.confirm_clear_topic_with_send("home".into(), window, cx, move |_, _| {
+            view.show_confirm_topic_deletion_dialog("home".into(), window, cx, move |_, _| {
                 sends.set(sends.get() + 1);
                 Ok(())
             });
@@ -3540,7 +3540,7 @@ fn topic_deletion_dialog_wraps_content_and_keeps_actions_visible_across_themes_a
                     let path = "homeassistant/binary_sensor/very_long_device_identifier/living_room/occupancy/state";
                     view.topics.receive(message(path), std::time::Instant::now());
                     view.select_topic(path, window, cx);
-                    view.confirm_clear_topic_with_send(path.into(), window, cx, |_, _| panic!("layout test must not publish"));
+                    view.show_confirm_topic_deletion_dialog(path.into(), window, cx, |_, _| panic!("layout test must not publish"));
                 });
                 window.render_frame(cx);
                 let surface = window.within("dialog").find(0usize).bounds();
@@ -3595,7 +3595,7 @@ fn topic_deletion_scope_renders_unicode_and_empty_topic_levels(cx: &mut TestAppC
             view.update(cx, |view, cx| {
                 view.topics.receive(message(message_topic), std::time::Instant::now());
                 view.select_topic(path, window, cx);
-                view.confirm_clear_topic_with_send(path.into(), window, cx, |_, _| panic!("rendering must not publish"));
+                view.show_confirm_topic_deletion_dialog(path.into(), window, cx, |_, _| panic!("rendering must not publish"));
             });
             window.render_frame(cx);
             let scope = window.find("delete-topic-scope");
@@ -3616,7 +3616,7 @@ fn confirming_topic_deletion_sends_only_the_scope_shown_in_the_warning(cx: &mut 
         view.update(cx, |view, cx| {
             view.select_topic("home", window, cx);
             let sent = sent.clone();
-            view.confirm_clear_topic_with_send("home".into(), window, cx, move |_, topics| {
+            view.show_confirm_topic_deletion_dialog("home".into(), window, cx, move |_, topics| {
                 *sent.borrow_mut() = topics;
                 Ok(())
             });
@@ -3644,7 +3644,7 @@ fn failed_topic_deletion_reports_the_error_without_losing_topic_data(cx: &mut Te
     cx.update_window(handle, |_, window, cx| {
         view.update(cx, |view, cx| {
             view.select_topic("home/a", window, cx);
-            view.confirm_clear_topic_with_send("home/a".into(), window, cx, |_, _| anyhow::bail!("queue full"));
+            view.show_confirm_topic_deletion_dialog("home/a".into(), window, cx, |_, _| anyhow::bail!("queue full"));
         });
     })
     .unwrap();
@@ -3664,11 +3664,16 @@ fn failed_topic_deletion_reports_the_error_without_losing_topic_data(cx: &mut Te
 }
 
 #[gpui_kit::test]
-fn disconnecting_during_topic_deletion_confirmation_prevents_publishing(cx: &mut TestAppContext) {
+fn disconnecting_during_topic_deletion_confirmation_still_queues_the_confirmed_request(cx: &mut TestAppContext) {
     let (handle, view) = open(cx, false, 1200., 760.);
+    let sent = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
     cx.update_window(handle, |_, window, cx| {
         view.update(cx, |view, cx| {
-            view.confirm_clear_topic_with_send("home".into(), window, cx, |_, _| panic!("must not publish after disconnect"));
+            let sent = sent.clone();
+            view.show_confirm_topic_deletion_dialog("home".into(), window, cx, move |_, topics| {
+                *sent.borrow_mut() = topics;
+                Ok(())
+            });
             view.status = ConnectionStatus::Disconnected;
         });
     })
@@ -3676,7 +3681,8 @@ fn disconnecting_during_topic_deletion_confirmation_prevents_publishing(cx: &mut
     click_topic_deletion_button(cx, handle, "ok");
     cx.update(|cx| {
         let view = view.read(cx);
-        assert!(view.error.as_ref().unwrap().contains("disconnected"));
+        assert_eq!(*sent.borrow(), ["home", "home/a", "home/b"]);
+        assert!(view.error.is_none());
         assert_eq!(view.topics.topics, 2);
     });
 }
@@ -3688,7 +3694,7 @@ fn disconnected_topic_deletion_does_not_open_a_dialog(cx: &mut TestAppContext) {
         view.update(cx, |view, cx| {
             view.select_topic("home", window, cx);
             view.status = ConnectionStatus::Disconnected;
-            view.confirm_clear_topic_with_send("home".into(), window, cx, |_, _| panic!("must not publish while disconnected"));
+            view.show_confirm_topic_deletion_dialog("home".into(), window, cx, |_, _| panic!("must not publish while disconnected"));
         });
         window.render_frame(cx);
         window.click("delete-topic", cx);
