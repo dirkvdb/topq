@@ -1,5 +1,9 @@
 { pkgs, inputs, lib, ... }:
 {
+  tasks."ci:checks" = {
+    exec = "just build && just test";
+  };
+
   enterShell = ''
     skill_dir="$DEVENV_ROOT/.agents/skills/rust-best-practices"
 
