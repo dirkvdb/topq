@@ -52,6 +52,7 @@ gpui_kit::actions!(
 pub(crate) fn init(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("secondary-,", OpenConnection, Some("Explorer")),
+        KeyBinding::new("escape", CancelConnection, Some("SettingsDialog")),
         KeyBinding::new("escape", FocusTopics, Some("TopicFilter")),
         KeyBinding::new("/", FocusTopicFilter, Some("Explorer && !TopicFilter")),
         KeyBinding::new("ctrl-f", FocusTopicFilter, Some("Explorer")),
@@ -1217,7 +1218,7 @@ impl Render for Explorer {
         div()
             .id("explorer")
             .test_support()
-            .key_context("Explorer")
+            .key_context(if self.show_config { "Explorer SettingsDialog" } else { "Explorer" })
             .track_focus(&self.focus)
             .on_action(cx.listener(|view, _: &OpenConnection, window, cx| view.open_connection(window, cx)))
             .on_action(cx.listener(|view, _: &CancelConnection, window, cx| view.cancel_connection(window, cx)))

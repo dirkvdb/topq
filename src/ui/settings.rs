@@ -142,10 +142,8 @@ impl Explorer {
             cx.propagate();
             return;
         }
-        if self.topic_editor_open {
-            self.cancel_topic_edit(window, cx);
-            return;
-        }
+        self.topic_editor_open = false;
+        self.topic_editor_restore_focus = None;
         self.show_config = false;
         self.field_error = None;
         if let Some(handle) = self.restore_focus.take() {
@@ -269,8 +267,10 @@ impl Explorer {
         self.topic_qos.update(cx, |state, cx| state.set_selected_value(&"0", window, cx));
         self.username
             .update(cx, |input, cx| input.set_value(config.username.clone(), window, cx));
-        self.password
-            .update(cx, |input, cx| input.set_value(config.password.clone(), window, cx));
+        self.password.update(cx, |input, cx| {
+            input.set_masked(true, window, cx);
+            input.set_value(config.password.clone(), window, cx);
+        });
         self.protocol
             .update(cx, |state, cx| state.set_selected_value(&config.protocol(), window, cx));
         self.field_error = None;
@@ -453,7 +453,22 @@ impl Explorer {
                 InputGroup::new(SharedString::from(format!("field:{id}")))
                     .w_full()
                     .invalid(error.is_some())
-                    .input(Input::new(input).id(id).aria_label(label)),
+                    .input(Input::new(input).id(id).aria_label(label).when(id == "password", |control| {
+                        let masked = input.read(cx).presentation().is_masked();
+                        let action = if masked { "Show password" } else { "Hide password" };
+                        let input = input.clone();
+                        control.suffix(
+                            Button::new("toggle-password")
+                                .xsmall()
+                                .ghost()
+                                .icon(if masked { IconName::Eye } else { IconName::EyeOff })
+                                .accessibility_label(action)
+                                .tooltip(action)
+                                .on_click(move |_, window, cx| {
+                                    input.update(cx, |input, cx| input.toggle_masked(window, cx));
+                                }),
+                        )
+                    })),
             )
             .when_some(error, |row, error| {
                 row.child(

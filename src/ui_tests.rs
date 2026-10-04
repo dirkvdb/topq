@@ -783,7 +783,14 @@ fn topic_editor_buttons_support_keyboard_activation_and_cancel_restores_the_trig
         window.click("port", cx);
     })
     .unwrap();
-    for id in ["client-id", "username", "password", "toggle-topics", "begin-add-topic"] {
+    for id in [
+        "client-id",
+        "username",
+        "password",
+        "toggle-password",
+        "toggle-topics",
+        "begin-add-topic",
+    ] {
         cx.update_window(handle, |_, window, cx| window.press("tab", cx)).unwrap();
         cx.run_until_parked();
         cx.update_window(handle, |_, window, cx| {
@@ -1283,6 +1290,14 @@ fn broker_protocol_supports_keyboard_selection_default_ports_and_tab_order(cx: &
         assert_eq!(window.find("broker-protocol").focused(), Some(true));
         assert_eq!(window.find("broker-protocol").expanded(), Some(false));
         assert!(window.find("settings-dialog").visible());
+        window.press("escape", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("settings-dialog").is_none());
+        assert!(!view.read(cx).show_config);
     })
     .unwrap();
 }
@@ -1338,6 +1353,93 @@ fn reopening_settings_restores_the_selected_connection(cx: &mut TestAppContext) 
 }
 
 #[gpui_kit::test]
+fn password_inspection_toggles_visibility_without_changing_the_value(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, true, 1200., 1600.);
+    let password = " secret 密碼 ";
+    cx.update_window(handle, |_, window, _| window.activate_window()).unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("password", cx);
+        window.input(password, cx);
+        assert_eq!(window.find("password").value(), None);
+        assert_eq!(window.find("toggle-password").label(), Some("Show password"));
+        let field = window.find("field:password").bounds();
+        let toggle = window.find("toggle-password").bounds();
+        assert!(toggle.left() >= field.left() && toggle.right() <= field.right());
+        assert!(toggle.top() >= field.top() && toggle.bottom() <= field.bottom());
+
+        window.click("toggle-password", cx);
+        assert_eq!(window.find("password").value(), Some(password));
+        assert_eq!(window.find("toggle-password").label(), Some("Hide password"));
+        window.click("toggle-password", cx);
+        assert_eq!(window.find("password").value(), None);
+        assert_eq!(view.read(cx).password.read(cx).value().as_str(), password);
+
+        window.click("password", cx);
+        window.press("tab", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("toggle-password").focused(), Some(true));
+        window.press("space", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("password").value(), Some(password));
+        assert_eq!(window.find("toggle-password").label(), Some("Hide password"));
+        assert_eq!(view.read(cx).password.read(cx).value().as_str(), password);
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn opening_connection_forms_masks_previously_inspected_passwords(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, false, 1200., 1600.);
+    view.update(cx, |view, _| {
+        view.saved_connections.connections[0].password = "home-secret".into();
+        view.saved_connections.connections.push(ConnectionConfig {
+            name: "Workshop".into(),
+            password: "workshop-secret".into(),
+            ..Default::default()
+        });
+    });
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("settings", cx);
+        window.click("edit-connection:0", cx);
+        assert_eq!(window.find("password").value(), None);
+        window.click("toggle-password", cx);
+        assert_eq!(window.find("password").value(), Some("home-secret"));
+
+        window.click("back-to-connections", cx);
+        window.click("edit-connection:1", cx);
+        assert_eq!(window.find("password").value(), None);
+        assert_eq!(window.find("toggle-password").label(), Some("Show password"));
+        window.click("toggle-password", cx);
+        assert_eq!(window.find("password").value(), Some("workshop-secret"));
+
+        window.click("close-settings", cx);
+        window.click("settings", cx);
+        window.click("edit-connection:1", cx);
+        assert_eq!(window.find("password").value(), None);
+        window.click("toggle-password", cx);
+        window.click("back-to-connections", cx);
+        window.click("new-connection", cx);
+        assert_eq!(window.find("password").value(), None);
+        assert_eq!(window.find("toggle-password").label(), Some("Show password"));
+        assert_eq!(view.read(cx).password.read(cx).value().as_str(), "");
+        assert_eq!(view.read(cx).saved_connections.connections[0].password, "home-secret");
+        assert_eq!(view.read(cx).saved_connections.connections[1].password, "workshop-secret");
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
 fn tabbing_between_connection_inputs_selects_values_and_visits_subscription_controls(cx: &mut TestAppContext) {
     let (handle, view) = open(cx, true, 1200., 1600.);
     cx.update_window(handle, |_, window, _| window.activate_window()).unwrap();
@@ -1366,11 +1468,13 @@ fn tabbing_between_connection_inputs_selects_values_and_visits_subscription_cont
         ("tab", "client-id", Some("topq-next-client")),
         ("tab", "username", Some("another-reader")),
         ("tab", "password", Some("new-password")),
+        ("tab", "toggle-password", None),
         ("tab", "toggle-topics", None),
         ("tab", "begin-add-topic", None),
         ("tab", "remove-topic:#", None),
         ("shift-tab", "begin-add-topic", None),
         ("shift-tab", "toggle-topics", None),
+        ("shift-tab", "toggle-password", None),
         ("shift-tab", "password", Some("replacement-password")),
         ("shift-tab", "username", Some("replacement-reader")),
         ("shift-tab", "client-id", Some("topq-previous-client")),
@@ -1615,7 +1719,41 @@ fn topic_rows_use_compact_spacing_and_remain_comfortable_at_larger_text_sizes(cx
 }
 
 #[gpui_kit::test]
-fn escape_cancels_the_topic_editor_then_connection_edits_and_restores_focus(cx: &mut TestAppContext) {
+fn escape_closes_settings_from_the_overview_appearance_and_connection_controls(cx: &mut TestAppContext) {
+    for target in [None, Some("appearance"), Some("name"), Some("password"), Some("toggle-password")] {
+        let (handle, view) = open(cx, false, 1200., 1600.);
+        let mut previous_focus = None;
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            previous_focus = window.focused(cx);
+            window.click("settings", cx);
+            match target {
+                Some("appearance") => window.click("0-1", cx),
+                Some(id) => {
+                    window.click("edit-connection:0", cx);
+                    window.click(id, cx);
+                }
+                None => {}
+            }
+            window.press("escape", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                window.try_find("settings-dialog").is_none(),
+                "Escape should close settings from {target:?}"
+            );
+            assert!(!view.read(cx).show_config);
+            assert!(previous_focus.as_ref().unwrap().is_focused(window));
+        })
+        .unwrap();
+    }
+}
+
+#[gpui_kit::test]
+fn escape_closes_settings_with_a_pending_topic_editor_and_restores_focus(cx: &mut TestAppContext) {
     let (handle, view) = open(cx, false, 1200., 1600.);
     cx.update_window(handle, |_, window, cx| {
         window.render_frame(cx);
@@ -1643,19 +1781,12 @@ fn escape_cancels_the_topic_editor_then_connection_edits_and_restores_focus(cx: 
     cx.run_until_parked();
     cx.update_window(handle, |_, window, cx| {
         window.render_frame(cx);
-        assert!(window.find("settings-dialog").visible());
+        assert!(window.try_find("settings-dialog").is_none());
         assert!(window.try_find("topic-editor").is_none());
-        assert_eq!(window.find("port").focused(), Some(true));
-        assert_eq!(window.find("port").value(), Some("9999"));
+        assert!(!view.read(cx).topic_editor_open);
         assert_eq!(view.read(cx).subscription_topics, vec![subscription("#", 0)]);
         assert_eq!(view.read(cx).saved_connections.connections[0].topics, vec![subscription("#", 0)]);
-        window.press("escape", cx);
-    })
-    .unwrap();
-    cx.run_until_parked();
-    cx.update_window(handle, |_, window, cx| {
-        window.render_frame(cx);
-        assert!(window.try_find("settings-dialog").is_none());
+        assert_eq!(view.read(cx).saved_connections.connections[0].port, 1883);
         assert!(!view.read(cx).show_config);
         assert_eq!(window.find("settings").focused(), Some(true));
         window.click("settings", cx);
