@@ -28,11 +28,11 @@ fn main() {
             },
             cx,
             |window, cx| {
-                window.set_window_title("Topq");
+                window.set_window_title("TopQ");
                 cx.new(|cx| ui::Explorer::new(window, cx))
             },
         ) {
-            eprintln!("Could not open the MQTT UI window: {error:#}");
+            eprintln!("Could not open the TopQ window: {error:#}");
             cx.quit();
             return;
         }

@@ -23,11 +23,8 @@ pub enum BrokerEvent {
     Connecting,
     Connected,
     Status(String),
-    /// A retained deletion failed; this does not change the connection status.
     OperationError(String),
-    /// The worker queued a publish to rumqttc, not a broker acknowledgement.
     PublishQueued,
-    /// A publish failed or was cancelled; this does not change the connection status.
     PublishError(String),
     Message(Message),
 }
@@ -40,6 +37,24 @@ pub struct Connection {
     session: Arc<AtomicU64>,
 }
 
+/// Quality of service for an MQTT publish.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Qos {
+    AtMostOnce,
+    AtLeastOnce,
+    ExactlyOnce,
+}
+
+impl From<Qos> for QoS {
+    fn from(qos: Qos) -> Self {
+        match qos {
+            Qos::AtMostOnce => Self::AtMostOnce,
+            Qos::AtLeastOnce => Self::AtLeastOnce,
+            Qos::ExactlyOnce => Self::ExactlyOnce,
+        }
+    }
+}
+
 /// Opaque connection identity and connected generation captured before a deletion prompt.
 /// Holding this token does not keep the MQTT worker alive.
 #[derive(Clone)]
@@ -50,12 +65,12 @@ pub struct RetainedClearSession {
 
 const COMMAND_CAPACITY: usize = 16;
 
-struct ClearRetained {
+struct DeleteTopicsData {
     topics: Vec<String>,
     session: u64,
 }
 
-struct PublishCommand {
+struct PublishCommandData {
     topic: String,
     payload: Vec<u8>,
     qos: QoS,
@@ -64,20 +79,20 @@ struct PublishCommand {
 }
 
 enum Command {
-    ClearRetained(ClearRetained),
-    Publish(PublishCommand),
+    DeleteTopics(DeleteTopicsData),
+    Publish(PublishCommandData),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum OperationKind {
-    ClearRetained,
+    DeleteTopics,
     Publish,
 }
 
 impl OperationKind {
     fn error(self, message: String) -> BrokerEvent {
         match self {
-            Self::ClearRetained => BrokerEvent::OperationError(message),
+            Self::DeleteTopics => BrokerEvent::OperationError(message),
             Self::Publish => BrokerEvent::PublishError(message),
         }
     }
@@ -86,53 +101,53 @@ impl OperationKind {
 impl Command {
     fn session(&self) -> u64 {
         match self {
-            Self::ClearRetained(command) => command.session,
+            Self::DeleteTopics(command) => command.session,
             Self::Publish(command) => command.session,
         }
     }
 
     fn kind(&self) -> OperationKind {
         match self {
-            Self::ClearRetained(_) => OperationKind::ClearRetained,
+            Self::DeleteTopics(_) => OperationKind::DeleteTopics,
             Self::Publish(_) => OperationKind::Publish,
         }
     }
+}
+
+fn ensure_valid_topic(topic: &str) -> Result<()> {
+    ensure!(!topic.is_empty(), "MQTT topic names must not be empty.");
+    ensure!(
+        !topic.contains(['#', '+']),
+        "Publishing requires an exact topic name, not MQTT wildcards."
+    );
+    ensure!(
+        topic.len() <= u16::MAX as usize,
+        "MQTT topic names must not exceed 65535 UTF-8 bytes."
+    );
+    ensure!(!topic.contains('\0'), "MQTT topic names must not contain a null character.");
+    Ok(())
 }
 
 impl Connection {
     /// Queues a publish for the current connected session without waiting.
     ///
     /// Topic names must be nonempty, exact MQTT names (no wildcards or NUL),
-    /// at most 65535 UTF-8 bytes; QoS must be 0, 1, or 2. Invalid input,
+    /// and at most 65535 UTF-8 bytes. Invalid input,
     /// disconnection, and full/closed command queues return an immediate error.
     /// `Ok(())` means the command was accepted. The worker subsequently emits
     /// `BrokerEvent::PublishQueued` when rumqttc accepts it, or
     /// `BrokerEvent::PublishError` on failure or cancellation. Neither event
     /// acknowledges broker delivery. Publishes are never replayed after reconnect.
-    pub fn publish(&self, topic: String, payload: Vec<u8>, qos: u8, retain: bool) -> Result<()> {
-        ensure!(!topic.is_empty(), "MQTT topic names must not be empty.");
-        ensure!(
-            !topic.contains(['#', '+']),
-            "Publishing requires an exact topic name, not MQTT wildcards."
-        );
-        ensure!(
-            topic.len() <= u16::MAX as usize,
-            "MQTT topic names must not exceed 65535 UTF-8 bytes."
-        );
-        ensure!(!topic.contains('\0'), "MQTT topic names must not contain a null character.");
-        let qos = match qos {
-            0 => QoS::AtMostOnce,
-            1 => QoS::AtLeastOnce,
-            2 => QoS::ExactlyOnce,
-            _ => anyhow::bail!("MQTT publish QoS must be 0, 1, or 2."),
-        };
+    pub fn publish(&self, topic: String, payload: Vec<u8>, qos: Qos, retain: bool) -> Result<()> {
+        ensure_valid_topic(&topic)?;
+
         let session = self.session.load(Ordering::Acquire);
         ensure!(session % 2 == 1, "Cannot publish while disconnected.");
         self.commands
-            .try_send(Command::Publish(PublishCommand {
+            .try_send(Command::Publish(PublishCommandData {
                 topic,
                 payload,
-                qos,
+                qos: qos.into(),
                 retain,
                 session,
             }))
@@ -200,7 +215,7 @@ impl Connection {
         // Preserve the captured generation in the command so the worker also
         // rejects a disconnect/reconnect racing with validation or queueing.
         self.commands
-            .try_send(Command::ClearRetained(ClearRetained { topics, session }))
+            .try_send(Command::DeleteTopics(DeleteTopicsData { topics, session }))
             .context("Could not queue retained-topic deletion (queue full or worker stopped).")
     }
 }
@@ -293,7 +308,7 @@ async fn publish_clear_retained(client: AsyncClient, topics: Vec<String>, queued
     for topic in topics {
         // Register before awaiting: a full flume queue can hand the request to
         // poll before the sending future is resumed.
-        queued.borrow_mut().push_back(OperationKind::ClearRetained);
+        queued.borrow_mut().push_back(OperationKind::DeleteTopics);
         if let Err(error) = client.publish(topic, QoS::AtMostOnce, true, Vec::new()).await {
             queued.borrow_mut().pop_back();
             return Err(error).context("Could not queue a retained-topic deletion publish.");
@@ -304,7 +319,7 @@ async fn publish_clear_retained(client: AsyncClient, topics: Vec<String>, queued
 
 async fn queue_command(client: AsyncClient, command: Command, queued: Rc<RefCell<VecDeque<OperationKind>>>) -> Result<()> {
     match command {
-        Command::ClearRetained(command) => publish_clear_retained(client, command.topics, queued).await,
+        Command::DeleteTopics(command) => publish_clear_retained(client, command.topics, queued).await,
         Command::Publish(command) => {
             queued.borrow_mut().push_back(OperationKind::Publish);
             if let Err(error) = client.publish(command.topic, command.qos, command.retain, command.payload).await {
@@ -347,7 +362,7 @@ async fn run(
                         let kind = command.kind();
                         if current.is_multiple_of(2) || command.session() != current {
                             let message = match kind {
-                                OperationKind::ClearRetained => "Retained-topic deletion cancelled because the connection changed. Confirm again while connected.",
+                                OperationKind::DeleteTopics => "Retained-topic deletion cancelled because the connection changed. Confirm again while connected.",
                                 OperationKind::Publish => "Publish cancelled because the connection changed. Publish again while connected.",
                             };
                             if sender.send(kind.error(message.into())).await.is_err() {
@@ -443,7 +458,7 @@ async fn run(
                 let interrupted = operation.take().map(|(kind, _)| kind);
                 let (pending_deletions, pending_publishes) = {
                     let mut queued = queued.borrow_mut();
-                    let deletions = queued.contains(&OperationKind::ClearRetained);
+                    let deletions = queued.contains(&OperationKind::DeleteTopics);
                     let publishes = queued.contains(&OperationKind::Publish);
                     queued.clear();
                     (deletions, publishes)
@@ -456,7 +471,7 @@ async fn run(
                 let interrupted_publish =
                     interrupted == Some(OperationKind::Publish) || pending_publishes || !inflight_publishes.is_empty();
                 inflight_publishes.clear();
-                if (interrupted == Some(OperationKind::ClearRetained) || pending_deletions)
+                if (interrupted == Some(OperationKind::DeleteTopics) || pending_deletions)
                     && sender.send(BrokerEvent::OperationError(
                         "Retained-topic deletion interrupted by disconnect; some topics may already have been cleared. It will not be retried.".into(),
                     )).await.is_err()
@@ -941,18 +956,22 @@ mod tests {
     }
 
     #[test]
-    fn publish_validates_exact_topics_and_qos_before_queueing() {
+    fn publish_validates_exact_topics_before_queueing() {
         let (connection, mut commands, _) = command_connection();
         for invalid in ["", "#", "a/+", "a#b", "a+b", "a\0b"] {
-            assert!(connection.publish(invalid.into(), Vec::new(), 0, false).is_err());
+            assert!(connection.publish(invalid.into(), Vec::new(), Qos::AtMostOnce, false).is_err());
         }
         for invalid in ["a".repeat(65536), "é".repeat(32768)] {
-            assert!(connection.publish(invalid, Vec::new(), 0, false).is_err());
-        }
-        for qos in [3, u8::MAX] {
-            assert!(connection.publish("test/value".into(), Vec::new(), qos, false).is_err());
+            assert!(connection.publish(invalid, Vec::new(), Qos::AtMostOnce, false).is_err());
         }
         assert!(matches!(commands.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn qos_converts_to_rumqttc_qos() {
+        assert_eq!(QoS::from(Qos::AtMostOnce), QoS::AtMostOnce);
+        assert_eq!(QoS::from(Qos::AtLeastOnce), QoS::AtLeastOnce);
+        assert_eq!(QoS::from(Qos::ExactlyOnce), QoS::ExactlyOnce);
     }
 
     #[test]
@@ -960,7 +979,7 @@ mod tests {
         let (connection, mut commands, _) = command_connection();
         let topics = ["/".into(), "$SYS/value".into(), " a//é ".into(), format!("{}a", "é".repeat(32767))];
         for topic in topics {
-            for qos in 0..=2 {
+            for qos in [Qos::AtMostOnce, Qos::AtLeastOnce, Qos::ExactlyOnce] {
                 for retain in [false, true] {
                     let payload = vec![0, 0xff, b'\n'];
                     connection.publish(topic.clone(), payload.clone(), qos, retain).unwrap();
@@ -969,7 +988,7 @@ mod tests {
                     };
                     assert_eq!(command.topic, topic);
                     assert_eq!(command.payload, payload);
-                    assert_eq!(command.qos as u8, qos);
+                    assert_eq!(command.qos, qos.into());
                     assert_eq!(command.retain, retain);
                     assert_eq!(command.session, 1);
                 }
@@ -982,7 +1001,9 @@ mod tests {
         let (connection, mut commands, _) = command_connection();
         for session in [0, 2, 4] {
             connection.session.store(session, Ordering::Release);
-            let error = connection.publish("test/value".into(), Vec::new(), 0, false).unwrap_err();
+            let error = connection
+                .publish("test/value".into(), Vec::new(), Qos::AtMostOnce, false)
+                .unwrap_err();
             assert!(error.to_string().contains("disconnected"));
         }
         assert!(matches!(commands.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
@@ -994,16 +1015,16 @@ mod tests {
         for _ in 0..COMMAND_CAPACITY {
             connection.clear_retained(vec!["test/value".into()]).unwrap();
         }
-        assert!(connection.publish("test/value".into(), Vec::new(), 0, false).is_err());
+        assert!(connection.publish("test/value".into(), Vec::new(), Qos::AtMostOnce, false).is_err());
         for _ in 0..COMMAND_CAPACITY {
             commands.try_recv().unwrap();
         }
         for _ in 0..COMMAND_CAPACITY {
-            connection.publish("test/value".into(), Vec::new(), 0, false).unwrap();
+            connection.publish("test/value".into(), Vec::new(), Qos::AtMostOnce, false).unwrap();
         }
         assert!(connection.clear_retained(vec!["test/value".into()]).is_err());
         drop(commands);
-        assert!(connection.publish("test/value".into(), Vec::new(), 0, false).is_err());
+        assert!(connection.publish("test/value".into(), Vec::new(), Qos::AtMostOnce, false).is_err());
     }
 
     #[test]
@@ -1052,7 +1073,7 @@ mod tests {
         })
         .unwrap();
         next_matching_event(&runtime, &mut connection, |event| matches!(event, BrokerEvent::Connected));
-        for qos in 0..=2 {
+        for qos in [Qos::AtMostOnce, Qos::AtLeastOnce, Qos::ExactlyOnce] {
             for retain in [false, true] {
                 connection.publish("test/é".into(), vec![0, 0xff, b'\n'], qos, retain).unwrap();
                 assert!(matches!(next_event(&runtime, &mut connection), BrokerEvent::PublishQueued));
@@ -1096,7 +1117,7 @@ mod tests {
         disconnect.send(()).unwrap();
         next_matching_event(&runtime, &mut connection, |event| matches!(event, BrokerEvent::Status(_)));
         let stale = || {
-            Command::Publish(PublishCommand {
+            Command::Publish(PublishCommandData {
                 topic: "test/value".into(),
                 payload: vec![42],
                 qos: QoS::AtLeastOnce,
@@ -1151,7 +1172,7 @@ mod tests {
         assert!(
             connection
                 .commands
-                .try_send(Command::Publish(PublishCommand {
+                .try_send(Command::Publish(PublishCommandData {
                     topic: "#".into(),
                     payload: Vec::new(),
                     qos: QoS::AtMostOnce,
@@ -1165,7 +1186,9 @@ mod tests {
             _ => panic!("publishing failure must not report a deletion or status error"),
         }
         assert_eq!(connection.session.load(Ordering::Acquire), session);
-        connection.publish("test/value".into(), vec![0, 0xff], 0, false).unwrap();
+        connection
+            .publish("test/value".into(), vec![0, 0xff], Qos::AtMostOnce, false)
+            .unwrap();
         assert!(matches!(next_event(&runtime, &mut connection), BrokerEvent::PublishQueued));
         received.recv_timeout(Duration::from_secs(5)).unwrap();
         drop(connection);
@@ -1174,18 +1197,18 @@ mod tests {
 
     #[test]
     fn disconnect_discards_unacknowledged_publishes_and_qos_two_releases_without_deletion_errors() {
-        for qos in [1, 2] {
+        for (qos, qos_level) in [(Qos::AtLeastOnce, 1), (Qos::ExactlyOnce, 2)] {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let port = listener.local_addr().unwrap().port();
             let (disconnect, disconnected) = std::sync::mpsc::channel();
             let broker = std::thread::spawn(move || {
                 let mut stream = handshake(&listener, 0);
                 let (header, body) = read_packet(&mut stream);
-                assert_eq!(header, 0x31 | (qos << 1));
+                assert_eq!(header, 0x31 | (qos_level << 1));
                 // An empty retained publish is still a user publish, not a deletion command.
                 assert_eq!(&body[2..12], b"test/value");
                 assert_eq!(body.len(), 14);
-                if qos == 2 {
+                if qos_level == 2 {
                     stream.write_all(&[0x50, 2, body[12], body[13]]).unwrap();
                     assert_eq!(read_packet(&mut stream), (0x62, body[12..14].to_vec()));
                 }
@@ -1238,7 +1261,7 @@ mod tests {
         assert!(connection.clear_retained_in_session(vec!["#".into()], &token).is_err());
         assert!(matches!(commands.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
         connection.clear_retained_in_session(vec!["test/value".into()], &token).unwrap();
-        let Command::ClearRetained(command) = commands.try_recv().unwrap() else {
+        let Command::DeleteTopics(command) = commands.try_recv().unwrap() else {
             panic!("expected a retained deletion command");
         };
         assert_eq!(command.topics, vec!["test/value"]);
@@ -1298,7 +1321,7 @@ mod tests {
         let (connection, mut commands, _) = command_connection();
         let topics = vec!["/".into(), "$SYS/value".into(), "a//é".into(), "a".repeat(65535)];
         connection.clear_retained(topics.clone()).unwrap();
-        let Command::ClearRetained(command) = commands.try_recv().unwrap() else {
+        let Command::DeleteTopics(command) = commands.try_recv().unwrap() else {
             panic!("expected a retained deletion command");
         };
         assert_eq!(command.topics, topics);
@@ -1394,7 +1417,7 @@ mod tests {
         assert!(
             connection
                 .commands
-                .try_send(Command::ClearRetained(ClearRetained {
+                .try_send(Command::DeleteTopics(DeleteTopicsData {
                     topics: vec!["test/value".into()],
                     session: old_session,
                 }))
@@ -1471,7 +1494,7 @@ mod tests {
         assert!(
             connection
                 .commands
-                .try_send(Command::ClearRetained(ClearRetained {
+                .try_send(Command::DeleteTopics(DeleteTopicsData {
                     topics: vec!["#".into()],
                     session,
                 }))

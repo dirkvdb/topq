@@ -3,7 +3,7 @@
 use std::ops::Range;
 
 use super::{Explorer, GrowPublish, PublishMessage, ShrinkPublish};
-use crate::config;
+use crate::{config, mqtt::Qos};
 use gpui_kit::base::{
     ElementExt,
     input::{Diagnostic, DiagnosticSeverity},
@@ -149,9 +149,9 @@ impl Explorer {
                 .ok_or_else(|| anyhow::anyhow!("Connect to a broker before publishing."))
                 .and_then(|connection| {
                     let qos = match self.publish_qos.read(cx).selected_value() {
-                        Some(&"1") => 1,
-                        Some(&"2") => 2,
-                        _ => 0,
+                        Some(&"1") => Qos::AtLeastOnce,
+                        Some(&"2") => Qos::ExactlyOnce,
+                        _ => Qos::AtMostOnce,
                     };
                     connection.publish(
                         self.publish_topic.read(cx).value().to_string(),
