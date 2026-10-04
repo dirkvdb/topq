@@ -1,6 +1,8 @@
-# MQTT UI
+# TopQ
 
 An MQTT 3.1.1 topic explorer built with Rust and [GPUI Kit](https://gpui-kit.com).
+
+![Screenshot](./data/screenshot-1.png)
 
 ## Features
 
