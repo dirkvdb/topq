@@ -14,6 +14,8 @@ Each connection has one or more **Topics** subscriptions, each with its own QoS 
 
 Connections and preferences are stored in the platform's `mqtt-ui` configuration directory (`connections.json`, `appearance.json`, and `layout.json`). Existing `connection.json` files are not migrated. Within `connections.json`, legacy `base_topic` settings are automatically loaded as a single subscription at QoS 2, preserving their previous behavior. Connections without either `topics` or `base_topic` default to `#` at QoS 0. Subsequent saves write only the new `topics` array, for example `"topics": [{"topic": "home/#", "qos": 0}, {"topic": "$SYS/#", "qos": 1}]`.
 
+Appearance settings provide **Mode** (`System`, `Light`, or `Dark`) and independent **Light theme** and **Dark theme** choices. System mode follows OS appearance changes using the selected theme for each mode. Changes are applied and saved immediately; choosing an inactive theme leaves the current appearance unchanged. Defaults are Dark mode, Ayu Light, and Charcoal Grove. Legacy `appearance.json` theme choices are preserved when loaded; subsequent saves use `mode`, `light_theme`, and `dark_theme`.
+
 Passwords are stored in the system credential store, never in the JSON files. Saving or restoring a password requires an available, unlocked credential store; there is no plaintext fallback.
 
 ## Development

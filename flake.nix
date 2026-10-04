@@ -47,7 +47,7 @@
           postInstall = pkgs.lib.optionalString pkgs.stdenv.isLinux ''
             install -Dm644 topq.desktop $out/share/applications/topq.desktop
             install -d $out/share/icons/hicolor/512x512/apps
-            magick data/icon.png -resize 512x512 $out/share/icons/hicolor/512x512/apps/topq.png
+            magick data/logo.png -resize 512x512 $out/share/icons/hicolor/512x512/apps/topq.png
           '';
 
           postFixup = pkgs.lib.optionalString pkgs.stdenv.isLinux ''

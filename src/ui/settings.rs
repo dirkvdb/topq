@@ -2,15 +2,16 @@
 
 use super::{ConnectionStatus, Explorer, connection_label};
 use crate::{
-    appearance::{self, Appearance},
+    appearance::{self, Appearance, AppearanceMode},
     config::{self, ConnectionConfig, ConnectionField, SavedConnections, TopicSubscription},
 };
 use gpui_kit::assets::IconName as AssetIconName;
 use gpui_kit::component::{
-    ActiveTheme, Disableable, Icon, IconName, Sizable, StyledExt, ThemeRegistry,
+    ActiveTheme, AxisExt, Disableable, Icon, IconName, Sizable, StyledExt, ThemeMode, ThemeRegistry,
     button::{Button, ButtonVariants},
     collapsible::Collapsible,
     input::{Input, InputGroup, InputState},
+    label::Label,
     menu::{DropdownMenu, PopupMenuItem},
     select::Select,
     setting::{SettingGroup, SettingItem, SettingPage, Settings},
@@ -18,9 +19,9 @@ use gpui_kit::component::{
     tooltip::Tooltip,
 };
 use gpui_kit::{
-    App, AvailableSpace, Bounds, Context, Element, ElementId, Entity, GlobalElementId, InspectorElementId, IntoElement, LayoutId,
-    MouseButton, Pixels, PromptButton, PromptLevel, Role, SharedString, Style, TestSupportExt, WeakEntity, Window, div, prelude::*, px,
-    relative, rems, size,
+    AnyElement, App, AvailableSpace, Bounds, Context, Element, ElementId, Entity, GlobalElementId, InspectorElementId, IntoElement,
+    LayoutId, MouseButton, Pixels, PromptButton, PromptLevel, Role, SharedString, Style, TestSupportExt, WeakEntity, Window, div,
+    prelude::*, px, relative, rems, size,
 };
 
 // The native header's title row shrink-wraps its suffix. A large preferred width with a zero
@@ -1039,60 +1040,154 @@ impl Explorer {
 
     fn appearance_page(&self, cx: &mut Context<Self>) -> SettingPage {
         let view = cx.weak_entity();
-        let label = Appearance::selected(cx).unwrap_or("Follow system (Ayu)").to_owned();
-        SettingPage::new("Appearance").resettable(false).group(
-            SettingGroup::new().item(
-                SettingItem::render(move |_, _, _| {
-                    div()
-                        .h_flex()
-                        .gap_3()
-                        .child(div().font_semibold().child("Color theme"))
-                        .child(Self::theme_menu(view.clone(), label.clone()))
+        let mut group = SettingGroup::new().item(
+            SettingItem::render(move |options, _, cx| {
+                Self::appearance_setting(
+                    "appearance-mode",
+                    "Mode",
+                    "Follow your system or choose Light or Dark.",
+                    Self::appearance_mode_menu(view.clone(), cx),
+                    options.layout().is_vertical(),
+                    cx,
+                )
+            })
+            .keywords(["mode", "system", "appearance"]),
+        );
+        for (mode, title, description) in [
+            (ThemeMode::Light, "Light theme", "Used when the appearance is light."),
+            (ThemeMode::Dark, "Dark theme", "Used when the appearance is dark."),
+        ] {
+            let view = cx.weak_entity();
+            group = group.item(
+                SettingItem::render(move |options, _, cx| {
+                    Self::appearance_setting(
+                        if mode.is_dark() { "dark-theme" } else { "light-theme" },
+                        title,
+                        description,
+                        Self::theme_menu(view.clone(), mode, cx),
+                        options.layout().is_vertical(),
+                        cx,
+                    )
                 })
-                .keywords(["theme", "appearance", "color"]),
-            ),
-        )
+                .keywords([title, "theme", "appearance", "color"]),
+            );
+        }
+        if let Some(error) = self.error.clone() {
+            group = group.footer(move |_, cx| {
+                div()
+                    .id("appearance-error")
+                    .test_support()
+                    .role(Role::Alert)
+                    .text_sm()
+                    .text_color(cx.theme().danger)
+                    .child(error.clone())
+            });
+        }
+        SettingPage::new("Appearance").resettable(false).group(group)
     }
 
-    fn theme_menu(view: WeakEntity<Self>, label: String) -> impl IntoElement {
-        Button::new("theme")
-            .small()
+    fn appearance_setting(
+        id: &'static str,
+        title: &'static str,
+        description: &'static str,
+        control: impl IntoElement,
+        stacked: bool,
+        cx: &App,
+    ) -> AnyElement {
+        let text = div()
+            .v_flex()
+            .min_w_0()
+            .gap_1()
+            .when(!stacked, |this| this.flex_1())
+            .child(
+                div()
+                    .id(SharedString::from(format!("{id}-label")))
+                    .test_support()
+                    .h_flex()
+                    .when(!stacked, |this| this.min_h_8())
+                    .child(Label::new(title).text_sm().font_semibold()),
+            )
+            .child(
+                div()
+                    .id(SharedString::from(format!("{id}-description")))
+                    .test_support()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(description),
+            );
+        div()
+            .w_full()
+            .map(|this| {
+                if stacked {
+                    this.v_flex().gap_2()
+                } else {
+                    this.h_flex().items_start().gap_6()
+                }
+            })
+            .child(text)
+            .child(div().w_56().max_w_full().flex_none().child(control))
+            .into_any_element()
+    }
+
+    fn appearance_mode_menu(view: WeakEntity<Self>, cx: &App) -> impl IntoElement + use<> {
+        let label = Appearance::mode(cx).label();
+        Button::new("appearance-mode")
+            .w_full()
             .outline()
             .label(label)
-            .icon(IconName::ChevronDown)
-            .dropdown_menu(move |menu, window, cx| {
-                let system_view = view.clone();
-                let mut menu = menu
-                    .min_w(rems(14.).to_pixels(window.rem_size()))
-                    .max_h(rems(24.).to_pixels(window.rem_size()))
-                    .scrollable(true)
-                    .item(
-                        PopupMenuItem::new("Follow system (Ayu)")
-                            .checked(Appearance::selected(cx).is_none())
-                            .on_click(move |_, window, cx| {
-                                _ = system_view.update(cx, |view, cx| view.select_theme(None, window, cx));
-                            }),
-                    );
-                for dark in [false, true] {
-                    menu = menu.separator().label(if dark { "Dark themes" } else { "Light themes" });
-                    for theme in ThemeRegistry::global(cx).sorted_themes() {
-                        if theme.mode.is_dark() != dark {
-                            continue;
-                        }
-                        let name = theme.name.clone();
-                        let selected = Appearance::selected(cx) == Some(name.as_str());
-                        let view = view.clone();
-                        menu = menu.item(PopupMenuItem::new(name.clone()).checked(selected).on_click(move |_, window, cx| {
-                            _ = view.update(cx, |view, cx| view.select_theme(Some(name.clone()), window, cx));
-                        }));
-                    }
+            .accessibility_label(format!("Mode: {label}"))
+            .dropdown_caret(true)
+            .dropdown_menu(move |mut menu, _, cx| {
+                for mode in [AppearanceMode::System, AppearanceMode::Light, AppearanceMode::Dark] {
+                    let view = view.clone();
+                    menu = menu.item(PopupMenuItem::new(mode.label()).checked(Appearance::mode(cx) == mode).on_click(
+                        move |_, window, cx| {
+                            _ = view.update(cx, |view, cx| view.select_appearance_mode(mode, window, cx));
+                        },
+                    ));
                 }
                 menu
             })
     }
 
-    fn select_theme(&mut self, name: Option<SharedString>, window: &mut Window, cx: &mut Context<Self>) {
-        if let Err(error) = appearance::select(name, window, cx) {
+    fn theme_menu(view: WeakEntity<Self>, mode: ThemeMode, cx: &App) -> impl IntoElement + use<> {
+        let label = Appearance::selected_theme(mode, cx).to_owned();
+        Button::new(if mode.is_dark() { "dark-theme" } else { "light-theme" })
+            .w_full()
+            .outline()
+            .accessibility_label(format!("{} theme: {label}", if mode.is_dark() { "Dark" } else { "Light" }))
+            .tooltip(label.clone())
+            .label(label)
+            .dropdown_caret(true)
+            .dropdown_menu(move |menu, window, cx| {
+                let mut menu = menu
+                    .min_w(rems(14.).to_pixels(window.rem_size()))
+                    .max_h(rems(24.).to_pixels(window.rem_size()))
+                    .scrollable(true);
+                for theme in ThemeRegistry::global(cx).sorted_themes() {
+                    if theme.mode != mode {
+                        continue;
+                    }
+                    let name = theme.name.clone();
+                    let selected = Appearance::selected_theme(mode, cx) == name.as_str();
+                    let view = view.clone();
+                    menu = menu.item(PopupMenuItem::new(name.clone()).checked(selected).on_click(move |_, window, cx| {
+                        _ = view.update(cx, |view, cx| view.select_theme(mode, name.clone(), window, cx));
+                    }));
+                }
+                menu
+            })
+    }
+
+    fn select_appearance_mode(&mut self, mode: AppearanceMode, window: &mut Window, cx: &mut Context<Self>) {
+        if let Err(error) = appearance::select_mode(mode, window, cx) {
+            self.error = Some(format!("{error:#}"));
+        }
+        cx.notify();
+    }
+
+    fn select_theme(&mut self, mode: ThemeMode, name: SharedString, window: &mut Window, cx: &mut Context<Self>) {
+        if let Err(error) = appearance::select_theme(mode, name, window, cx) {
             self.error = Some(format!("{error:#}"));
         }
         cx.notify();
