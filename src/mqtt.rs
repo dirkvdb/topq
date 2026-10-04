@@ -1,6 +1,9 @@
 //! MQTT I/O on a dedicated runtime, with bounded delivery and drop-based cancellation.
 
 use std::{
+    cell::RefCell,
+    collections::{HashSet, VecDeque},
+    rc::Rc,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -20,8 +23,12 @@ pub enum BrokerEvent {
     Connecting,
     Connected,
     Status(String),
-    /// An operation failed; this does not change the connection status.
+    /// A retained deletion failed; this does not change the connection status.
     OperationError(String),
+    /// The worker queued a publish to rumqttc, not a broker acknowledgement.
+    PublishQueued,
+    /// A publish failed or was cancelled; this does not change the connection status.
+    PublishError(String),
     Message(Message),
 }
 
@@ -29,7 +36,7 @@ pub enum BrokerEvent {
 pub struct Connection {
     pub events: mpsc::Receiver<BrokerEvent>,
     stop: Option<oneshot::Sender<()>>,
-    commands: mpsc::Sender<ClearRetained>,
+    commands: mpsc::Sender<Command>,
     session: Arc<AtomicU64>,
 }
 
@@ -48,7 +55,90 @@ struct ClearRetained {
     session: u64,
 }
 
+struct PublishCommand {
+    topic: String,
+    payload: Vec<u8>,
+    qos: QoS,
+    retain: bool,
+    session: u64,
+}
+
+enum Command {
+    ClearRetained(ClearRetained),
+    Publish(PublishCommand),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OperationKind {
+    ClearRetained,
+    Publish,
+}
+
+impl OperationKind {
+    fn error(self, message: String) -> BrokerEvent {
+        match self {
+            Self::ClearRetained => BrokerEvent::OperationError(message),
+            Self::Publish => BrokerEvent::PublishError(message),
+        }
+    }
+}
+
+impl Command {
+    fn session(&self) -> u64 {
+        match self {
+            Self::ClearRetained(command) => command.session,
+            Self::Publish(command) => command.session,
+        }
+    }
+
+    fn kind(&self) -> OperationKind {
+        match self {
+            Self::ClearRetained(_) => OperationKind::ClearRetained,
+            Self::Publish(_) => OperationKind::Publish,
+        }
+    }
+}
+
 impl Connection {
+    /// Queues a publish for the current connected session without waiting.
+    ///
+    /// Topic names must be nonempty, exact MQTT names (no wildcards or NUL),
+    /// at most 65535 UTF-8 bytes; QoS must be 0, 1, or 2. Invalid input,
+    /// disconnection, and full/closed command queues return an immediate error.
+    /// `Ok(())` means the command was accepted. The worker subsequently emits
+    /// `BrokerEvent::PublishQueued` when rumqttc accepts it, or
+    /// `BrokerEvent::PublishError` on failure or cancellation. Neither event
+    /// acknowledges broker delivery. Publishes are never replayed after reconnect.
+    pub fn publish(&self, topic: String, payload: Vec<u8>, qos: u8, retain: bool) -> Result<()> {
+        ensure!(!topic.is_empty(), "MQTT topic names must not be empty.");
+        ensure!(
+            !topic.contains(['#', '+']),
+            "Publishing requires an exact topic name, not MQTT wildcards."
+        );
+        ensure!(
+            topic.len() <= u16::MAX as usize,
+            "MQTT topic names must not exceed 65535 UTF-8 bytes."
+        );
+        ensure!(!topic.contains('\0'), "MQTT topic names must not contain a null character.");
+        let qos = match qos {
+            0 => QoS::AtMostOnce,
+            1 => QoS::AtLeastOnce,
+            2 => QoS::ExactlyOnce,
+            _ => anyhow::bail!("MQTT publish QoS must be 0, 1, or 2."),
+        };
+        let session = self.session.load(Ordering::Acquire);
+        ensure!(session % 2 == 1, "Cannot publish while disconnected.");
+        self.commands
+            .try_send(Command::Publish(PublishCommand {
+                topic,
+                payload,
+                qos,
+                retain,
+                session,
+            }))
+            .context("Could not queue publish (queue full or worker stopped).")
+    }
+
     /// Captures the current connected session for a retained-deletion confirmation prompt.
     /// Returns `None` while disconnected or after the command receiver has closed.
     pub fn retained_clear_session(&self) -> Option<RetainedClearSession> {
@@ -110,7 +200,7 @@ impl Connection {
         // Preserve the captured generation in the command so the worker also
         // rejects a disconnect/reconnect racing with validation or queueing.
         self.commands
-            .try_send(ClearRetained { topics, session })
+            .try_send(Command::ClearRetained(ClearRetained { topics, session }))
             .context("Could not queue retained-topic deletion (queue full or worker stopped).")
     }
 }
@@ -199,26 +289,47 @@ fn mqtt_options(config: &ConnectionConfig) -> Result<MqttOptions> {
     Ok(options)
 }
 
-async fn publish_clear_retained(client: AsyncClient, topics: Vec<String>) -> Result<()> {
+async fn publish_clear_retained(client: AsyncClient, topics: Vec<String>, queued: Rc<RefCell<VecDeque<OperationKind>>>) -> Result<()> {
     for topic in topics {
-        client
-            .publish(topic, QoS::AtMostOnce, true, Vec::new())
-            .await
-            .context("Could not queue a retained-topic deletion publish.")?;
+        // Register before awaiting: a full flume queue can hand the request to
+        // poll before the sending future is resumed.
+        queued.borrow_mut().push_back(OperationKind::ClearRetained);
+        if let Err(error) = client.publish(topic, QoS::AtMostOnce, true, Vec::new()).await {
+            queued.borrow_mut().pop_back();
+            return Err(error).context("Could not queue a retained-topic deletion publish.");
+        }
     }
     Ok(())
+}
+
+async fn queue_command(client: AsyncClient, command: Command, queued: Rc<RefCell<VecDeque<OperationKind>>>) -> Result<()> {
+    match command {
+        Command::ClearRetained(command) => publish_clear_retained(client, command.topics, queued).await,
+        Command::Publish(command) => {
+            queued.borrow_mut().push_back(OperationKind::Publish);
+            if let Err(error) = client.publish(command.topic, command.qos, command.retain, command.payload).await {
+                queued.borrow_mut().pop_back();
+                return Err(error).context("Could not queue publish to rumqttc.");
+            }
+            Ok(())
+        }
+    }
 }
 
 async fn run(
     config: ConnectionConfig,
     sender: &mpsc::Sender<BrokerEvent>,
-    mut commands: mpsc::Receiver<ClearRetained>,
+    mut commands: mpsc::Receiver<Command>,
     session: &AtomicU64,
 ) -> Result<()> {
     let options = mqtt_options(&config)?;
-    let (client, mut event_loop) = AsyncClient::new(options, 16);
+    let (mut client, mut event_loop) = AsyncClient::new(options.clone(), 16);
     event_loop.network_options.set_connection_timeout(10);
     let mut operation = None;
+    // Only the worker and its active future share this FIFO. Keeping origins
+    // separately avoids mistaking an empty retained user publish for a deletion.
+    let queued = Rc::new(RefCell::new(VecDeque::new()));
+    let mut inflight_publishes = HashSet::new();
     let mut pending_subscription = None;
     loop {
         // Publishing must yield to poll when rumqttc's bounded request queue fills.
@@ -233,27 +344,34 @@ async fn run(
                     result = &mut poll => break result,
                     Some(command) = commands.recv(), if operation.is_none() => {
                         let current = session.load(Ordering::Acquire);
-                        if current.is_multiple_of(2) || command.session != current {
-                            if sender.send(BrokerEvent::OperationError(
-                                "Retained-topic deletion cancelled because the connection changed. Confirm again while connected.".into(),
-                            )).await.is_err() {
+                        let kind = command.kind();
+                        if current.is_multiple_of(2) || command.session() != current {
+                            let message = match kind {
+                                OperationKind::ClearRetained => "Retained-topic deletion cancelled because the connection changed. Confirm again while connected.",
+                                OperationKind::Publish => "Publish cancelled because the connection changed. Publish again while connected.",
+                            };
+                            if sender.send(kind.error(message.into())).await.is_err() {
                                 return Ok(());
                             }
                         } else {
-                            operation = Some(Box::pin(publish_clear_retained(client.clone(), command.topics)));
+                            operation = Some((kind, Box::pin(queue_command(client.clone(), command, Rc::clone(&queued)))));
                         }
                     }
                     result = async {
                         match operation.as_mut() {
-                            Some(operation) => operation.await,
+                            Some((_, operation)) => operation.await,
                             None => std::future::pending().await,
                         }
                     } => {
-                        operation = None;
-                        if let Err(error) = result
-                            && sender.send(BrokerEvent::OperationError(format!("{error:#}"))).await.is_err()
-                        {
-                            return Ok(());
+                        if let Some((kind, _)) = operation.take() {
+                            let event = match result {
+                                Err(error) => kind.error(format!("{error:#}")),
+                                Ok(()) if kind == OperationKind::Publish => BrokerEvent::PublishQueued,
+                                Ok(()) => continue,
+                            };
+                            if sender.send(event).await.is_err() {
+                                return Ok(());
+                            }
                         }
                     }
                 }
@@ -295,6 +413,20 @@ async fn run(
                     BrokerEvent::Connected
                 }
             }
+            Ok(Event::Outgoing(Outgoing::Publish(pkid))) => {
+                if queued.borrow_mut().pop_front() == Some(OperationKind::Publish) && pkid != 0 {
+                    inflight_publishes.insert(pkid);
+                }
+                continue;
+            }
+            Ok(Event::Incoming(Packet::PubAck(ack))) => {
+                inflight_publishes.remove(&ack.pkid);
+                continue;
+            }
+            Ok(Event::Incoming(Packet::PubComp(ack))) => {
+                inflight_publishes.remove(&ack.pkid);
+                continue;
+            }
             Ok(Event::Incoming(Packet::Publish(publish))) => BrokerEvent::Message(Message {
                 topic: publish.topic,
                 payload: publish.payload,
@@ -308,21 +440,36 @@ async fn run(
                 if session.load(Ordering::Acquire) % 2 == 1 {
                     session.fetch_add(1, Ordering::AcqRel);
                 }
-                let interrupted = operation.take().is_some();
-                // rumqttc normally saves queued requests for reconnect. Deletions
-                // are destructive, so also purge requests already handed to it.
-                event_loop.clean();
-                let pending_deletions = event_loop
-                    .pending
-                    .iter()
-                    .any(|request| matches!(request, rumqttc::Request::Publish(_)));
-                event_loop
-                    .pending
-                    .retain(|request| !matches!(request, rumqttc::Request::Publish(_)));
-                if (interrupted || pending_deletions)
+                let interrupted = operation.take().map(|(kind, _)| kind);
+                let (pending_deletions, pending_publishes) = {
+                    let mut queued = queued.borrow_mut();
+                    let deletions = queued.contains(&OperationKind::ClearRetained);
+                    let publishes = queued.contains(&OperationKind::Publish);
+                    queued.clear();
+                    (deletions, publishes)
+                };
+                // A fresh client discards rumqttc's requests, unacknowledged QoS
+                // publishes, QoS 2 releases, collisions, and buffered events.
+                // No user operation may carry over into a new broker session.
+                (client, event_loop) = AsyncClient::new(options.clone(), 16);
+                event_loop.network_options.set_connection_timeout(10);
+                let interrupted_publish =
+                    interrupted == Some(OperationKind::Publish) || pending_publishes || !inflight_publishes.is_empty();
+                inflight_publishes.clear();
+                if (interrupted == Some(OperationKind::ClearRetained) || pending_deletions)
                     && sender.send(BrokerEvent::OperationError(
                         "Retained-topic deletion interrupted by disconnect; some topics may already have been cleared. It will not be retried.".into(),
                     )).await.is_err()
+                {
+                    return Ok(());
+                }
+                if interrupted_publish
+                    && sender
+                        .send(BrokerEvent::PublishError(
+                            "Publish interrupted by disconnect; it may already have reached the broker. It will not be retried.".into(),
+                        ))
+                        .await
+                        .is_err()
                 {
                     return Ok(());
                 }
@@ -635,10 +782,10 @@ mod tests {
                     assert_eq!(message.qos, 0);
                     assert!(message.retained);
                 }
-                BrokerEvent::Status(status) | BrokerEvent::OperationError(status) => {
+                BrokerEvent::Status(status) | BrokerEvent::OperationError(status) | BrokerEvent::PublishError(status) => {
                     panic!("expected retained message, got: {status}")
                 }
-                BrokerEvent::Connected | BrokerEvent::Connecting => {
+                BrokerEvent::Connected | BrokerEvent::Connecting | BrokerEvent::PublishQueued => {
                     panic!("expected retained message, got duplicate connect")
                 }
             }
@@ -721,7 +868,11 @@ mod tests {
         let event = next_matching_event(&runtime, &mut connection, |event| match event {
             BrokerEvent::Status(status) => status.contains("refused"),
             BrokerEvent::Connected => true,
-            BrokerEvent::Message(_) | BrokerEvent::Connecting | BrokerEvent::OperationError(_) => false,
+            BrokerEvent::Message(_)
+            | BrokerEvent::Connecting
+            | BrokerEvent::OperationError(_)
+            | BrokerEvent::PublishQueued
+            | BrokerEvent::PublishError(_) => false,
         });
         assert!(matches!(event, BrokerEvent::Status(_)), "a refused subscription is not connected");
         assert!(connection.retained_clear_session().is_none());
@@ -760,7 +911,11 @@ mod tests {
             let event = next_matching_event(&runtime, &mut connection, |event| match event {
                 BrokerEvent::Status(status) => status.contains("acknowledge all"),
                 BrokerEvent::Connected => true,
-                BrokerEvent::Message(_) | BrokerEvent::Connecting | BrokerEvent::OperationError(_) => false,
+                BrokerEvent::Message(_)
+                | BrokerEvent::Connecting
+                | BrokerEvent::OperationError(_)
+                | BrokerEvent::PublishQueued
+                | BrokerEvent::PublishError(_) => false,
             });
             assert!(matches!(event, BrokerEvent::Status(_)), "an incomplete SUBACK is not connected");
             assert!(connection.retained_clear_session().is_none());
@@ -769,7 +924,7 @@ mod tests {
         }
     }
 
-    fn command_connection() -> (Connection, mpsc::Receiver<ClearRetained>, oneshot::Receiver<()>) {
+    fn command_connection() -> (Connection, mpsc::Receiver<Command>, oneshot::Receiver<()>) {
         let (_, events) = mpsc::channel(1);
         let (commands, receiver) = mpsc::channel(COMMAND_CAPACITY);
         let (stop, stopped) = oneshot::channel();
@@ -783,6 +938,283 @@ mod tests {
             receiver,
             stopped,
         )
+    }
+
+    #[test]
+    fn publish_validates_exact_topics_and_qos_before_queueing() {
+        let (connection, mut commands, _) = command_connection();
+        for invalid in ["", "#", "a/+", "a#b", "a+b", "a\0b"] {
+            assert!(connection.publish(invalid.into(), Vec::new(), 0, false).is_err());
+        }
+        for invalid in ["a".repeat(65536), "é".repeat(32768)] {
+            assert!(connection.publish(invalid, Vec::new(), 0, false).is_err());
+        }
+        for qos in [3, u8::MAX] {
+            assert!(connection.publish("test/value".into(), Vec::new(), qos, false).is_err());
+        }
+        assert!(matches!(commands.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn publish_preserves_exact_topics_payload_options_and_session() {
+        let (connection, mut commands, _) = command_connection();
+        let topics = ["/".into(), "$SYS/value".into(), " a//é ".into(), format!("{}a", "é".repeat(32767))];
+        for topic in topics {
+            for qos in 0..=2 {
+                for retain in [false, true] {
+                    let payload = vec![0, 0xff, b'\n'];
+                    connection.publish(topic.clone(), payload.clone(), qos, retain).unwrap();
+                    let Command::Publish(command) = commands.try_recv().unwrap() else {
+                        panic!("expected a publish command");
+                    };
+                    assert_eq!(command.topic, topic);
+                    assert_eq!(command.payload, payload);
+                    assert_eq!(command.qos as u8, qos);
+                    assert_eq!(command.retain, retain);
+                    assert_eq!(command.session, 1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn publish_rejects_disconnected_sessions_without_queueing() {
+        let (connection, mut commands, _) = command_connection();
+        for session in [0, 2, 4] {
+            connection.session.store(session, Ordering::Release);
+            let error = connection.publish("test/value".into(), Vec::new(), 0, false).unwrap_err();
+            assert!(error.to_string().contains("disconnected"));
+        }
+        assert!(matches!(commands.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn publish_returns_immediately_when_the_shared_queue_is_full_or_closed() {
+        let (connection, mut commands, _) = command_connection();
+        for _ in 0..COMMAND_CAPACITY {
+            connection.clear_retained(vec!["test/value".into()]).unwrap();
+        }
+        assert!(connection.publish("test/value".into(), Vec::new(), 0, false).is_err());
+        for _ in 0..COMMAND_CAPACITY {
+            commands.try_recv().unwrap();
+        }
+        for _ in 0..COMMAND_CAPACITY {
+            connection.publish("test/value".into(), Vec::new(), 0, false).unwrap();
+        }
+        assert!(connection.clear_retained(vec!["test/value".into()]).is_err());
+        drop(commands);
+        assert!(connection.publish("test/value".into(), Vec::new(), 0, false).is_err());
+    }
+
+    #[test]
+    fn publish_sends_binary_payload_qos_and_retain_and_reports_queueing_before_broker_ack() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (acknowledge, acknowledged) = std::sync::mpsc::channel();
+        let (finished, received) = std::sync::mpsc::channel();
+        let broker = std::thread::spawn(move || {
+            let mut stream = handshake(&listener, 0);
+            for qos in 0..=2 {
+                for retain in [false, true] {
+                    let (header, body) = read_packet(&mut stream);
+                    assert_eq!(header, 0x30 | (qos << 1) | u8::from(retain));
+                    let topic_len = usize::from(u16::from_be_bytes([body[0], body[1]]));
+                    assert_eq!(&body[2..2 + topic_len], "test/é".as_bytes());
+                    let offset = 2 + topic_len;
+                    let payload_offset = offset + if qos == 0 { 0 } else { 2 };
+                    assert_eq!(&body[payload_offset..], &[0, 0xff, b'\n']);
+                    // The UI must be able to finish its pending state before any ack.
+                    acknowledged.recv_timeout(Duration::from_secs(5)).unwrap();
+                    if qos != 0 {
+                        let pkid = &body[offset..offset + 2];
+                        stream
+                            .write_all(&[if qos == 1 { 0x40 } else { 0x50 }, 2, pkid[0], pkid[1]])
+                            .unwrap();
+                        if qos == 2 {
+                            assert_eq!(read_packet(&mut stream), (0x62, pkid.to_vec()));
+                            stream.write_all(&[0x70, 2, pkid[0], pkid[1]]).unwrap();
+                        }
+                    }
+                    finished.send(()).unwrap();
+                }
+            }
+            // TCP orders this marker after the final PUBCOMP. Receiving it
+            // proves the worker drained the ack before drop, avoiding a reset
+            // caused by closing a socket with unread incoming data.
+            stream.write_all(b"\x30\x16\x00\x10test/ack-barrierdone").unwrap();
+            assert_eq!(stream.read(&mut [0]).unwrap(), 0);
+        });
+        let runtime = runtime();
+        let mut connection = connect(ConnectionConfig {
+            host: "127.0.0.1".into(),
+            port,
+            ..Default::default()
+        })
+        .unwrap();
+        next_matching_event(&runtime, &mut connection, |event| matches!(event, BrokerEvent::Connected));
+        for qos in 0..=2 {
+            for retain in [false, true] {
+                connection.publish("test/é".into(), vec![0, 0xff, b'\n'], qos, retain).unwrap();
+                assert!(matches!(next_event(&runtime, &mut connection), BrokerEvent::PublishQueued));
+                acknowledge.send(()).unwrap();
+                received.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+        }
+        match next_event(&runtime, &mut connection) {
+            BrokerEvent::Message(message) => {
+                assert_eq!(message.topic, "test/ack-barrier");
+                assert_eq!(message.payload.as_ref(), b"done");
+            }
+            _ => panic!("expected the shutdown barrier, not a publish acknowledgement or error"),
+        }
+        assert!(matches!(connection.events.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+        drop(connection);
+        broker.join().unwrap();
+    }
+
+    #[test]
+    fn stale_publishes_report_publish_errors_and_are_not_sent_in_a_new_session() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (disconnect, disconnected) = std::sync::mpsc::channel();
+        let broker = std::thread::spawn(move || {
+            let stream = handshake(&listener, 0);
+            disconnected.recv_timeout(Duration::from_secs(5)).unwrap();
+            drop(stream);
+            let mut stream = handshake(&listener, 0);
+            assert_eq!(stream.read(&mut [0]).unwrap(), 0, "stale publishes must never reach the wire");
+        });
+        let runtime = runtime();
+        let mut connection = connect(ConnectionConfig {
+            host: "127.0.0.1".into(),
+            port,
+            ..Default::default()
+        })
+        .unwrap();
+        next_matching_event(&runtime, &mut connection, |event| matches!(event, BrokerEvent::Connected));
+        let session = connection.session.load(Ordering::Acquire);
+        disconnect.send(()).unwrap();
+        next_matching_event(&runtime, &mut connection, |event| matches!(event, BrokerEvent::Status(_)));
+        let stale = || {
+            Command::Publish(PublishCommand {
+                topic: "test/value".into(),
+                payload: vec![42],
+                qos: QoS::AtLeastOnce,
+                retain: true,
+                session,
+            })
+        };
+        assert!(connection.commands.try_send(stale()).is_ok());
+        let mut connected = false;
+        let mut cancelled = false;
+        while !connected || !cancelled {
+            match next_event(&runtime, &mut connection) {
+                BrokerEvent::Connected => connected = true,
+                BrokerEvent::PublishError(error) => {
+                    assert!(error.contains("connection changed"));
+                    cancelled = true;
+                }
+                BrokerEvent::Connecting => {}
+                _ => panic!("stale publishing must report only a publish error"),
+            }
+        }
+        assert!(connection.commands.try_send(stale()).is_ok());
+        match next_event(&runtime, &mut connection) {
+            BrokerEvent::PublishError(error) => assert!(error.contains("connection changed")),
+            _ => panic!("an old generation must be rejected even while connected"),
+        }
+        drop(connection);
+        broker.join().unwrap();
+    }
+
+    #[test]
+    fn publish_worker_failure_reports_publish_error_without_changing_the_session() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (finished, received) = std::sync::mpsc::channel();
+        let broker = std::thread::spawn(move || {
+            let mut stream = handshake(&listener, 0);
+            assert_eq!(read_packet(&mut stream), (0x30, b"\x00\x0atest/value\x00\xff".to_vec()));
+            finished.send(()).unwrap();
+            assert_eq!(stream.read(&mut [0]).unwrap(), 0);
+        });
+        let runtime = runtime();
+        let mut connection = connect(ConnectionConfig {
+            host: "127.0.0.1".into(),
+            port,
+            ..Default::default()
+        })
+        .unwrap();
+        next_matching_event(&runtime, &mut connection, |event| matches!(event, BrokerEvent::Connected));
+        let session = connection.session.load(Ordering::Acquire);
+        // Bypass validation to exercise rumqttc's failure rather than the API's.
+        assert!(
+            connection
+                .commands
+                .try_send(Command::Publish(PublishCommand {
+                    topic: "#".into(),
+                    payload: Vec::new(),
+                    qos: QoS::AtMostOnce,
+                    retain: false,
+                    session,
+                }))
+                .is_ok()
+        );
+        match next_event(&runtime, &mut connection) {
+            BrokerEvent::PublishError(error) => assert!(error.contains("Could not queue publish")),
+            _ => panic!("publishing failure must not report a deletion or status error"),
+        }
+        assert_eq!(connection.session.load(Ordering::Acquire), session);
+        connection.publish("test/value".into(), vec![0, 0xff], 0, false).unwrap();
+        assert!(matches!(next_event(&runtime, &mut connection), BrokerEvent::PublishQueued));
+        received.recv_timeout(Duration::from_secs(5)).unwrap();
+        drop(connection);
+        broker.join().unwrap();
+    }
+
+    #[test]
+    fn disconnect_discards_unacknowledged_publishes_and_qos_two_releases_without_deletion_errors() {
+        for qos in [1, 2] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let (disconnect, disconnected) = std::sync::mpsc::channel();
+            let broker = std::thread::spawn(move || {
+                let mut stream = handshake(&listener, 0);
+                let (header, body) = read_packet(&mut stream);
+                assert_eq!(header, 0x31 | (qos << 1));
+                // An empty retained publish is still a user publish, not a deletion command.
+                assert_eq!(&body[2..12], b"test/value");
+                assert_eq!(body.len(), 14);
+                if qos == 2 {
+                    stream.write_all(&[0x50, 2, body[12], body[13]]).unwrap();
+                    assert_eq!(read_packet(&mut stream), (0x62, body[12..14].to_vec()));
+                }
+                disconnected.recv_timeout(Duration::from_secs(5)).unwrap();
+                drop(stream);
+                let mut stream = handshake(&listener, 0);
+                assert_eq!(stream.read(&mut [0]).unwrap(), 0, "publishes and releases must not replay");
+            });
+            let runtime = runtime();
+            let mut connection = connect(ConnectionConfig {
+                host: "127.0.0.1".into(),
+                port,
+                ..Default::default()
+            })
+            .unwrap();
+            next_matching_event(&runtime, &mut connection, |event| matches!(event, BrokerEvent::Connected));
+            connection.publish("test/value".into(), Vec::new(), qos, true).unwrap();
+            assert!(matches!(next_event(&runtime, &mut connection), BrokerEvent::PublishQueued));
+            disconnect.send(()).unwrap();
+            match next_event(&runtime, &mut connection) {
+                BrokerEvent::PublishError(error) => assert!(error.contains("will not be retried")),
+                _ => panic!("a disconnected publish must report a publish error, not a deletion error"),
+            }
+            assert!(matches!(next_event(&runtime, &mut connection), BrokerEvent::Status(_)));
+            assert!(matches!(next_event(&runtime, &mut connection), BrokerEvent::Connecting));
+            assert!(matches!(next_event(&runtime, &mut connection), BrokerEvent::Connected));
+            drop(connection);
+            broker.join().unwrap();
+        }
     }
 
     #[test]
@@ -806,7 +1238,9 @@ mod tests {
         assert!(connection.clear_retained_in_session(vec!["#".into()], &token).is_err());
         assert!(matches!(commands.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
         connection.clear_retained_in_session(vec!["test/value".into()], &token).unwrap();
-        let command = commands.try_recv().unwrap();
+        let Command::ClearRetained(command) = commands.try_recv().unwrap() else {
+            panic!("expected a retained deletion command");
+        };
         assert_eq!(command.topics, vec!["test/value"]);
         assert_eq!(command.session, 1);
     }
@@ -826,7 +1260,7 @@ mod tests {
         connection
             .clear_retained_in_session(vec!["test/value".into()], &fresh_token)
             .unwrap();
-        assert_eq!(commands.try_recv().unwrap().session, 3);
+        assert_eq!(commands.try_recv().unwrap().session(), 3);
     }
 
     #[test]
@@ -842,7 +1276,7 @@ mod tests {
         replacement
             .clear_retained_in_session(vec!["test/value".into()], &fresh_token)
             .unwrap();
-        assert_eq!(commands.try_recv().unwrap().session, token.generation);
+        assert_eq!(commands.try_recv().unwrap().session(), token.generation);
     }
 
     #[test]
@@ -864,7 +1298,9 @@ mod tests {
         let (connection, mut commands, _) = command_connection();
         let topics = vec!["/".into(), "$SYS/value".into(), "a//é".into(), "a".repeat(65535)];
         connection.clear_retained(topics.clone()).unwrap();
-        let command = commands.try_recv().unwrap();
+        let Command::ClearRetained(command) = commands.try_recv().unwrap() else {
+            panic!("expected a retained deletion command");
+        };
         assert_eq!(command.topics, topics);
         assert_eq!(command.session, 1);
     }
@@ -958,10 +1394,10 @@ mod tests {
         assert!(
             connection
                 .commands
-                .try_send(ClearRetained {
+                .try_send(Command::ClearRetained(ClearRetained {
                     topics: vec!["test/value".into()],
                     session: old_session,
-                })
+                }))
                 .is_ok()
         );
         let mut connected = false;
@@ -1035,10 +1471,10 @@ mod tests {
         assert!(
             connection
                 .commands
-                .try_send(ClearRetained {
+                .try_send(Command::ClearRetained(ClearRetained {
                     topics: vec!["#".into()],
                     session,
-                })
+                }))
                 .is_ok()
         );
         match next_event(&runtime, &mut connection) {
@@ -1100,7 +1536,7 @@ mod tests {
         let (client, event_loop) = AsyncClient::new(MqttOptions::new("test", "localhost", 1883), 16);
         drop(event_loop);
         let error = runtime()
-            .block_on(publish_clear_retained(client, vec!["test/value".into()]))
+            .block_on(publish_clear_retained(client, vec!["test/value".into()], Rc::default()))
             .unwrap_err();
         assert!(error.to_string().contains("Could not queue"));
     }

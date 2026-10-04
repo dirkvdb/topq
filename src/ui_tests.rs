@@ -52,6 +52,146 @@ fn open(cx: &mut TestAppContext, form: bool, width: f32, height: f32) -> (AnyWin
     })
 }
 
+#[gpui_kit::test]
+fn publish_disclosure_preserves_draft_and_options_across_keyboard_and_pointer_toggles(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, false, 900., 640.);
+    cx.update_window(handle, |_, window, _| window.activate_window()).unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("publish-form").is_none());
+        window.click("toggle-publish", cx);
+        assert!(window.find("publish-form").visible());
+        window.click("publish-topic", cx);
+        window.input("home/command", cx);
+        window.click("publish-payload", cx);
+        window.input("{\"enabled\":true}", cx);
+        window.click("publish-retain", cx);
+        window.click("toggle-publish", cx);
+        assert!(window.try_find("publish-form").is_none());
+        window.click("toggle-publish", cx);
+        window.click("publish-topic", cx);
+        window.press("shift-tab", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("toggle-publish").focused(), Some(true));
+        window.press("enter", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("publish-form").is_none());
+        window.press("enter", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.find("publish-form").visible());
+        assert_eq!(window.find("publish-topic").value(), Some("home/command"));
+        assert_eq!(view.read(cx).publish_payload.read(cx).value().as_str(), "{\"enabled\":true}");
+        assert!(view.read(cx).publish_retain);
+        window.click("publish-qos", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    for _ in 0..2 {
+        cx.update_window(handle, |_, window, cx| window.press("down", cx)).unwrap();
+        cx.run_until_parked();
+    }
+    cx.update_window(handle, |_, window, cx| window.press("enter", cx)).unwrap();
+    cx.run_until_parked();
+    cx.update(|cx| assert_eq!(view.read(cx).publish_qos.read(cx).selected_value(), Some(&"1")));
+}
+
+#[gpui_kit::test]
+fn publish_is_disabled_offline_and_shortcut_reports_error_without_losing_draft(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, false, 900., 640.);
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("toggle-publish", cx);
+        window.click("publish-topic", cx);
+        window.input("home/command", cx);
+
+        window.click("publish-message", cx);
+        assert!(view.read(cx).publish_feedback.is_none());
+        window.press("ctrl-enter", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("publish-feedback").label(),
+            Some("Connect to a broker before publishing.")
+        );
+        assert_eq!(window.find("publish-topic").value(), Some("home/command"));
+        assert!(!view.read(cx).publish_pending);
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn publish_panel_keeps_topic_tree_and_controls_visible_at_minimum_size_across_themes_and_zoom(cx: &mut TestAppContext) {
+    for mode in [ThemeMode::Light, ThemeMode::Dark] {
+        for font_size in [16., 20.] {
+            let (handle, _) = open(cx, false, 760., 540.);
+            cx.update(|cx| {
+                Theme::change(mode, None, cx);
+                Theme::update(cx, |theme| theme.font_size = px(font_size));
+            });
+            cx.update_window(handle, |_, window, cx| {
+                window.render_frame(cx);
+                window.click("toggle-publish", cx);
+                let panel = window.find("publish-panel").bounds();
+                let heading = window.find("topics-heading").bounds();
+                assert!(
+                    panel.top() > heading.bottom() + window.rem_size(),
+                    "panel {panel:?}, heading {heading:?}, font {font_size}"
+                );
+                for id in [
+                    "publish-topic",
+                    "publish-payload",
+                    "publish-qos",
+                    "publish-retain",
+                    "publish-message",
+                ] {
+                    let control = window.find(id);
+                    assert!(control.visible(), "{id} is not visible");
+                    assert!(control.bounds().left() >= panel.left());
+                    assert!(control.bounds().right() <= panel.right());
+                    assert!(control.bounds().bottom() <= panel.bottom());
+                }
+                let topic = window.find("publish-topic").bounds();
+                let payload = window.find("publish-payload").bounds();
+                let action = window.find("publish-message").bounds();
+                assert_eq!(topic.left(), payload.left());
+                assert_eq!(topic.right(), action.right());
+                assert!(payload.size.height > window.rem_size() * 2.);
+            })
+            .unwrap();
+        }
+    }
+}
+
+#[gpui_kit::test]
+fn publish_panel_does_not_intercept_slashes_as_topic_filter_shortcuts(cx: &mut TestAppContext) {
+    let (handle, _) = open(cx, false, 900., 640.);
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("toggle-publish", cx);
+        window.click("publish-topic", cx);
+        window.input("home/command", cx);
+        assert_eq!(window.find("publish-topic").value(), Some("home/command"));
+        assert_eq!(window.find("publish-topic").focused(), Some(true));
+    })
+    .unwrap();
+}
+
 fn subscription(topic: &str, qos: u8) -> TopicSubscription {
     TopicSubscription { topic: topic.into(), qos }
 }
@@ -2839,4 +2979,160 @@ fn topic_filter_shows_matching_paths_and_ancestors_then_restores_the_tree(cx: &m
         assert!(window.find("topic:home/b").visible());
     })
     .unwrap();
+}
+
+#[gpui_kit::test]
+fn publish_panel_queues_one_retained_qos_one_message_without_claiming_broker_acknowledgement(cx: &mut TestAppContext) {
+    use std::{
+        io::{ErrorKind, Read, Write},
+        net::{TcpListener, TcpStream},
+        time::{Duration, Instant},
+    };
+
+    fn packet(stream: &mut TcpStream) -> (u8, Vec<u8>) {
+        let mut header = [0; 2];
+        stream.read_exact(&mut header).unwrap();
+        assert!(header[1] < 128, "test broker expects short packets");
+        let mut body = vec![0; usize::from(header[1])];
+        stream.read_exact(&mut body).unwrap();
+        (header[0], body)
+    }
+
+    let topic = "home/command/é";
+    let payload = "{\"enabled\":true}";
+    let feedback = "Queued for sending · delivery not confirmed";
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (sent, received) = std::sync::mpsc::channel();
+    let (check_duplicates, duplicate_check_requested) = std::sync::mpsc::channel();
+    let (checked, duplicate_check_completed) = std::sync::mpsc::channel();
+    let broker = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        assert_eq!(packet(&mut stream).0, 0x10);
+        stream.write_all(&[0x20, 2, 0, 0]).unwrap();
+        let (header, subscribe) = packet(&mut stream);
+        assert_eq!(header, 0x82);
+        stream.write_all(&[0x90, 3, subscribe[0], subscribe[1], 0]).unwrap();
+        sent.send(packet(&mut stream)).unwrap();
+
+        // Withhold PUBACK: queue feedback must not depend on broker acknowledgement.
+        duplicate_check_requested.recv_timeout(Duration::from_secs(5)).unwrap();
+        stream.set_read_timeout(Some(Duration::from_millis(250))).unwrap();
+        let error = stream.read(&mut [0]).expect_err("pending clicks must not send another packet");
+        assert!(matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut));
+        checked.send(()).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        assert_eq!(stream.read(&mut [0]).unwrap(), 0);
+    });
+
+    let (handle, view) = open(cx, false, 1200., 760.);
+    view.update(cx, |view, cx| {
+        view.connection = Some(
+            crate::mqtt::connect(ConnectionConfig {
+                host: "127.0.0.1".into(),
+                port,
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        view.status = ConnectionStatus::Connecting;
+        cx.notify();
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let connected = cx
+            .update_window(handle, |_, window, cx| {
+                view.update(cx, |view, cx| view.poll(window, cx));
+                assert!(
+                    !matches!(view.read(cx).status, ConnectionStatus::Failed(_)),
+                    "test broker connection failed"
+                );
+                view.read(cx).status.is_connected()
+            })
+            .unwrap();
+        if connected {
+            break;
+        }
+        assert!(Instant::now() < deadline, "view must process the broker connection");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    cx.update_window(handle, |_, window, _| window.activate_window()).unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("toggle-publish", cx);
+        assert_eq!(window.find("publish-topic").value(), Some(""));
+        window.click("publish-topic", cx);
+        window.input(topic, cx);
+        window.click("publish-payload", cx);
+        window.input(payload, cx);
+        window.click("publish-retain", cx);
+        view.update(cx, |view, cx| {
+            view.publish_qos.update(cx, |state, cx| state.set_selected_value(&"1", window, cx));
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("publish-topic").value(), Some(topic));
+        assert_eq!(view.read(cx).publish_payload.read(cx).value().as_str(), payload);
+        assert_eq!(view.read(cx).publish_qos.read(cx).selected_value(), Some(&"1"));
+        assert_eq!(window.find("publish-retain").checked(), Some(true));
+        assert!(view.read(cx).publish_feedback.is_none());
+        assert!(!view.read(cx).publish_pending);
+
+        window.click("publish-message", cx);
+        assert!(view.read(cx).publish_pending);
+        assert!(view.read(cx).publish_feedback.is_none());
+        window.render_frame(cx);
+        window.click("publish-message", cx);
+        assert!(view.read(cx).publish_pending);
+        assert!(view.read(cx).publish_feedback.is_none());
+    })
+    .unwrap();
+
+    let (header, body) = received.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(header, 0x33, "must publish with QoS 1, retain set, and DUP unset");
+    let topic_length = usize::from(u16::from_be_bytes([body[0], body[1]]));
+    assert_eq!(&body[2..2 + topic_length], topic.as_bytes());
+    let packet_id = u16::from_be_bytes([body[2 + topic_length], body[3 + topic_length]]);
+    assert_ne!(packet_id, 0, "QoS 1 requires a nonzero packet identifier");
+    assert_eq!(&body[4 + topic_length..], payload.as_bytes());
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let queued = cx
+            .update_window(handle, |_, window, cx| {
+                view.update(cx, |view, cx| view.poll(window, cx));
+                view.read(cx).publish_feedback.is_some()
+            })
+            .unwrap();
+        if queued {
+            break;
+        }
+        assert!(Instant::now() < deadline, "view must process PublishQueued without PUBACK");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        let view = view.read(cx);
+        assert!(!view.publish_pending);
+        assert_eq!(view.publish_feedback.as_ref().unwrap().as_deref(), Ok(feedback));
+        assert!(window.find("publish-feedback").visible());
+        assert_eq!(window.find("publish-feedback").label(), Some(feedback));
+        assert_ne!(window.find("publish-message").disabled(), Some(true));
+        assert_eq!(window.find("publish-topic").value(), Some(topic));
+        assert_eq!(view.publish_payload.read(cx).value().as_str(), payload);
+        assert_eq!(view.publish_qos.read(cx).selected_value(), Some(&"1"));
+        assert!(view.publish_retain);
+        assert!(view.status.is_connected());
+    })
+    .unwrap();
+
+    check_duplicates.send(()).unwrap();
+    duplicate_check_completed.recv_timeout(Duration::from_secs(5)).unwrap();
+    view.update(cx, |view, _| view.connection = None);
+    broker.join().unwrap();
 }

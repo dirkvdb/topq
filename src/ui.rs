@@ -33,6 +33,7 @@ use crate::{
     topics::{FLASH_DURATION, TopicStore},
 };
 
+mod publish;
 mod settings;
 
 gpui_kit::actions!(
@@ -45,7 +46,8 @@ gpui_kit::actions!(
         FirstTopic,
         LastTopic,
         NarrowTopics,
-        WidenTopics
+        WidenTopics,
+        PublishMessage
     ]
 );
 
@@ -54,7 +56,7 @@ pub(crate) fn init(cx: &mut App) {
         KeyBinding::new("secondary-,", OpenConnection, Some("Explorer")),
         KeyBinding::new("escape", CancelConnection, Some("SettingsDialog")),
         KeyBinding::new("escape", FocusTopics, Some("TopicFilter")),
-        KeyBinding::new("/", FocusTopicFilter, Some("Explorer && !TopicFilter")),
+        KeyBinding::new("/", FocusTopicFilter, Some("Explorer && !TopicFilter && !PublishPanel")),
         KeyBinding::new("ctrl-f", FocusTopicFilter, Some("Explorer")),
         KeyBinding::new("ctrl-f", FocusTopicFilter, Some("Explorer > Input")),
         KeyBinding::new("secondary-1", FocusTopics, Some("Explorer")),
@@ -63,6 +65,7 @@ pub(crate) fn init(cx: &mut App) {
         KeyBinding::new("enter", gpui_kit::base::actions::Confirm { secondary: false }, Some("Tree")),
         KeyBinding::new("ctrl-alt-left", NarrowTopics, Some("Explorer")),
         KeyBinding::new("ctrl-alt-right", WidenTopics, Some("Explorer")),
+        KeyBinding::new("ctrl-enter", PublishMessage, Some("PublishPanel")),
     ]);
 }
 
@@ -145,6 +148,13 @@ pub struct Explorer {
     selected: Option<String>,
     payload: Entity<EditorState>,
     payload_format: &'static str,
+    publish_open: bool,
+    publish_topic: Entity<InputState>,
+    publish_payload: Entity<EditorState>,
+    publish_qos: Entity<SelectState<Vec<&'static str>>>,
+    publish_retain: bool,
+    publish_pending: bool,
+    publish_feedback: Option<Result<String, String>>,
     panes: Entity<ResizableState>,
     topics_width_rem: Option<f32>,
     topics_width_fraction: Option<f32>,
@@ -231,6 +241,15 @@ impl Explorer {
                 .indent_guides(false)
                 .folding(false)
         });
+        let publish_topic = cx.new(|cx| InputState::new(window, cx).placeholder("example/topic"));
+        let publish_payload = cx.new(|cx| {
+            EditorState::new(window, cx)
+                .language("plaintext")
+                .line_number(false)
+                .indent_guides(false)
+                .folding(false)
+        });
+        let publish_qos = cx.new(|cx| SelectState::new(vec!["0", "1", "2"], Some(IndexPath::default()), window, cx));
         let tree_state = cx.new(|cx| TreeState::new(cx));
         // Kit 0.7 exposes focus through the tree state rather than a handle reader.
         // Capture its real handle once and enable the native Tab stop.
@@ -338,6 +357,13 @@ impl Explorer {
             password,
             payload,
             payload_format: "Text",
+            publish_open: false,
+            publish_topic,
+            publish_payload,
+            publish_qos,
+            publish_retain: false,
+            publish_pending: false,
+            publish_feedback: None,
             tree_state,
             panes,
             topics_width_fraction: width_fraction,
@@ -373,6 +399,8 @@ impl Explorer {
 
     fn start_connection(&mut self, config: ConnectionConfig, window: &mut Window, cx: &mut Context<Self>) {
         self.connection = None;
+        self.publish_pending = false;
+        self.publish_feedback = None;
         self.error = None;
         self.field_error = None;
         match mqtt::connect(config.clone()) {
@@ -393,6 +421,8 @@ impl Explorer {
     }
 
     fn clear_topics(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.publish_pending = false;
+        self.publish_feedback = None;
         self.topics = TopicStore::default();
         self.expanded.clear();
         self.selected = None;
@@ -427,6 +457,14 @@ impl Explorer {
                 }
                 BrokerEvent::Status(status) => self.status = ConnectionStatus::Failed(status),
                 BrokerEvent::OperationError(error) => self.error = Some(format!("Could not delete retained topics: {error}")),
+                BrokerEvent::PublishQueued => {
+                    self.publish_pending = false;
+                    self.publish_feedback = Some(Ok("Queued for sending · delivery not confirmed".into()));
+                }
+                BrokerEvent::PublishError(error) => {
+                    self.publish_pending = false;
+                    self.publish_feedback = Some(Err(error));
+                }
                 BrokerEvent::Message(message) => {
                     let has_payload = !message.payload.is_empty();
                     payload_changed |= self.selected.as_ref() == Some(&message.topic);
@@ -438,6 +476,12 @@ impl Explorer {
             }
         }
         if ended {
+            if self.publish_pending {
+                self.publish_pending = false;
+                self.publish_feedback = Some(Err(
+                    "Connection stopped before the message could be queued. Reconnect and try again.".into(),
+                ));
+            }
             self.connection = None;
             self.status = ConnectionStatus::Failed(format!("Connection stopped · {}", self.status.label()));
             changed = true;
@@ -965,6 +1009,7 @@ impl Explorer {
                     )
                 }
             })
+            .child(self.publish_panel(cx))
     }
 
     fn details(&self, cx: &mut Context<Self>) -> impl IntoElement {
