@@ -1096,6 +1096,7 @@ impl Explorer {
             .items_center()
             .justify_center()
             .bg(cx.theme().background.opacity(0.8))
+            .occlude()
             .on_mouse_down(MouseButton::Left, |_, _, _| {})
             .child(
                 div()

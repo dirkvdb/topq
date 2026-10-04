@@ -98,6 +98,42 @@ fn status_bar_stays_compact_across_connection_states_and_text_sizes(cx: &mut Tes
 }
 
 #[gpui_kit::test]
+fn settings_block_dragging_the_underlying_pane_divider(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, false, 760., 540.);
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("settings", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.find("settings-dialog").visible());
+        let pane = window.find("topics-pane").bounds();
+        let sizes = view.read(cx).panes.read(cx).sizes().clone();
+        // Cover both the settings surface and the backdrop below it.
+        for y in [pane.center().y, pane.bottom() - px(1.)] {
+            let from = gpui_kit::point(pane.right(), y);
+            window.drag(from, from + gpui_kit::point(px(80.), px(0.)), cx);
+            assert_eq!(view.read(cx).panes.read(cx).sizes(), &sizes);
+        }
+        window.click("close-settings", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("settings-dialog").is_none());
+        let pane = window.find("topics-pane").bounds();
+        let width = view.read(cx).panes.read(cx).sizes()[0];
+        let from = gpui_kit::point(pane.right(), pane.center().y);
+        window.drag(from, from + gpui_kit::point(px(80.), px(0.)), cx);
+        assert!(view.read(cx).panes.read(cx).sizes()[0] > width);
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
 fn theme_selector_stays_compact_in_appearance_settings(cx: &mut TestAppContext) {
     let (handle, _) = open(cx, true, 760., 540.);
     cx.update_window(handle, |_, window, cx| {
@@ -2396,6 +2432,72 @@ fn metadata_tags_leave_room_for_json_at_minimum_size_in_both_themes(cx: &mut Tes
 }
 
 #[gpui_kit::test]
+fn topic_filter_shortcuts_work_from_the_application_shell_payload_and_toolbar(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, false, 900., 640.);
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |view, cx| view.select_topic("home/a", window, cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    for shortcut in ["/", "ctrl-f"] {
+        for source in ["application", "payload", "toolbar"] {
+            cx.update_window(handle, |_, window, cx| {
+                window.render_frame(cx);
+                match source {
+                    "application" => view.update(cx, |view, cx| view.focus.focus(window, cx)),
+                    "payload" => window.click("payload", cx),
+                    "toolbar" => {
+                        view.update(cx, |view, cx| view.focus_topics(window, cx));
+                        window.press("shift-tab", cx);
+                        window.press("shift-tab", cx);
+                        assert_eq!(window.find("settings").focused(), Some(true));
+                    }
+                    _ => unreachable!(),
+                }
+                window.render_frame(cx);
+                assert_eq!(window.find("topic-search").focused(), Some(false));
+                window.press(shortcut, cx);
+                assert_eq!(window.find("topic-search").focused(), Some(true), "{shortcut} from {source}");
+            })
+            .unwrap();
+        }
+    }
+
+    cx.update_window(handle, |_, window, cx| {
+        window.input("home/a", cx);
+        assert_eq!(view.read(cx).topic_filter.read(cx).value().as_str(), "home/a");
+        window.press("ctrl-f", cx);
+        assert_eq!(window.find("topic-search").focused(), Some(true));
+        assert_eq!(view.read(cx).topic_filter.read(cx).value().as_str(), "home/a");
+        view.update(cx, |view, cx| view.clear_topics(window, cx));
+        for shortcut in ["/", "ctrl-f"] {
+            view.update(cx, |view, cx| view.focus_topics(window, cx));
+            window.press(shortcut, cx);
+            assert_eq!(window.find("topic-search").focused(), Some(true));
+        }
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn topic_filter_shortcuts_preserve_modal_settings_focus_and_text_entry(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, true, 900., 640.);
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("host", cx);
+        window.press("secondary-a", cx);
+        window.input("broker/path", cx);
+        assert_eq!(view.read(cx).host.read(cx).value().as_str(), "broker/path");
+        window.press("ctrl-f", cx);
+        assert_eq!(window.find("host").focused(), Some(true));
+        assert_eq!(window.find("topic-search").focused(), Some(false));
+        assert!(window.find("settings-dialog").visible());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
 fn topic_filter_shortcuts_focus_it_and_clear_button_resets_it(cx: &mut TestAppContext) {
     let (handle, view) = open(cx, false, 900., 640.);
 
@@ -2477,6 +2579,13 @@ fn topic_filter_shows_matching_paths_and_ancestors_then_restores_the_tree(cx: &m
         assert!(window.find("topics-filter-empty").visible());
         assert!(window.try_find("topic:home/a").is_none());
         assert!(window.try_find("topic:home/b").is_none());
+        for shortcut in ["/", "ctrl-f"] {
+            window.press(shortcut, cx);
+            assert_eq!(window.find("topic-search").focused(), Some(true));
+            assert_eq!(view.read(cx).topic_filter.read(cx).value().as_str(), "missing");
+            window.press("escape", cx);
+            assert_eq!(window.find("topic-search").focused(), Some(false));
+        }
         window.click("clean", cx);
     })
     .unwrap();

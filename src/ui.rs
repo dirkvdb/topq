@@ -53,8 +53,9 @@ pub(crate) fn init(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("secondary-,", OpenConnection, Some("Explorer")),
         KeyBinding::new("escape", FocusTopics, Some("TopicFilter")),
-        KeyBinding::new("/", FocusTopicFilter, Some("Tree")),
-        KeyBinding::new("ctrl-f", FocusTopicFilter, Some("Tree")),
+        KeyBinding::new("/", FocusTopicFilter, Some("Explorer && !TopicFilter")),
+        KeyBinding::new("ctrl-f", FocusTopicFilter, Some("Explorer")),
+        KeyBinding::new("ctrl-f", FocusTopicFilter, Some("Explorer > Input")),
         KeyBinding::new("secondary-1", FocusTopics, Some("Explorer")),
         KeyBinding::new("home", FirstTopic, Some("Tree")),
         KeyBinding::new("end", LastTopic, Some("Tree")),
@@ -666,10 +667,20 @@ impl Explorer {
         if self.show_config {
             return;
         }
-        self.tree_state.update(cx, |state, cx| state.focus(window, cx));
+        let filter = self.topic_filter.read(cx).value().to_lowercase();
+        if self.topics.nodes.is_empty() || (!filter.trim().is_empty() && self.filtered_topic_paths(filter.trim()).is_empty()) {
+            // An unrendered tree has no focus path for application shortcuts.
+            self.focus.focus(window, cx);
+        } else {
+            self.tree_state.update(cx, |state, cx| state.focus(window, cx));
+        }
     }
 
     fn focus_topic_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.show_config || window.has_active_dialog(cx) {
+            cx.propagate();
+            return;
+        }
         self.topic_filter.update(cx, |state, cx| state.focus(window, cx));
     }
 
@@ -780,11 +791,7 @@ impl Explorer {
                         .ghost()
                         .icon(IconName::Settings)
                         .accessibility_label("Settings")
-                        .tooltip(if cfg!(target_os = "macos") {
-                            "Settings (Cmd+,)"
-                        } else {
-                            "Settings (Ctrl+,)"
-                        })
+                        .tooltip_with_action("Settings", &OpenConnection, Some("Explorer"))
                         .on_click(cx.listener(|view, _, window, cx| view.open_connection(window, cx))),
                 ),
         )
