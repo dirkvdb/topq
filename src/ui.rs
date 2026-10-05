@@ -18,7 +18,6 @@ use gpui_kit::component::{
     resizable::{ResizablePanelEvent, ResizableState, h_resizable, resizable_panel, v_resizable},
     scroll::ScrollableElement,
     select::{SelectEvent, SelectState},
-    spinner::Spinner,
     tag::Tag,
     tooltip::Tooltip,
     tree::{TreeEntry, TreeEvent, TreeItem, TreeState},
@@ -967,25 +966,24 @@ impl Explorer {
             .tooltip(move |window, cx| Tooltip::new(tooltip_label.clone()).build(window, cx))
             .h_flex()
             .flex_none()
-            .when(self.status.is_connecting(), |indicator| indicator.child(Spinner::new().small()))
-            .when(!self.status.is_connecting(), |indicator| {
-                indicator.child(
-                    div()
-                        .size_1p5()
-                        .flex_none()
-                        .rounded(cx.theme().radius_full())
-                        .bg(if self.status.is_connected() {
-                            cx.theme().success
-                        } else if matches!(&self.status, ConnectionStatus::Failed(_)) {
-                            cx.theme().danger
-                        } else {
-                            cx.theme().muted_foreground
-                        }),
-                )
-            })
+            .child(
+                div()
+                    .size_1p5()
+                    .flex_none()
+                    .rounded(cx.theme().radius_full())
+                    .bg(if self.status.is_connecting() {
+                        cx.theme().warning
+                    } else if self.status.is_connected() {
+                        cx.theme().success
+                    } else if matches!(&self.status, ConnectionStatus::Failed(_)) {
+                        cx.theme().danger
+                    } else {
+                        cx.theme().muted_foreground
+                    }),
+            )
     }
 
-    fn error_alerts(&self) -> impl IntoElement {
+    fn error_alerts(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let error = self.error.clone();
         let connection_error = match &self.status {
             ConnectionStatus::Failed(message) => Some(message.clone()),
@@ -995,22 +993,26 @@ impl Explorer {
         let mut alerts = div().id("error-alerts").test_support().v_flex().flex_none().gap_2();
         if let Some(message) = error {
             alerts = alerts.child(
-                div()
-                    .id("application-error")
-                    .test_support()
-                    .px_4()
-                    .pt_2()
-                    .child(Alert::error("application-error-content", message).banner()),
+                div().id("application-error").test_support().child(
+                    Alert::error("application-error-content", message)
+                        .bg(cx.theme().background)
+                        .on_close(cx.listener(|view, _, _, cx| {
+                            view.error = None;
+                            cx.notify();
+                        })),
+                ),
             );
         }
         if let Some(message) = connection_error {
             alerts = alerts.child(
-                div()
-                    .id("connection-error")
-                    .test_support()
-                    .px_4()
-                    .pt_2()
-                    .child(Alert::error("connection-error-content", message).banner()),
+                div().id("connection-error").test_support().child(
+                    Alert::error("connection-error-content", message)
+                        .bg(cx.theme().background)
+                        .on_close(cx.listener(|view, _, _, cx| {
+                            view.status = ConnectionStatus::Disconnected;
+                            cx.notify();
+                        })),
+                ),
             );
         }
         alerts
@@ -1384,6 +1386,7 @@ impl Explorer {
         let rem = window.rem_size();
         let width = self.topics_width_rem.unwrap_or(24.).clamp(15., 50.);
         div()
+            .relative()
             .v_flex()
             .size_full()
             .min_w_0()
@@ -1392,7 +1395,6 @@ impl Explorer {
                     .clone()
                     .cached(StyleRefinement::default().w_full().h(TITLE_BAR_HEIGHT).flex_none()),
             )
-            .when(!self.show_config, |content| content.child(self.error_alerts()))
             .child(
                 div().flex_1().min_h_0().min_w_0().child(
                     h_resizable("panes")
@@ -1410,6 +1412,9 @@ impl Explorer {
                         ),
                 ),
             )
+            .when(!self.show_config, |root| {
+                root.child(div().absolute().top(TITLE_BAR_HEIGHT).right_0().p_2().child(self.error_alerts(cx)))
+            })
     }
 }
 

@@ -8,8 +8,16 @@ mod ui;
 
 use gpui_kit::{AppContext, Bounds, WindowBounds, WindowOptions, px, size};
 
+fn init_logging() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+    if let Err(error) = tracing_subscriber::fmt().with_env_filter(filter).try_init() {
+        eprintln!("Could not initialize console logging: {error}");
+    }
+}
+
 #[hotpath::main]
 fn main() {
+    init_logging();
     gpui_kit::application().with_assets(gpui_kit::assets::AllAssets).run(|cx| {
         gpui_kit::init(cx);
         appearance::init(cx);
@@ -33,7 +41,7 @@ fn main() {
                 cx.new(|cx| ui::Explorer::new(window, cx))
             },
         ) {
-            eprintln!("Could not open the TopQ window: {error:#}");
+            tracing::error!(error = %format_args!("{error:#}"), "Could not open the TopQ window");
             cx.quit();
             return;
         }

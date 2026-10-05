@@ -188,6 +188,7 @@ pub fn connect(config: ConnectionConfig) -> Result<Connection> {
                     result = run(config, &sender, command_receiver) => result,
                 };
                 if let Err(error) = result {
+                    tracing::error!(error = %format_args!("{error:#}"), "MQTT worker stopped");
                     let _ = sender.send(BrokerEvent::Status(format!("{error:#}"))).await;
                 }
             });
@@ -354,6 +355,7 @@ async fn run(config: ConnectionConfig, sender: &mpsc::Sender<BrokerEvent>, mut c
                 }
                 pending_subscription = None;
                 if ack.return_codes.iter().any(|code| matches!(code, SubscribeReasonCode::Failure)) {
+                    tracing::warn!(broker = %config.host, "Broker refused one or more topic subscriptions");
                     BrokerEvent::Status("Broker refused one or more topic subscriptions. Check access permissions.".into())
                 } else if ack.return_codes.len() != config.topics.len() {
                     BrokerEvent::Status("Broker did not acknowledge all topic subscriptions.".into())
@@ -385,6 +387,7 @@ async fn run(config: ConnectionConfig, sender: &mpsc::Sender<BrokerEvent>, mut c
             }),
             Ok(_) => continue,
             Err(error) => {
+                tracing::error!(broker = %config.host, port = config.port, error = %error, "MQTT connection failed; retrying");
                 pending_subscription = None;
                 session = SessionState::Disconnected;
                 while let Ok(command) = commands.try_recv() {

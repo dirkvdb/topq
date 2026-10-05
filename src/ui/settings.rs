@@ -1240,7 +1240,7 @@ impl Explorer {
                                     .on_click(cx.listener(|view, _, window, cx| view.cancel_connection(window, cx))),
                             ),
                     )
-                    .child(self.error_alerts())
+                    .child(self.error_alerts(cx))
                     .child(
                         div().flex_1().min_h_0().child(
                             Settings::new(SharedString::from(format!("settings-pages:{}", self.settings_generation)))

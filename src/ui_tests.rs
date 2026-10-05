@@ -1430,7 +1430,13 @@ fn application_errors_are_shown_in_alerts(cx: &mut TestAppContext) {
         window.render_frame(cx);
         let alert = window.find("application-error");
         assert!(alert.visible());
+        let alert_bounds = alert.bounds();
         assert_eq!(view.read(cx).error.as_deref(), Some("Could not save the application state."));
+        // Alert's built-in close control has no test-support registration.
+        window.click_at("application-error", gpui_kit::point(alert_bounds.size.width - px(26.), px(20.)), cx);
+        window.render_frame(cx);
+        assert!(view.read(cx).error.is_none());
+        assert!(window.try_find("application-error").is_none());
     })
     .unwrap();
 }
