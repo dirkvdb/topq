@@ -41,6 +41,7 @@ mod payload_diff;
 use explorer_pane::{ExplorerPane, ExplorerPaneKind};
 mod publish;
 mod settings;
+mod topic_completion;
 mod topic_row;
 
 use topic_row::TopicRow;
@@ -57,6 +58,7 @@ gpui_kit::actions!(
         NarrowTopics,
         WidenTopics,
         PublishMessage,
+        CompletePublishTopic,
         GrowPublish,
         ShrinkPublish
     ]
@@ -77,6 +79,7 @@ pub(crate) fn init(cx: &mut App) {
         KeyBinding::new("ctrl-alt-left", NarrowTopics, Some("Explorer")),
         KeyBinding::new("ctrl-alt-right", WidenTopics, Some("Explorer")),
         KeyBinding::new("ctrl-enter", PublishMessage, Some("PublishPanel")),
+        KeyBinding::new("tab", CompletePublishTopic, Some("PublishTopic > Input")),
         KeyBinding::new("ctrl-alt-up", GrowPublish, Some("PublishPanel")),
         KeyBinding::new("ctrl-alt-down", ShrinkPublish, Some("PublishPanel")),
     ]);
@@ -203,6 +206,7 @@ pub struct Explorer {
     payload_highlight: payload::PayloadHighlight,
     publish_open: bool,
     publish_topic: Entity<InputState>,
+    publish_topic_completion: Option<topic_completion::TopicCompletion>,
     publish_payload: Entity<EditorState>,
     publish_content: publish::PayloadContent,
     publish_qos: Entity<SelectState<Vec<&'static str>>>,
@@ -345,6 +349,12 @@ impl Explorer {
                 })
             })
             .collect();
+        subscriptions.push(cx.subscribe_in(&publish_topic, window, |view, _, event, _, cx| {
+            view.update_topic_completion(event, cx);
+        }));
+        subscriptions.push(cx.observe_in(&publish_topic, window, |view, _, _, cx| {
+            view.publish_view.update(cx, |_, cx| cx.notify());
+        }));
         subscriptions.push(cx.subscribe_in(&publish_payload, window, |view, _, event, _, cx| {
             if matches!(event, InputEvent::Change) {
                 view.update_publish_content(cx);
@@ -438,6 +448,7 @@ impl Explorer {
             payload_highlight,
             publish_open: false,
             publish_topic,
+            publish_topic_completion: None,
             publish_payload,
             publish_content: publish::PayloadContent::default(),
             publish_qos,

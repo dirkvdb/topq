@@ -36,7 +36,7 @@ impl ExplorerPane {
 }
 
 impl Render for ExplorerPane {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         #[cfg(test)]
         {
             self.render_count += 1;
@@ -48,7 +48,7 @@ impl Render for ExplorerPane {
             ExplorerPaneKind::Header => explorer.header(cx).into_any_element(),
             ExplorerPaneKind::Topics => explorer.topic_list(cx).into_any_element(),
             ExplorerPaneKind::Details => explorer.details(cx).into_any_element(),
-            ExplorerPaneKind::Publish => explorer.publish_panel(cx).into_any_element(),
+            ExplorerPaneKind::Publish => explorer.publish_panel(window, cx).into_any_element(),
         })
     }
 }

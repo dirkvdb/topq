@@ -55,6 +55,314 @@ fn open(cx: &mut TestAppContext, form: bool, width: f32, height: f32) -> (AnyWin
 }
 
 #[gpui_kit::test]
+fn publish_topic_tab_cycles_inline_proposals_without_changing_typed_text(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, false, 1200., 760.);
+    cx.update_window(handle, |_, window, _| window.activate_window()).unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("toggle-publish", cx);
+        window.click("publish-topic", cx);
+        window.input("home/", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("publish-topic-proposal").label(), Some("a"));
+        assert!(window.try_find("publish-topic-suggestions").is_none());
+    })
+    .unwrap();
+    for expected in ["b", "a", "b"] {
+        cx.update_window(handle, |_, window, cx| window.press("tab", cx)).unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find("publish-topic").value(), Some("home/"));
+            assert_eq!(window.find("publish-topic-proposal").label(), Some(expected));
+            assert_eq!(window.find("publish-topic").focused(), Some(true));
+            assert_eq!(view.read(cx).publish_topic.read(cx).selected_range(), 5..5);
+        })
+        .unwrap();
+    }
+    cx.update_window(handle, |_, window, cx| window.press("right", cx)).unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("publish-topic").value(), Some("home/b"));
+        assert!(window.try_find("publish-topic-proposal").is_none());
+        assert_eq!(window.find("publish-topic").focused(), Some(true));
+        window.press("shift-tab", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("toggle-publish").focused(), Some(true));
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn publish_topic_completion_accepts_unique_branches_and_cycles_only_siblings(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, false, 1200., 760.);
+    cx.update_window(handle, |_, window, cx| {
+        window.activate_window();
+        view.update(cx, |view, cx| {
+            for topic in ["home/room/sensor/temperature", "home/room/sensor/humidity", "home/room/status"] {
+                view.topics.receive(message(topic), std::time::Instant::now());
+            }
+            view.sync_tree(cx);
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("toggle-publish", cx);
+        window.click("publish-topic", cx);
+        window.input("home/r", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("publish-topic-proposal").label(), Some("oom/"));
+        window.press("tab", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("publish-topic").value(), Some("home/room/"));
+        assert_eq!(window.find("publish-topic-proposal").label(), Some("sensor/"));
+    })
+    .unwrap();
+    for expected in ["status", "sensor/"] {
+        cx.update_window(handle, |_, window, cx| window.press("tab", cx)).unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find("publish-topic").value(), Some("home/room/"));
+            assert_eq!(window.find("publish-topic-proposal").label(), Some(expected));
+        })
+        .unwrap();
+    }
+    cx.update_window(handle, |_, window, cx| window.press("right", cx)).unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("publish-topic").value(), Some("home/room/sensor/"));
+        assert_eq!(window.find("publish-topic-proposal").label(), Some("humidity"));
+        assert_eq!(window.find("publish-topic").focused(), Some(true));
+        window.press("secondary-a", cx);
+        window.input("h", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("publish-topic-proposal").label(), Some("ome/"));
+        window.press("tab", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("publish-topic").value(), Some("home/"));
+        assert_eq!(window.find("publish-topic-proposal").label(), Some("a"));
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn publish_topic_right_accepts_the_first_proposal_and_undo_restores_typed_text(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, false, 1200., 760.);
+    cx.update_window(handle, |_, window, _| window.activate_window()).unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("toggle-publish", cx);
+        window.click("publish-topic", cx);
+        window.input("home/", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("publish-topic").value(), Some("home/"));
+        assert_eq!(window.find("publish-topic-proposal").label(), Some("a"));
+        window.press("right", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("publish-topic").value(), Some("home/a"));
+        assert_eq!(view.read(cx).publish_topic.read(cx).selected_range(), 6..6);
+        assert!(window.try_find("publish-topic-proposal").is_none());
+        window.press("secondary-z", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("publish-topic").value(), Some("home/"));
+        assert_eq!(window.find("publish-topic-proposal").label(), Some("a"));
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn publish_topic_proposals_follow_edits_focus_and_cursor_without_interfering_with_navigation(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, false, 1200., 760.);
+    cx.update_window(handle, |_, window, _| window.activate_window()).unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("toggle-publish", cx);
+        window.click("publish-topic", cx);
+        assert!(window.try_find("publish-topic-proposal").is_none());
+        window.input("home/", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.press("tab", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("publish-topic-proposal").label(), Some("b"));
+        window.press("left", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("publish-topic-proposal").is_none());
+        window.press("right", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("publish-topic").value(), Some("home/"));
+        assert_eq!(view.read(cx).publish_topic.read(cx).selected_range(), 5..5);
+        assert_eq!(window.find("publish-topic-proposal").label(), Some("b"));
+        window.press("backspace", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("publish-topic").value(), Some("home"));
+        assert_eq!(window.find("publish-topic-proposal").label(), Some("/"));
+        window.click("publish-payload", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("publish-topic-proposal").is_none());
+        window.click("publish-topic", cx);
+        window.press("secondary-a", cx);
+        window.input("unknown", cx);
+        window.press("left", cx);
+        window.press("right", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("publish-topic").value(), Some("unknown"));
+        assert_eq!(view.read(cx).publish_topic.read(cx).selected_range(), 7..7);
+        assert!(window.try_find("publish-topic-proposal").is_none());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn publish_topic_tab_uses_edited_prefix_and_preserves_normal_navigation(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, false, 1200., 760.);
+    cx.update_window(handle, |_, window, _| window.activate_window()).unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("toggle-publish", cx);
+        window.click("publish-topic", cx);
+        window.input("home/", cx);
+        window.press("tab", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.press("secondary-a", cx);
+        window.input("home/b", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| window.press("tab", cx)).unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("publish-topic").value(), Some("home/b"));
+        assert!(view.read(cx).publish_payload.read(cx).focus_handle(cx).is_focused(window));
+        window.click("publish-topic", cx);
+        window.press("secondary-a", cx);
+        window.input("unknown/", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| window.press("tab", cx)).unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("publish-topic").value(), Some("unknown/"));
+        assert!(view.read(cx).publish_payload.read(cx).focus_handle(cx).is_focused(window));
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn publish_topic_tab_preserves_unicode_empty_levels_and_undo(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, false, 1200., 760.);
+    cx.update_window(handle, |_, window, cx| {
+        window.activate_window();
+        view.update(cx, |view, cx| {
+            view.topics.receive(message("家//測定値"), std::time::Instant::now());
+            view.sync_tree(cx);
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("toggle-publish", cx);
+        window.click("publish-topic", cx);
+        window.input("家//測", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| window.press("tab", cx)).unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("publish-topic").value(), Some("家//測定値"));
+        assert_eq!(window.find("publish-topic").focused(), Some(true));
+        window.press("secondary-z", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("publish-topic").value(), Some("家//測"));
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
 fn publish_disclosure_preserves_draft_and_options_across_keyboard_and_pointer_toggles(cx: &mut TestAppContext) {
     let (handle, view) = open(cx, false, 900., 640.);
     cx.update_window(handle, |_, window, _| window.activate_window()).unwrap();

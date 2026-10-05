@@ -2,7 +2,7 @@
 
 use std::ops::Range;
 
-use super::{Explorer, GrowPublish, PublishMessage, ShrinkPublish};
+use super::{CompletePublishTopic, Explorer, GrowPublish, PublishMessage, ShrinkPublish};
 use crate::{config, mqtt::Qos};
 use gpui_kit::base::{
     ElementExt,
@@ -14,7 +14,7 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants},
     checkbox::Checkbox,
     collapsible::Collapsible,
-    input::{Editor, Input, RopeExt},
+    input::{Editor, Input, MoveRight, RopeExt},
     resizable::ResizableState,
     select::Select,
 };
@@ -174,7 +174,7 @@ impl Explorer {
         cx.notify();
     }
 
-    pub(super) fn publish_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn publish_panel(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let connected = self.status.is_connected() && self.connection.is_some();
         let enabled = connected && !self.publish_pending && !self.publish_topic.read(cx).value().is_empty();
         let view = cx.weak_entity();
@@ -233,13 +233,29 @@ impl Explorer {
                             .pb_4()
                             .gap_3()
                             .child(
-                                div().v_flex().gap_1().flex_none().child("Topic").child(
-                                    Input::new(&self.publish_topic)
-                                        .id("publish-topic")
-                                        .small()
-                                        .w_full()
-                                        .aria_label("Publish topic"),
-                                ),
+                                div()
+                                    .key_context("PublishTopic")
+                                    .on_action(
+                                        cx.listener(|view, _: &CompletePublishTopic, window, cx| view.complete_publish_topic(window, cx)),
+                                    )
+                                    .capture_action(cx.listener(|view, _: &MoveRight, window, cx| view.accept_topic_proposal(window, cx)))
+                                    .v_flex()
+                                    .gap_1()
+                                    .flex_none()
+                                    .child("Topic")
+                                    .child(
+                                        div()
+                                            .relative()
+                                            .w_full()
+                                            .child(
+                                                Input::new(&self.publish_topic)
+                                                    .id("publish-topic")
+                                                    .small()
+                                                    .w_full()
+                                                    .aria_label("Publish topic"),
+                                            )
+                                            .children(self.topic_proposal(window, cx)),
+                                    ),
                             )
                             .child(
                                 div()
