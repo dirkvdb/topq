@@ -1008,6 +1008,128 @@ fn message(topic: &str) -> Message {
 }
 
 #[gpui_kit::test]
+fn broker_events_update_connection_topics_and_selected_payload_through_async_delivery(cx: &mut TestAppContext) {
+    use crate::mqtt::BrokerEvent;
+
+    let (handle, view) = open(cx, false, 1200., 760.);
+    let (sender, events) = tokio::sync::mpsc::channel(4);
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.status = ConnectionStatus::Connecting;
+            view.select_topic("home/a", window, cx);
+            view.listen_for_events(events, window, cx);
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update(|cx| {
+        assert!(view.read(cx).status.is_connecting());
+        assert_eq!(view.read(cx).payload.read(cx).value().as_str(), "42");
+        assert!(!view.read(cx).topics.nodes.contains_key("home/pushed"));
+    });
+
+    let mut update = message("home/a");
+    update.payload = Bytes::from_static(b"delivered asynchronously");
+    assert!(sender.try_send(BrokerEvent::Connected).is_ok());
+    assert!(sender.try_send(BrokerEvent::Message(update)).is_ok());
+    assert!(sender.try_send(BrokerEvent::Message(message("home/pushed"))).is_ok());
+    cx.run_until_parked();
+
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        let view = view.read(cx);
+        assert!(view.status.is_connected());
+        assert_eq!(window.find("connection-indicator").label(), Some("Connected"));
+        assert_eq!(
+            view.topics.nodes["home/a"].value.as_ref().unwrap().payload.as_ref(),
+            b"delivered asynchronously"
+        );
+        assert_eq!(view.payload.read(cx).value().as_str(), "delivered asynchronously");
+        assert!(view.topics.nodes.contains_key("home/pushed"));
+        assert!(view.tree_state.read(cx).index_of(&"home/pushed".into()).is_some());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn broker_event_channel_closure_fails_pending_publish_and_retains_connection_status_context(cx: &mut TestAppContext) {
+    use crate::mqtt::BrokerEvent;
+
+    let (handle, view) = open(cx, false, 1200., 760.);
+    let (sender, events) = tokio::sync::mpsc::channel(1);
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |view, cx| view.listen_for_events(events, window, cx));
+    })
+    .unwrap();
+    assert!(sender.try_send(BrokerEvent::Status("Broker unavailable".into())).is_ok());
+    cx.run_until_parked();
+    view.update(cx, |view, _| {
+        assert_eq!(view.status.label(), "Broker unavailable");
+        view.publish_pending = true;
+        view.publish_feedback = None;
+    });
+
+    drop(sender);
+    cx.run_until_parked();
+
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        let view = view.read(cx);
+        assert!(view.connection.is_none());
+        assert!(!view.publish_pending);
+        assert_eq!(
+            view.publish_feedback.as_ref().unwrap().as_deref().map_err(String::as_str),
+            Err("Connection stopped before the message could be queued. Reconnect and try again.")
+        );
+        assert!(matches!(&view.status, ConnectionStatus::Failed(status) if status == "Connection stopped · Broker unavailable"));
+        assert_eq!(
+            window.find("connection-indicator").label(),
+            Some("Connection stopped · Broker unavailable")
+        );
+        assert!(window.find("connection-error").visible());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn replacing_broker_event_listener_cancels_old_channel_and_ignores_queued_events(cx: &mut TestAppContext) {
+    use crate::mqtt::BrokerEvent;
+
+    let (handle, view) = open(cx, false, 1200., 760.);
+    let (old_sender, old_events) = tokio::sync::mpsc::channel(2);
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |view, cx| view.listen_for_events(old_events, window, cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert!(old_sender.try_send(BrokerEvent::Status("Stale connection failure".into())).is_ok());
+    assert!(old_sender.try_send(BrokerEvent::Message(message("home/stale"))).is_ok());
+
+    let (sender, events) = tokio::sync::mpsc::channel(2);
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.status = ConnectionStatus::Connecting;
+            view.listen_for_events(events, window, cx);
+        });
+    })
+    .unwrap();
+    assert!(sender.try_send(BrokerEvent::Connected).is_ok());
+    assert!(sender.try_send(BrokerEvent::Message(message("home/current"))).is_ok());
+    cx.run_until_parked();
+    assert!(old_sender.is_closed());
+    drop(old_sender);
+    cx.run_until_parked();
+
+    cx.update(|cx| {
+        let view = view.read(cx);
+        assert!(view.status.is_connected());
+        assert!(!view.topics.nodes.contains_key("home/stale"));
+        assert!(view.topics.nodes.contains_key("home/current"));
+        assert!(view.error.is_none());
+    });
+}
+
+#[gpui_kit::test]
 fn connection_failures_use_alerts_and_the_status_bar_is_removed(cx: &mut TestAppContext) {
     for font_size in [16., 20.] {
         let (handle, view) = open(cx, false, 760., 540.);
@@ -3078,7 +3200,7 @@ fn reduced_motion_clears_payload_highlights_and_keeps_updates_visible(cx: &mut T
         });
         assert!(!view.read(cx).payload_highlight.ranges(cx).is_empty());
         cx.set_reduce_motion(true);
-        view.update(cx, |view, cx| view.poll(window, cx));
+        view.update(cx, |view, cx| view.refresh_animation(window, cx));
         assert!(view.read(cx).payload_highlight.ranges(cx).is_empty());
         view.update(cx, |view, cx| receive_payload(view, "home/a", r#"{"reading":3}"#, window, cx));
         window.render_frame(cx);
@@ -3284,6 +3406,9 @@ fn click_topic_deletion_button(cx: &mut TestAppContext, handle: AnyWindowHandle,
 
 #[gpui_kit::test]
 fn topic_deletion_requires_confirmation_and_broker_updates_remove_it_in_both_clients(cx: &mut TestAppContext) {
+    // Broker events wake the GPUI executor from the real MQTT worker thread.
+    cx.executor().allow_parking();
+
     use std::{
         io::{Read, Write},
         net::{TcpListener, TcpStream},
@@ -3348,10 +3473,11 @@ fn topic_deletion_requires_confirmation_and_broker_updates_remove_it_in_both_cli
             ..Default::default()
         })
         .unwrap();
+        let mut events = connection.take_events().unwrap();
         runtime.block_on(async {
             tokio::time::timeout(Duration::from_secs(5), async {
                 loop {
-                    match connection.events.recv().await.unwrap() {
+                    match events.recv().await.unwrap() {
                         crate::mqtt::BrokerEvent::Connected => break,
                         crate::mqtt::BrokerEvent::Status(error) => panic!("test broker failed: {error}"),
                         _ => {}
@@ -3361,23 +3487,26 @@ fn topic_deletion_requires_confirmation_and_broker_updates_remove_it_in_both_cli
             .await
             .unwrap();
         });
-        connections.push(connection);
+        connections.push((connection, events));
     }
+    let (connection, events) = connections.pop().unwrap();
     let (observer_handle, observer) = open(cx, false, 1200., 760.);
     cx.update_window(observer_handle, |_, window, cx| {
         observer.update(cx, |view, cx| {
-            view.connection = connections.pop();
+            view.connection = Some(connection);
+            view.listen_for_events(events, window, cx);
             view.topics.receive(message("outside/a"), std::time::Instant::now());
             view.expanded.insert("outside".into());
             view.select_topic("home/a", window, cx);
         });
     })
     .unwrap();
-    let connection = connections.pop().unwrap();
+    let (connection, events) = connections.pop().unwrap();
     let (handle, view) = open(cx, false, 1200., 760.);
     cx.update_window(handle, |_, window, cx| {
         view.update(cx, |view, cx| {
             view.connection = Some(connection);
+            view.listen_for_events(events, window, cx);
             view.topics.receive(message("outside/a"), std::time::Instant::now());
             view.expanded.insert("outside".into());
             view.select_topic("home", window, cx);
@@ -3407,11 +3536,11 @@ fn topic_deletion_requires_confirmation_and_broker_updates_remove_it_in_both_cli
         }
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
+            cx.run_until_parked();
             let mut ready = true;
             for (handle, view) in &clients {
                 ready &= cx
                     .update_window(*handle, |_, window, cx| {
-                        view.update(cx, |view, cx| view.poll(window, cx));
                         window.render_frame(cx);
                         view.read(cx).topics.nodes.contains_key("home") == recreated
                     })
@@ -3810,9 +3939,14 @@ fn metadata_tags_leave_room_for_json_at_minimum_size_in_both_themes(cx: &mut Tes
         cx.update_window(handle, |_, window, cx| {
             window.render_frame(cx);
             let metadata = window.find("topic-metadata");
+            let received_age = window.find("received-age");
             let payload = window.find("payload");
             assert!(metadata.visible());
             assert!(metadata.bounds().bottom() <= payload.bounds().top());
+            assert!(received_age.visible());
+            assert!(received_age.bounds().size.width > px(0.));
+            assert!(received_age.bounds().right() <= window.find("details-pane").bounds().right());
+            assert!(received_age.bounds().bottom() <= payload.bounds().top());
             assert!(payload.visible());
             assert!(payload.bounds().size.height > px(0.));
             assert!(payload.bounds().bottom() <= window.find("details-pane").bounds().bottom());
@@ -3992,6 +4126,9 @@ fn topic_filter_shows_matching_paths_and_ancestors_then_restores_the_tree(cx: &m
 
 #[gpui_kit::test]
 fn publish_panel_queues_one_retained_qos_one_message_without_claiming_broker_acknowledgement(cx: &mut TestAppContext) {
+    // Broker events wake the GPUI executor from the real MQTT worker thread.
+    cx.executor().allow_parking();
+
     use std::{
         io::{ErrorKind, Read, Write},
         net::{TcpListener, TcpStream},
@@ -4035,24 +4172,28 @@ fn publish_panel_queues_one_retained_qos_one_message_without_claiming_broker_ack
         assert_eq!(stream.read(&mut [0]).unwrap(), 0);
     });
 
+    let mut connection = crate::mqtt::connect(ConnectionConfig {
+        host: "127.0.0.1".into(),
+        port,
+        ..Default::default()
+    })
+    .unwrap();
+    let events = connection.take_events().unwrap();
     let (handle, view) = open(cx, false, 1200., 760.);
-    view.update(cx, |view, cx| {
-        view.connection = Some(
-            crate::mqtt::connect(ConnectionConfig {
-                host: "127.0.0.1".into(),
-                port,
-                ..Default::default()
-            })
-            .unwrap(),
-        );
-        view.status = ConnectionStatus::Connecting;
-        cx.notify();
-    });
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.connection = Some(connection);
+            view.status = ConnectionStatus::Connecting;
+            view.listen_for_events(events, window, cx);
+            cx.notify();
+        });
+    })
+    .unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
+        cx.run_until_parked();
         let connected = cx
-            .update_window(handle, |_, window, cx| {
-                view.update(cx, |view, cx| view.poll(window, cx));
+            .update_window(handle, |_, _, cx| {
                 assert!(
                     !matches!(view.read(cx).status, ConnectionStatus::Failed(_)),
                     "test broker connection failed"
@@ -4112,11 +4253,9 @@ fn publish_panel_queues_one_retained_qos_one_message_without_claiming_broker_ack
 
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
+        cx.run_until_parked();
         let queued = cx
-            .update_window(handle, |_, window, cx| {
-                view.update(cx, |view, cx| view.poll(window, cx));
-                view.read(cx).publish_feedback.is_some()
-            })
+            .update_window(handle, |_, _, cx| view.read(cx).publish_feedback.is_some())
             .unwrap();
         if queued {
             break;

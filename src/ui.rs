@@ -108,6 +108,36 @@ fn topic_summary(topics: usize, messages: u64) -> String {
     )
 }
 
+fn relative_received_age(received_at: &chrono::DateTime<chrono::Local>) -> String {
+    let seconds = chrono::Local::now().signed_duration_since(received_at).num_seconds().max(0);
+    if seconds < 60 {
+        format!("{seconds} second{} ago", if seconds == 1 { "" } else { "s" })
+    } else if seconds < 60 * 60 {
+        let minutes = seconds / 60;
+        format!("{minutes} minute{} ago", if minutes == 1 { "" } else { "s" })
+    } else if seconds < 24 * 60 * 60 {
+        let hours = seconds / (60 * 60);
+        format!("{hours} hour{} ago", if hours == 1 { "" } else { "s" })
+    } else {
+        let days = seconds / (24 * 60 * 60);
+        format!("{days} day{} ago", if days == 1 { "" } else { "s" })
+    }
+}
+
+fn received_age_refresh_delay(received_at: &chrono::DateTime<chrono::Local>) -> Duration {
+    let elapsed = chrono::Local::now().signed_duration_since(received_at).num_milliseconds().max(0);
+    let interval = if elapsed < 60_000 {
+        1_000
+    } else if elapsed < 3_600_000 {
+        60_000
+    } else if elapsed < 86_400_000 {
+        3_600_000
+    } else {
+        86_400_000
+    };
+    Duration::from_millis((interval - elapsed % interval) as u64)
+}
+
 impl ConnectionStatus {
     fn label(&self) -> &str {
         match self {
@@ -180,7 +210,9 @@ pub struct Explorer {
     restore_focus: Option<FocusHandle>,
     settings_generation: u64,
     flash_until: Option<Instant>,
-    _poll: Task<()>,
+    event_task: Option<Task<()>>,
+    received_age_task: Option<Task<()>>,
+    animation_scheduled: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -367,14 +399,7 @@ impl Explorer {
                 view.persist_publish_split(state, window, cx);
             }),
         );
-        let poll = cx.spawn_in(window, async move |view, cx| {
-            loop {
-                cx.background_executor().timer(Duration::from_millis(50)).await;
-                if view.update_in(cx, |view, window, cx| view.poll(window, cx)).is_err() {
-                    break;
-                }
-            }
-        });
+
         let mut view = Self {
             name,
             host,
@@ -430,7 +455,9 @@ impl Explorer {
             restore_focus: None,
             settings_generation: 0,
             flash_until: None,
-            _poll: poll,
+            event_task: None,
+            received_age_task: None,
+            animation_scheduled: false,
             _subscriptions: subscriptions,
         };
         if let Some(config) = saved_config {
@@ -442,13 +469,17 @@ impl Explorer {
     }
 
     fn start_connection(&mut self, config: ConnectionConfig, window: &mut Window, cx: &mut Context<Self>) {
+        self.event_task = None;
         self.connection = None;
         self.publish_pending = false;
         self.publish_feedback = None;
         self.error = None;
         self.field_error = None;
         match mqtt::connect(config.clone()) {
-            Ok(connection) => {
+            Ok(mut connection) => {
+                if let Some(events) = connection.take_events() {
+                    self.listen_for_events(events, window, cx);
+                }
                 self.connection = Some(connection);
                 self.active_config = Some(config);
                 self.show_config = false;
@@ -475,25 +506,43 @@ impl Explorer {
         self.refresh_details(window, cx);
     }
 
-    fn poll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let now = Instant::now();
-        let mut ended = false;
-        let mut changed = false;
-        let mut tree_changed = false;
-        let mut payload_changed = false;
-        for _ in 0..1000 {
-            let Some(connection) = &mut self.connection else {
-                break;
-            };
-            let event = match connection.events.try_recv() {
-                Ok(event) => event,
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                    ended = true;
+    fn listen_for_events(&mut self, mut events: tokio::sync::mpsc::Receiver<BrokerEvent>, window: &mut Window, cx: &mut Context<Self>) {
+        self.event_task = Some(cx.spawn_in(window, async move |view, cx| {
+            let mut batch = Vec::new();
+            loop {
+                if events.recv_many(&mut batch, 1000).await == 0 {
+                    let _ = view.update_in(cx, |view, _, cx| view.connection_stopped(cx));
                     break;
                 }
-            };
-            changed = true;
+                if view
+                    .update_in(cx, |view, window, cx| view.apply_broker_events(batch.drain(..), window, cx))
+                    .is_err()
+                {
+                    break;
+                }
+                // Keep sustained bursts from monopolizing the UI executor.
+                tokio::task::yield_now().await;
+            }
+        }));
+    }
+
+    fn connection_stopped(&mut self, cx: &mut Context<Self>) {
+        if self.publish_pending {
+            self.publish_pending = false;
+            self.publish_feedback = Some(Err(
+                "Connection stopped before the message could be queued. Reconnect and try again.".into(),
+            ));
+        }
+        self.connection = None;
+        self.status = ConnectionStatus::Failed(format!("Connection stopped · {}", self.status.label()));
+        cx.notify();
+    }
+
+    fn apply_broker_events(&mut self, events: impl IntoIterator<Item = BrokerEvent>, window: &mut Window, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        let mut tree_changed = false;
+        let mut payload_changed = false;
+        for event in events {
             match event {
                 BrokerEvent::Connecting => self.status = ConnectionStatus::Connecting,
                 BrokerEvent::Connected => {
@@ -519,17 +568,7 @@ impl Explorer {
                 }
             }
         }
-        if ended {
-            if self.publish_pending {
-                self.publish_pending = false;
-                self.publish_feedback = Some(Err(
-                    "Connection stopped before the message could be queued. Reconnect and try again.".into(),
-                ));
-            }
-            self.connection = None;
-            self.status = ConnectionStatus::Failed(format!("Connection stopped · {}", self.status.label()));
-            changed = true;
-        }
+
         if tree_changed {
             self.expanded.retain(|path| self.topics.nodes.contains_key(path));
             if self.selected.as_ref().is_some_and(|path| !self.topics.nodes.contains_key(path)) {
@@ -541,16 +580,53 @@ impl Explorer {
         if payload_changed {
             self.refresh_details(window, cx);
         }
-        self.payload_highlight.refresh(now, cx);
-        if let Some(deadline) = self.flash_until {
-            changed = true;
-            if now >= deadline || cx.reduce_motion() {
-                self.flash_until = None;
+        self.schedule_animation(window, cx);
+        cx.notify();
+    }
+
+    fn schedule_received_age(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.received_age_task = None;
+        let Some(received_at) = self
+            .selected
+            .as_ref()
+            .and_then(|path| self.topics.nodes.get(path))
+            .and_then(|node| node.value.as_ref())
+            .map(|value| value.received_at)
+        else {
+            return;
+        };
+        self.received_age_task = Some(cx.spawn_in(window, async move |view, cx| {
+            loop {
+                cx.background_executor().timer(received_age_refresh_delay(&received_at)).await;
+                if view.update_in(cx, |_, _, cx| cx.notify()).is_err() {
+                    break;
+                }
             }
+        }));
+    }
+
+    fn schedule_animation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.animation_scheduled || (self.flash_until.is_none() && !self.payload_highlight.is_active()) {
+            return;
         }
-        if changed {
-            cx.notify();
+        self.animation_scheduled = true;
+        let view = cx.weak_entity();
+        window.on_next_frame(move |window, cx| {
+            let _ = view.update(cx, |view, cx| {
+                view.animation_scheduled = false;
+                view.refresh_animation(window, cx);
+            });
+        });
+    }
+
+    fn refresh_animation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        self.payload_highlight.refresh(now, cx);
+        if self.flash_until.is_some_and(|deadline| now >= deadline || cx.reduce_motion()) {
+            self.flash_until = None;
         }
+        cx.notify();
+        self.schedule_animation(window, cx);
     }
 
     fn filtered_topic_paths(&self, filter: &str) -> BTreeSet<String> {
@@ -1241,9 +1317,22 @@ impl Explorer {
                         )
                         .child(
                             div()
+                                .h_flex()
+                                .gap_2()
+                                .flex_wrap()
                                 .text_xs()
                                 .text_color(cx.theme().muted_foreground)
-                                .child(format!("Received {}", value.received_at.format("%Y-%m-%d %H:%M:%S%.3f"))),
+                                .child(format!("Received {}", value.received_at.format("%Y-%m-%d %H:%M:%S%.3f")))
+                                .child(
+                                    div().id("received-age").test_support().flex_none().child(
+                                        Tag::secondary()
+                                            .small()
+                                            .outline()
+                                            .rounded(cx.theme().radius_full())
+                                            .text_xs()
+                                            .child(relative_received_age(&value.received_at)),
+                                    ),
+                                ),
                         ),
                 )
                 .child(

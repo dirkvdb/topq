@@ -27,9 +27,9 @@ pub enum BrokerEvent {
     Message(Message),
 }
 
-/// Receives broker events and cancels the MQTT worker when dropped.
+/// Queues broker commands and cancels the MQTT worker when dropped.
 pub struct Connection {
-    pub events: mpsc::Receiver<BrokerEvent>,
+    events: Option<mpsc::Receiver<BrokerEvent>>,
     stop: Option<oneshot::Sender<()>>,
     commands: mpsc::Sender<Command>,
 }
@@ -115,6 +115,13 @@ fn ensure_valid_topic(topic: &str) -> Result<()> {
 }
 
 impl Connection {
+    /// Transfers sole ownership of the broker event receiver to the caller.
+    /// Returns `None` after the receiver has been taken once. Taking the receiver
+    /// leaves this command handle alive; dropping `Connection` still cancels the worker.
+    pub fn take_events(&mut self) -> Option<mpsc::Receiver<BrokerEvent>> {
+        self.events.take()
+    }
+
     /// Queues a publish to an exact MQTT topic.
     /// Invalid topics and full/closed queues fail immediately. `Ok(())` means
     /// accepted into the command queue, not delivered. The worker reports
@@ -187,7 +194,7 @@ pub fn connect(config: ConnectionConfig) -> Result<Connection> {
         })
         .context("Could not start the MQTT worker thread.")?;
     Ok(Connection {
-        events,
+        events: Some(events),
         stop: Some(stop),
         commands,
     })
@@ -519,7 +526,13 @@ mod tests {
         runtime.block_on(async {
             tokio::time::timeout(Duration::from_secs(5), async {
                 loop {
-                    let event = connection.events.recv().await.expect("MQTT worker stopped");
+                    let event = connection
+                        .events
+                        .as_mut()
+                        .expect("broker event receiver has been taken")
+                        .recv()
+                        .await
+                        .expect("MQTT worker stopped");
                     if predicate(&event) {
                         return event;
                     }
@@ -884,13 +897,32 @@ mod tests {
         let (stop, stopped) = oneshot::channel();
         (
             Connection {
-                events,
+                events: Some(events),
                 stop: Some(stop),
                 commands,
             },
             receiver,
             stopped,
         )
+    }
+
+    #[test]
+    fn take_events_transfers_the_receiver_only_once() {
+        let (mut connection, _, _) = command_connection();
+        let _events = connection.take_events().expect("broker event receiver must be available");
+        assert!(connection.take_events().is_none());
+    }
+
+    #[test]
+    fn taking_events_preserves_commands_and_drop_cancellation() {
+        let (mut connection, mut commands, mut stopped) = command_connection();
+        let _events = connection.take_events().expect("broker event receiver must be available");
+        assert_eq!(stopped.try_recv(), Err(oneshot::error::TryRecvError::Empty));
+        connection.publish("test/value".into(), Vec::new(), Qos::AtMostOnce, false).unwrap();
+        assert!(matches!(commands.try_recv(), Ok(Command::Publish(_))));
+        drop(connection);
+        assert_eq!(stopped.try_recv(), Ok(()));
+        assert!(matches!(commands.try_recv(), Err(mpsc::error::TryRecvError::Disconnected)));
     }
 
     #[test]
@@ -1079,7 +1111,10 @@ mod tests {
             }
             _ => panic!("expected the shutdown barrier, not a publish acknowledgement or error"),
         }
-        assert!(matches!(connection.events.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+        assert!(matches!(
+            connection.events.as_mut().unwrap().try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
         drop(connection);
         broker.join().unwrap();
     }
@@ -1271,7 +1306,10 @@ mod tests {
         connection.delete_topics(topics).unwrap();
         received.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(
-            matches!(connection.events.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            matches!(
+                connection.events.as_mut().unwrap().try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ),
             "QoS 0 must not generate a success acknowledgement"
         );
         drop(connection);

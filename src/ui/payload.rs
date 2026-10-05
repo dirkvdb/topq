@@ -64,6 +64,10 @@ impl PayloadHighlight {
         );
     }
 
+    pub(super) fn is_active(&self) -> bool {
+        self.pulse.is_some()
+    }
+
     #[cfg(test)]
     pub(super) fn ranges(&self, cx: &App) -> Vec<Range<usize>> {
         self.collection.get_ranges(cx)
@@ -117,5 +121,7 @@ impl Explorer {
         } else if cx.reduce_motion() {
             self.payload_highlight.clear(cx);
         }
+        self.schedule_received_age(window, cx);
+        self.schedule_animation(window, cx);
     }
 }

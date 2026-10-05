@@ -407,6 +407,7 @@ impl Explorer {
             return;
         }
         if self.saved_connections.selected == Some(index) {
+            self.event_task = None;
             self.connection = None;
             self.active_config = None;
             self.status = ConnectionStatus::Disconnected;
