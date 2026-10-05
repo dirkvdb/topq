@@ -966,7 +966,12 @@ mod tests {
     fn commands_queued_during_reconnect_delay_report_errors_without_replaying() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        let broker = std::thread::spawn(move || drop(handshake(&listener, 0)));
+        let (disconnect, disconnected) = std::sync::mpsc::channel();
+        let broker = std::thread::spawn(move || {
+            let stream = handshake(&listener, 0);
+            disconnected.recv().unwrap();
+            drop(stream);
+        });
         let runtime = runtime();
         let mut connection = connect(ConnectionConfig {
             host: "127.0.0.1".into(),
@@ -975,6 +980,7 @@ mod tests {
         })
         .unwrap();
         next_matching_event(&runtime, &mut connection, |event| matches!(event, BrokerEvent::Connected));
+        disconnect.send(()).unwrap();
         next_matching_event(&runtime, &mut connection, |event| matches!(event, BrokerEvent::Status(_)));
         for _ in 0..2 {
             connection.publish("test/value".into(), Vec::new(), Qos::AtMostOnce, false).unwrap();
