@@ -10,6 +10,7 @@ use gpui_kit::base::{
 };
 use gpui_kit::component::{
     ActiveTheme, Disableable, IconName, Sizable, StyledExt,
+    alert::Alert,
     button::{Button, ButtonVariants},
     checkbox::Checkbox,
     collapsible::Collapsible,
@@ -313,12 +314,8 @@ impl Explorer {
                                         .child("Connect to a broker to publish."),
                                 )
                             })
-                            .when_some(self.publish_feedback.as_ref(), |form, feedback| {
-                                let (message, color) = match feedback {
-                                    Ok(message) => (message, cx.theme().muted_foreground),
-                                    Err(message) => (message, cx.theme().danger),
-                                };
-                                form.child(
+                            .when_some(self.publish_feedback.as_ref(), |form, feedback| match feedback {
+                                Ok(message) => form.child(
                                     div()
                                         .id("publish-feedback")
                                         .test_support()
@@ -326,9 +323,15 @@ impl Explorer {
                                         .aria_label(message.clone())
                                         .flex_none()
                                         .text_xs()
-                                        .text_color(color)
+                                        .text_color(cx.theme().muted_foreground)
                                         .child(message.clone()),
-                                )
+                                ),
+                                Err(message) => form.child(
+                                    div()
+                                        .id("publish-feedback")
+                                        .test_support()
+                                        .child(Alert::error("publish-feedback-content", message.clone()).banner()),
+                                ),
                             }),
                     ),
             )

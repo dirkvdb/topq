@@ -333,9 +333,10 @@ fn publish_is_disabled_offline_and_shortcut_reports_error_without_losing_draft(c
     cx.run_until_parked();
     cx.update_window(handle, |_, window, cx| {
         window.render_frame(cx);
+        assert!(window.find("publish-feedback").visible());
         assert_eq!(
-            window.find("publish-feedback").label(),
-            Some("Connect to a broker before publishing.")
+            view.read(cx).publish_feedback.as_ref().unwrap().as_deref().map_err(String::as_str),
+            Err("Connect to a broker before publishing.")
         );
         assert_eq!(window.find("publish-topic").value(), Some("home/command"));
         assert!(!view.read(cx).publish_pending);
@@ -371,7 +372,6 @@ fn assert_publish_resize_layout(window: &mut Window, cx: &mut App) {
         "panel {panel:?}, pane {pane:?}, rem {:?}",
         window.rem_size()
     );
-    assert!(panel.bottom() <= window.find("status").bounds().top());
     for id in [
         "toggle-publish",
         "publish-topic",
@@ -1008,7 +1008,7 @@ fn message(topic: &str) -> Message {
 }
 
 #[gpui_kit::test]
-fn status_bar_stays_compact_across_connection_states_and_text_sizes(cx: &mut TestAppContext) {
+fn connection_failures_use_alerts_and_the_status_bar_is_removed(cx: &mut TestAppContext) {
     for font_size in [16., 20.] {
         let (handle, view) = open(cx, false, 760., 540.);
         cx.update(|cx| Theme::update(cx, |theme| theme.font_size = px(font_size)));
@@ -1018,25 +1018,43 @@ fn status_bar_stays_compact_across_connection_states_and_text_sizes(cx: &mut Tes
             ConnectionStatus::Connected,
             ConnectionStatus::Failed("Could not connect to broker".into()),
         ] {
+            let failed = matches!(status, ConnectionStatus::Failed(_));
             view.update(cx, |view, cx| {
                 view.status = status;
                 cx.notify();
             });
             cx.update_window(handle, |_, window, cx| {
                 window.render_frame(cx);
-                let bar = window.find("status");
-                assert!(bar.visible());
-                assert_eq!(bar.label(), Some(view.read(cx).status.label()));
-                let height = bar.bounds().size.height;
-                let compact_height = window.rem_size() * 1.5;
-                assert!(
-                    height >= compact_height && height <= compact_height + px(1.),
-                    "status bar should retain its compact height: {height:?}"
-                );
+                assert!(window.try_find("status").is_none());
+                assert_eq!(window.try_find("connection-error").is_some(), failed);
+                let picker = window.find("connection-picker").bounds();
+                let indicator = window.find("connection-indicator");
+                let settings = window.find("settings").bounds();
+                assert!(indicator.visible());
+                assert_eq!(indicator.label(), Some(view.read(cx).status.label()));
+                assert!(indicator.bounds().left() >= picker.right());
+                assert!(indicator.bounds().right() <= settings.left());
             })
             .unwrap();
         }
     }
+}
+
+#[gpui_kit::test]
+fn application_errors_are_shown_in_alerts(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, false, 900., 640.);
+    view.update(cx, |view, cx| {
+        view.error = Some("Could not save the application state.".into());
+        cx.notify();
+    });
+    cx.update_window(handle, |_, window, cx| {
+        assert!(view.read(cx).error.is_some());
+        window.render_frame(cx);
+        let alert = window.find("application-error");
+        assert!(alert.visible());
+        assert_eq!(view.read(cx).error.as_deref(), Some("Could not save the application state."));
+    })
+    .unwrap();
 }
 
 #[gpui_kit::test]
@@ -2879,7 +2897,7 @@ fn pane_headings_align_in_both_themes_at_minimum_size_and_larger_text(cx: &mut T
                 assert_eq!(topics.top(), details.top());
                 assert_eq!(topics.size.height, details.size.height);
                 assert!(window.find("copy-topic").visible());
-                assert!(window.find("status").visible());
+                assert!(window.try_find("status").is_none());
             })
             .unwrap();
         }
@@ -3135,7 +3153,7 @@ fn long_topic_and_payload_remain_usable_at_minimum_size_with_large_text(cx: &mut
         let payload = window.find("payload");
         assert!(payload.visible());
         assert!(payload.bounds().size.height > px(0.));
-        assert!(payload.bounds().bottom() <= window.find("status").bounds().top());
+        assert!(payload.bounds().bottom() <= window.find("details-pane").bounds().bottom());
         assert_eq!(window.find("copy-topic").label(), Some("Copy topic name"));
         assert_eq!(window.find("copy-value").label(), Some("Copy latest value"));
     })
@@ -3797,7 +3815,7 @@ fn metadata_tags_leave_room_for_json_at_minimum_size_in_both_themes(cx: &mut Tes
             assert!(metadata.bounds().bottom() <= payload.bounds().top());
             assert!(payload.visible());
             assert!(payload.bounds().size.height > px(0.));
-            assert!(payload.bounds().bottom() <= window.find("status").bounds().top());
+            assert!(payload.bounds().bottom() <= window.find("details-pane").bounds().bottom());
         })
         .unwrap();
     }

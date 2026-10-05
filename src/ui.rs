@@ -10,6 +10,7 @@ use std::{
 use gpui_kit::assets::IconName as AssetIconName;
 use gpui_kit::component::{
     ActiveTheme, Disableable, Icon, IconName, IndexPath, Sizable, StyledExt, TitleBar, WindowExt,
+    alert::Alert,
     button::{Button, ButtonVariant, ButtonVariants},
     input::{Editor, EditorState, Input, InputEvent, InputState},
     list::ListItem,
@@ -19,6 +20,7 @@ use gpui_kit::component::{
     select::{SelectEvent, SelectState},
     spinner::Spinner,
     tag::Tag,
+    tooltip::Tooltip,
     tree::{Tree, TreeEntry, TreeEvent, TreeItem, TreeState},
 };
 use gpui_kit::{
@@ -828,6 +830,66 @@ impl Explorer {
             })
     }
 
+    fn connection_indicator(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let label = self.status.label().to_owned();
+        let tooltip_label = label.clone();
+        div()
+            .id("connection-indicator")
+            .test_support()
+            .role(Role::Status)
+            .aria_label(label)
+            .tooltip(move |window, cx| Tooltip::new(tooltip_label.clone()).build(window, cx))
+            .h_flex()
+            .flex_none()
+            .when(self.status.is_connecting(), |indicator| indicator.child(Spinner::new().small()))
+            .when(!self.status.is_connecting(), |indicator| {
+                indicator.child(
+                    div()
+                        .size_1p5()
+                        .flex_none()
+                        .rounded(cx.theme().radius_full())
+                        .bg(if self.status.is_connected() {
+                            cx.theme().success
+                        } else if matches!(&self.status, ConnectionStatus::Failed(_)) {
+                            cx.theme().danger
+                        } else {
+                            cx.theme().muted_foreground
+                        }),
+                )
+            })
+    }
+
+    fn error_alerts(&self) -> impl IntoElement {
+        let error = self.error.clone();
+        let connection_error = match &self.status {
+            ConnectionStatus::Failed(message) => Some(message.clone()),
+            ConnectionStatus::Disconnected | ConnectionStatus::Connecting | ConnectionStatus::Connected => None,
+        };
+
+        let mut alerts = div().id("error-alerts").test_support().v_flex().flex_none().gap_2();
+        if let Some(message) = error {
+            alerts = alerts.child(
+                div()
+                    .id("application-error")
+                    .test_support()
+                    .px_4()
+                    .pt_2()
+                    .child(Alert::error("application-error-content", message).banner()),
+            );
+        }
+        if let Some(message) = connection_error {
+            alerts = alerts.child(
+                div()
+                    .id("connection-error")
+                    .test_support()
+                    .px_4()
+                    .pt_2()
+                    .child(Alert::error("connection-error-content", message).banner()),
+            );
+        }
+        alerts
+    }
+
     fn header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let broker = self
             .saved_connections
@@ -847,6 +909,7 @@ impl Explorer {
                 .min_w_0()
                 .child(div().flex_1())
                 .child(self.connection_menu(broker, cx))
+                .child(self.connection_indicator(cx))
                 .child(
                     Button::new("settings")
                         .small()
@@ -1239,12 +1302,12 @@ impl Explorer {
         // The resize API takes resolved pixels; derive all pane constraints from rem.
         let rem = window.rem_size();
         let width = self.topics_width_rem.unwrap_or(24.).clamp(15., 50.);
-        let status = self.error.as_deref().unwrap_or_else(|| self.status.label()).to_owned();
         div()
             .v_flex()
             .size_full()
             .min_w_0()
             .child(self.header(cx))
+            .when(!self.show_config, |content| content.child(self.error_alerts()))
             .child(
                 div().flex_1().min_h_0().min_w_0().child(
                     h_resizable("panes")
@@ -1261,39 +1324,6 @@ impl Explorer {
                                 .child(self.details(cx)),
                         ),
                 ),
-            )
-            .child(
-                div()
-                    .id("status")
-                    .test_support()
-                    .role(Role::Status)
-                    .aria_label(status.clone())
-                    .h_flex()
-                    .flex_none()
-                    .min_h_6()
-                    .px_4()
-                    .py_0p5()
-                    .gap_3()
-                    .text_xs()
-                    .min_w_0()
-                    .border_t_1()
-                    .border_color(cx.theme().border)
-                    .when(self.status.is_connecting(), |bar| bar.child(Spinner::new().small()))
-                    .when(!self.status.is_connecting(), |bar| {
-                        bar.child(
-                            div()
-                                .size_1p5()
-                                .flex_none()
-                                .rounded(cx.theme().radius_full())
-                                .bg(if self.status.is_connected() {
-                                    cx.theme().success
-                                } else {
-                                    cx.theme().muted_foreground
-                                }),
-                        )
-                    })
-                    .child(div().flex_1().min_w_0().child(status))
-                    .child(div().flex_none().child(topic_summary(self.topics.topics, self.topics.messages))),
             )
     }
 }
