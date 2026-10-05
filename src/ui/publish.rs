@@ -217,6 +217,9 @@ impl Explorer {
                                 .on_click(cx.listener(|view, _, _, cx| {
                                     view.publish_open = !view.publish_open;
                                     view.restore_publish_height = view.publish_open;
+                                    if let Err(error) = config::save_publish_open(view.publish_open) {
+                                        view.error = Some(format!("Could not save the pane layout: {error:#}"));
+                                    }
                                     cx.notify();
                                 })),
                         ),

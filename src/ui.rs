@@ -240,6 +240,7 @@ impl Explorer {
         let layout = config::load_topics_layout().unwrap_or_default();
         let publish_layout = config::load_publish_layout().unwrap_or_default();
         let mut view = Self::with_connections(saved_connections, error, layout.width_rem, layout.width_fraction, window, cx);
+        view.publish_open = publish_layout.open;
         view.publish_height_rem = publish_layout.height_rem;
         view.publish_height_fraction = publish_layout.height_fraction;
         view.restore_publish_height = publish_layout.height_rem.is_some() || publish_layout.height_fraction.is_some();

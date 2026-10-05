@@ -363,6 +363,24 @@ fn publish_topic_tab_preserves_unicode_empty_levels_and_undo(cx: &mut TestAppCon
 }
 
 #[gpui_kit::test]
+fn publish_disclosure_restores_saved_state_in_new_explorers(cx: &mut TestAppContext) {
+    let (handle, _) = open(cx, false, 900., 640.);
+    cx.update_window(handle, |_, window, _| window.activate_window()).unwrap();
+    cx.run_until_parked();
+    for expected_open in [true, false] {
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("toggle-publish", cx);
+            let restored = cx.new(|cx| Explorer::new(window, cx));
+            assert_eq!(restored.read(cx).publish_open, expected_open);
+            assert_eq!(crate::config::load_publish_layout().unwrap().open, expected_open);
+        })
+        .unwrap();
+        cx.run_until_parked();
+    }
+}
+
+#[gpui_kit::test]
 fn publish_disclosure_preserves_draft_and_options_across_keyboard_and_pointer_toggles(cx: &mut TestAppContext) {
     let (handle, view) = open(cx, false, 900., 640.);
     cx.update_window(handle, |_, window, _| window.activate_window()).unwrap();

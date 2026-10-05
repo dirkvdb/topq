@@ -472,6 +472,7 @@ struct LayoutPreferences {
     topics_width_fraction: Option<f32>,
     publish_height_rem: Option<f32>,
     publish_height_fraction: Option<f32>,
+    publish_open: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -482,6 +483,7 @@ pub(crate) struct TopicsLayout {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct PublishLayout {
+    pub open: bool,
     pub height_rem: Option<f32>,
     pub height_fraction: Option<f32>,
 }
@@ -540,6 +542,7 @@ pub(crate) fn load_publish_layout() -> Result<PublishLayout> {
 fn load_publish_layout_from(path: &Path) -> Result<PublishLayout> {
     let preferences = load_layout_preferences_from(path)?;
     Ok(PublishLayout {
+        open: preferences.publish_open.unwrap_or_default(),
         height_rem: preferences.publish_height_rem.filter(|height| height.is_finite() && *height > 0.),
         height_fraction: preferences
             .publish_height_fraction
@@ -566,6 +569,16 @@ fn save_publish_height_to(path: &Path, height_rem: f32, fraction: f32) -> Result
     let mut preferences = load_layout_preferences_from(path)?;
     preferences.publish_height_rem = Some(height_rem);
     preferences.publish_height_fraction = Some(fraction);
+    write_toml(path, &preferences)
+}
+
+pub(crate) fn save_publish_open(open: bool) -> Result<()> {
+    save_publish_open_to(&state_path()?, open)
+}
+
+fn save_publish_open_to(path: &Path, open: bool) -> Result<()> {
+    let mut preferences = load_layout_preferences_from(path)?;
+    preferences.publish_open = Some(open);
     write_toml(path, &preferences)
 }
 
@@ -1022,11 +1035,42 @@ mod tests {
                 PublishLayout {
                     height_rem: Some(18.5),
                     height_fraction: Some(fraction),
+                    ..PublishLayout::default()
                 }
             );
         }
         let state = fs::read_to_string(path).unwrap();
         assert_eq!(state, "publish_height_rem = 18.5\npublish_height_fraction = 1.0\n");
+    }
+
+    #[test]
+    fn publish_open_roundtrips_without_losing_pane_sizes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("topq").join("state.toml");
+        save_topics_width_to(&path, 31.5, 0.4).unwrap();
+        save_publish_height_to(&path, 18.5, 0.25).unwrap();
+        assert!(!load_publish_layout_from(&path).unwrap().open);
+        for open in [true, false] {
+            save_publish_open_to(&path, open).unwrap();
+            assert_eq!(
+                load_publish_layout_from(&path).unwrap(),
+                PublishLayout {
+                    open,
+                    height_rem: Some(18.5),
+                    height_fraction: Some(0.25),
+                }
+            );
+            assert_eq!(
+                load_topics_layout_from(&path).unwrap(),
+                TopicsLayout {
+                    width_rem: Some(31.5),
+                    width_fraction: Some(0.4),
+                }
+            );
+            save_topics_width_to(&path, 31.5, 0.4).unwrap();
+            save_publish_height_to(&path, 18.5, 0.25).unwrap();
+            assert_eq!(load_publish_layout_from(&path).unwrap().open, open);
+        }
     }
 
     #[test]
@@ -1048,6 +1092,7 @@ mod tests {
             PublishLayout {
                 height_rem: Some(18.5),
                 height_fraction: Some(0.25),
+                ..PublishLayout::default()
             }
         );
         save_publish_height_to(&path, 20., 0.5).unwrap();
@@ -1063,6 +1108,7 @@ mod tests {
             PublishLayout {
                 height_rem: Some(20.),
                 height_fraction: Some(0.5),
+                ..PublishLayout::default()
             }
         );
     }
@@ -1117,6 +1163,7 @@ mod tests {
                     topics_width_fraction: Some(0.4),
                     publish_height_rem: Some(invalid),
                     publish_height_fraction: Some(0.25),
+                    ..LayoutPreferences::default()
                 },
             )
             .unwrap();
@@ -1132,6 +1179,7 @@ mod tests {
                 PublishLayout {
                     height_rem: None,
                     height_fraction: Some(0.25),
+                    ..PublishLayout::default()
                 }
             );
         }
@@ -1149,6 +1197,7 @@ mod tests {
                     topics_width_fraction: Some(invalid),
                     publish_height_rem: Some(18.5),
                     publish_height_fraction: Some(invalid),
+                    ..LayoutPreferences::default()
                 },
             )
             .unwrap();
@@ -1164,6 +1213,7 @@ mod tests {
                 PublishLayout {
                     height_rem: Some(18.5),
                     height_fraction: None,
+                    ..PublishLayout::default()
                 }
             );
         }
@@ -1179,6 +1229,8 @@ mod tests {
             assert_eq!(fs::read_to_string(&path).unwrap(), original);
             assert!(save_publish_height_to(&path, 18.5, 0.25).is_err());
             assert_eq!(fs::read_to_string(&path).unwrap(), original);
+            assert!(save_publish_open_to(&path, true).is_err());
+            assert_eq!(fs::read_to_string(&path).unwrap(), original);
             assert!(!path.with_extension("toml.tmp").exists());
         }
     }
@@ -1190,6 +1242,7 @@ mod tests {
         fs::create_dir(&path).unwrap();
         assert!(save_topics_width_to(&path, 31.5, 0.4).is_err());
         assert!(save_publish_height_to(&path, 18.5, 0.25).is_err());
+        assert!(save_publish_open_to(&path, true).is_err());
         assert!(path.is_dir());
         assert!(!path.with_extension("toml.tmp").exists());
     }
