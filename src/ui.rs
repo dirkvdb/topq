@@ -1126,6 +1126,7 @@ impl Explorer {
                     .h_10()
                     .flex_none()
                     .px_4()
+                    .pr_2()
                     .border_b_1()
                     .border_color(cx.theme().border)
                     .font_medium()
