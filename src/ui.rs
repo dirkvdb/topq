@@ -110,7 +110,9 @@ fn topic_summary(topics: usize, messages: u64) -> String {
 
 fn relative_received_age(received_at: &chrono::DateTime<chrono::Local>) -> String {
     let seconds = chrono::Local::now().signed_duration_since(received_at).num_seconds().max(0);
-    if seconds < 60 {
+    if seconds == 0 {
+        "just now".to_owned()
+    } else if seconds < 60 {
         format!("{seconds} second{} ago", if seconds == 1 { "" } else { "s" })
     } else if seconds < 60 * 60 {
         let minutes = seconds / 60;
