@@ -1347,6 +1347,15 @@ impl Explorer {
                         .flex_none()
                         .child(div().flex_1().font_medium().child("Latest value"))
                         .child(
+                            Button::new("edit-value")
+                                .ghost()
+                                .small()
+                                .icon(AssetIconName::SquarePen)
+                                .accessibility_label("Publish new value")
+                                .tooltip("Publish new value")
+                                .on_click(cx.listener(|view, _, window, cx| view.edit_topic_value(window, cx))),
+                        )
+                        .child(
                             Button::new("copy-value")
                                 .ghost()
                                 .small()

@@ -75,6 +75,35 @@ fn json_error_range(text: &str, error: &serde_json::Error) -> Range<usize> {
 }
 
 impl Explorer {
+    fn set_publish_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        if self.publish_open == open {
+            return;
+        }
+        self.publish_open = open;
+        self.restore_publish_height = open;
+        if let Err(error) = config::save_publish_open(open) {
+            self.error = Some(format!("Could not save the pane layout: {error:#}"));
+        }
+        cx.notify();
+    }
+
+    pub(super) fn edit_topic_value(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(topic) = self.selected.clone() else { return };
+        let Some(value) = self.topics.nodes.get(&topic).and_then(|node| node.value.as_ref()) else {
+            return;
+        };
+        let payload = value.display_payload();
+        self.set_publish_open(true, cx);
+        self.publish_topic.update(cx, |input, cx| input.set_value(topic, window, cx));
+        self.publish_payload.update(cx, |editor, cx| {
+            editor.set_value(payload, window, cx);
+            let end = editor.text().offset_to_position(editor.text().len());
+            editor.set_cursor_position(end, window, cx);
+        });
+        self.publish_feedback = None;
+        self.update_publish_content(cx);
+    }
+
     pub(super) fn update_publish_content(&mut self, cx: &mut Context<Self>) {
         let text = self.publish_payload.read(cx).value();
         self.publish_content = PayloadContent::detect(text.as_str());
@@ -215,12 +244,7 @@ impl Explorer {
                                 .accessibility_label(if self.publish_open { "Collapse publish" } else { "Expand publish" })
                                 .tooltip("Drag the top edge to resize (Ctrl+Alt+Up/Down)")
                                 .on_click(cx.listener(|view, _, _, cx| {
-                                    view.publish_open = !view.publish_open;
-                                    view.restore_publish_height = view.publish_open;
-                                    if let Err(error) = config::save_publish_open(view.publish_open) {
-                                        view.error = Some(format!("Could not save the pane layout: {error:#}"));
-                                    }
-                                    cx.notify();
+                                    view.set_publish_open(!view.publish_open, cx);
                                 })),
                         ),
                     )

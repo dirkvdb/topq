@@ -3623,6 +3623,94 @@ fn receive_payload(view: &mut Explorer, topic: &str, payload: &str, window: &mut
 }
 
 #[gpui_kit::test]
+fn edit_value_prefills_publish_draft_and_focuses_the_payload_end(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, false, 900., 640.);
+    cx.update_window(handle, |_, window, _| window.activate_window()).unwrap();
+    for (open, raw, expected) in [
+        (false, "first line\n温度 🌡", "first line\n温度 🌡"),
+        (true, "{\"value\":\"é\"}", "{\n  \"value\": \"é\"\n}"),
+    ] {
+        cx.update_window(handle, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                receive_payload(view, "home/a", raw, window, cx);
+                view.select_topic("home/a", window, cx);
+                view.publish_open = open;
+                view.publish_topic.update(cx, |input, cx| input.set_value("old/topic", window, cx));
+                view.publish_payload
+                    .update(cx, |editor, cx| editor.set_value("old draft", window, cx));
+                view.publish_retain = true;
+                view.publish_qos
+                    .update(cx, |select, cx| select.set_selected_value(&"1", window, cx));
+                view.publish_feedback = Some(Ok("Previous publish".into()));
+                cx.notify();
+            });
+            window.render_frame(cx);
+            assert_eq!(window.find("edit-value").label(), Some("Publish new value"));
+            window.click("edit-value", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("publish-form").visible());
+            assert_eq!(window.find("publish-topic").value(), Some("home/a"));
+            assert_publish_payload_detection(window, cx, &view, expected, None, expected.len());
+            assert!(view.read(cx).publish_retain);
+            assert_eq!(view.read(cx).publish_qos.read(cx).selected_value(), Some(&"1"));
+            assert!(crate::config::load_publish_layout().unwrap().open);
+            window.input("!", cx);
+            let editor = view.read(cx).publish_payload.read(cx);
+            assert_eq!(editor.value().as_str(), format!("{expected}!"));
+            assert_eq!(editor.selected_range(), expected.len() + 1..expected.len() + 1);
+            assert_eq!(
+                view.read(cx).topics.nodes["home/a"].value.as_ref().unwrap().payload.as_ref(),
+                raw.as_bytes()
+            );
+        })
+        .unwrap();
+        cx.run_until_parked();
+    }
+}
+
+#[gpui_kit::test]
+fn edit_value_supports_keyboard_activation_and_is_absent_without_a_topic_value(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, false, 900., 640.);
+    cx.update_window(handle, |_, window, cx| {
+        window.activate_window();
+        window.render_frame(cx);
+        assert!(window.try_find("edit-value").is_none());
+        view.update(cx, |view, cx| view.select_topic("home", window, cx));
+        window.render_frame(cx);
+        assert!(window.try_find("edit-value").is_none());
+        view.update(cx, |view, cx| view.select_topic("home/b", window, cx));
+        window.render_frame(cx);
+        window.click("payload", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    for _ in 0..2 {
+        cx.update_window(handle, |_, window, cx| window.press("shift-tab", cx)).unwrap();
+        cx.run_until_parked();
+    }
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("edit-value").focused(), Some(true));
+        window.press("enter", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("publish-topic").value(), Some("home/b"));
+        let raw = std::str::from_utf8(&view.read(cx).topics.nodes["home/b"].value.as_ref().unwrap().payload)
+            .unwrap()
+            .to_owned();
+        assert_publish_payload_detection(window, cx, &view, &raw, None, raw.len());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
 fn live_payload_updates_preserve_scrolled_viewport_and_focus(cx: &mut TestAppContext) {
     for mode in [ThemeMode::Light, ThemeMode::Dark] {
         let (handle, view) = open(cx, false, 1200., 760.);
