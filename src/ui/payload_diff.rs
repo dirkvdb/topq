@@ -15,6 +15,7 @@ use serde_json::Value;
 /// Added array elements and type changes highlight the entire new value.
 /// Removals have no current-text range. Invalid input (including an empty initial
 /// `previous` payload) produces no ranges.
+#[hotpath::measure]
 pub(super) fn changed_ranges(previous: &str, current: &str) -> Vec<Range<usize>> {
     let Ok(previous) = serde_json::from_str::<Value>(previous) else {
         return Vec::new();

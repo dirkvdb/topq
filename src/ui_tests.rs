@@ -1052,6 +1052,262 @@ fn broker_events_update_connection_topics_and_selected_payload_through_async_del
 }
 
 #[gpui_kit::test]
+fn topic_animation_reuses_the_details_publish_and_header_panes(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, false, 1200., 760.);
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |view, cx| view.select_topic("home/a", window, cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| window.draw(cx).clear(cx)).unwrap();
+    cx.run_until_parked();
+    // Let initial native title-bar and focus callbacks settle before measuring.
+    for _ in 0..2 {
+        cx.update_window(handle, |_, window, cx| window.simulate_next_frame(cx)).unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| window.draw(cx).clear(cx)).unwrap();
+        cx.run_until_parked();
+    }
+
+    let counts = |cx: &App| {
+        let view = view.read(cx);
+        [
+            view.topics_view.read(cx).render_count,
+            view.details_view.read(cx).render_count,
+            view.publish_view.read(cx).render_count,
+            view.header_view.read(cx).render_count,
+        ]
+    };
+    let before = cx.update(|cx| counts(cx));
+    for _ in 0..3 {
+        cx.update_window(handle, |_, window, cx| {
+            assert!(window.simulate_next_frame(cx) > 0);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        // render_frame forces a whole-window refresh and intentionally bypasses
+        // caches; use the normal draw path to test animation invalidation.
+        cx.update_window(handle, |_, window, cx| window.draw(cx).clear(cx)).unwrap();
+        cx.run_until_parked();
+    }
+    let after = cx.update(|cx| counts(cx));
+    assert!(after[0] > before[0], "the animated topic pane must repaint");
+    assert_eq!(after[1..], before[1..], "tree animation must not rebuild sibling panes");
+}
+
+#[gpui_kit::test]
+fn topic_animation_rebuilds_only_the_updated_row_and_its_ancestors(cx: &mut TestAppContext) {
+    use crate::mqtt::BrokerEvent;
+    use std::time::{Duration, Instant};
+
+    let (handle, view) = open(cx, false, 1200., 760.);
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            for node in view.topics.nodes.values_mut() {
+                node.updated = Some(Instant::now() - Duration::from_secs(1));
+            }
+            view.select_topic("home/a", window, cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    for _ in 0..3 {
+        cx.update_window(handle, |_, window, cx| window.simulate_next_frame(cx)).unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| window.draw(cx).clear(cx)).unwrap();
+        cx.run_until_parked();
+    }
+
+    let counts = |cx: &App| {
+        let explorer = view.read(cx);
+        let rows = explorer.topic_rows.borrow();
+        ["home", "home/a", "home/b"].map(|path| rows.get(path).unwrap().read(cx).render_count)
+    };
+    let before = cx.update(|cx| counts(cx));
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.apply_broker_events([BrokerEvent::Message(message("home/a"))], window, cx)
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| window.draw(cx).clear(cx)).unwrap();
+    cx.run_until_parked();
+    for _ in 0..3 {
+        cx.update_window(handle, |_, window, cx| assert!(window.simulate_next_frame(cx) > 0))
+            .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| window.draw(cx).clear(cx)).unwrap();
+        cx.run_until_parked();
+    }
+    let after = cx.update(|cx| counts(cx));
+    assert!(after[0] > before[0] + 2, "the updated ancestor must animate");
+    assert!(after[1] > before[1] + 2, "the updated leaf must animate");
+    assert_eq!(
+        after[2], before[2],
+        "an unchanged sibling must reuse its row layout and paint cache"
+    );
+
+    // Backdate the model rather than sleeping: the next requested frame must
+    // render the final color and stop requesting frames after the flash expires.
+    view.update(cx, |view, _| {
+        for node in view.topics.nodes.values_mut() {
+            node.updated = Some(Instant::now() - Duration::from_secs(1));
+        }
+    });
+    cx.update_window(handle, |_, window, cx| window.simulate_next_frame(cx)).unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| window.draw(cx).clear(cx)).unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| window.simulate_next_frame(cx)).unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| window.draw(cx).clear(cx)).unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| assert_eq!(window.simulate_next_frame(cx), 0))
+        .unwrap();
+}
+
+#[gpui_kit::test]
+fn broker_update_rebuilds_the_first_cached_row_without_animation(cx: &mut TestAppContext) {
+    use crate::mqtt::BrokerEvent;
+
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let (handle, view) = open(cx, false, 1200., 760.);
+    cx.update_window(handle, |_, window, cx| window.render_frame(cx)).unwrap();
+    cx.run_until_parked();
+    for _ in 0..3 {
+        cx.update_window(handle, |_, window, cx| window.simulate_next_frame(cx)).unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| window.draw(cx).clear(cx)).unwrap();
+        cx.run_until_parked();
+    }
+    let count = |cx: &App| view.read(cx).topic_rows.borrow().get("home").unwrap().read(cx).render_count;
+    let before = cx.update(|cx| count(cx));
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.apply_broker_events([BrokerEvent::Message(message("home"))], window, cx)
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| window.draw(cx).clear(cx)).unwrap();
+    cx.run_until_parked();
+    // Cached rows have a definite size, so list measurement does not invoke
+    // Render. This must be the visible row's rebuild on the first draw, not a
+    // discarded measurement or a later corrective animation frame.
+    assert_eq!(cx.update(|cx| count(cx)), before + 1);
+    cx.update_window(handle, |_, window, cx| assert_eq!(window.simulate_next_frame(cx), 0))
+        .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| window.draw(cx).clear(cx)).unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|cx| count(cx)),
+        before + 1,
+        "the row must settle without a render-notify loop"
+    );
+}
+
+#[gpui_kit::test]
+fn topic_row_views_are_virtualized_and_pruned_when_filtered_out(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, false, 1200., 760.);
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            for index in 0..400 {
+                view.topics
+                    .receive(message(&format!("home/sensor-{index:03}")), std::time::Instant::now());
+            }
+            view.select_topic("home/a", window, cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update(|cx| {
+        let explorer = view.read(cx);
+        assert!(
+            explorer.topic_rows.borrow().len() < explorer.topics.nodes.len() / 4,
+            "only visited rows should allocate a view"
+        );
+    });
+    cx.update_window(handle, |_, window, cx| {
+        window.click("topic-search", cx);
+        window.input("no matching topics", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| window.draw(cx).clear(cx)).unwrap();
+    cx.run_until_parked();
+    cx.update(|cx| assert!(view.read(cx).topic_rows.borrow().is_empty()));
+    cx.update_window(handle, |_, window, cx| window.simulate_next_frame(cx)).unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| window.draw(cx).clear(cx)).unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        assert_eq!(
+            window.simulate_next_frame(cx),
+            0,
+            "hidden rows must not keep the frame loop running"
+        )
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn broker_updates_invalidate_only_the_affected_cached_panes(cx: &mut TestAppContext) {
+    use crate::mqtt::BrokerEvent;
+
+    let (handle, view) = open(cx, false, 1200., 760.);
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |view, cx| view.select_topic("home/a", window, cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| window.draw(cx).clear(cx)).unwrap();
+    cx.run_until_parked();
+
+    let counts = |cx: &App| {
+        let view = view.read(cx);
+        [
+            view.topics_view.read(cx).render_count,
+            view.details_view.read(cx).render_count,
+            view.publish_view.read(cx).render_count,
+            view.header_view.read(cx).render_count,
+        ]
+    };
+    let before = cx.update(|cx| counts(cx));
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.apply_broker_events([BrokerEvent::Message(message("home/b"))], window, cx)
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| window.draw(cx).clear(cx)).unwrap();
+    cx.run_until_parked();
+    let after_unselected = cx.update(|cx| counts(cx));
+    assert!(after_unselected[0] > before[0]);
+    assert_eq!(after_unselected[1..], before[1..]);
+
+    cx.update_window(handle, |_, window, cx| {
+        let mut update = message("home/a");
+        update.payload = Bytes::from_static(b"updated selected payload");
+        view.update(cx, |view, cx| view.apply_broker_events([BrokerEvent::Message(update)], window, cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| window.draw(cx).clear(cx)).unwrap();
+    cx.run_until_parked();
+    let after_selected = cx.update(|cx| counts(cx));
+    assert!(after_selected[1] > after_unselected[1]);
+    assert_eq!(after_selected[2..], before[2..]);
+    cx.update(|cx| assert_eq!(view.read(cx).payload.read(cx).value().as_str(), "updated selected payload"));
+}
+
+#[gpui_kit::test]
 fn broker_event_channel_closure_fails_pending_publish_and_retains_connection_status_context(cx: &mut TestAppContext) {
     use crate::mqtt::BrokerEvent;
 
@@ -1653,7 +1909,7 @@ fn deleting_the_active_connection_clears_the_topic_tree_and_details(cx: &mut Tes
         view.update(cx, |view, cx| {
             view.expanded.insert("home".into());
             view.selected = Some("home/a".into());
-            view.flash_until = Some(std::time::Instant::now());
+
             view.sync_tree(cx);
             view.refresh_details(window, cx);
             assert_eq!(view.payload.read(cx).value().as_str(), "42");
@@ -1677,7 +1933,7 @@ fn deleting_the_active_connection_clears_the_topic_tree_and_details(cx: &mut Tes
         assert_eq!(view.topics.messages, 0);
         assert!(view.expanded.is_empty());
         assert!(view.selected.is_none());
-        assert!(view.flash_until.is_none());
+
         assert!(view.tree_state.read(cx).index_of(&"home".into()).is_none());
         assert!(view.tree_state.read(cx).selected_item().is_none());
         assert_eq!(view.payload.read(cx).value().as_str(), "");
@@ -3229,8 +3485,8 @@ fn reduced_motion_hides_update_flashes_without_losing_selection(cx: &mut TestApp
         assert!(window.find("topic:home").visible());
         assert!(window.try_find("update:home").is_none());
         let explorer = view.read(cx);
-        let entry = explorer.tree_state.read(cx).entry(0).unwrap();
-        let mut row = explorer.topic_row(entry, cx);
+        let rows = explorer.topic_rows.borrow();
+        let mut row = rows.get("home").unwrap().read(cx).item(explorer, cx);
         assert_ne!(row.style().text.color, Some(cx.theme().foreground));
     })
     .unwrap();
@@ -3238,8 +3494,8 @@ fn reduced_motion_hides_update_flashes_without_losing_selection(cx: &mut TestApp
     cx.update_window(handle, |_, window, cx| {
         window.render_frame(cx);
         let explorer = view.read(cx);
-        let entry = explorer.tree_state.read(cx).entry(0).unwrap();
-        let mut row = explorer.topic_row(entry, cx);
+        let rows = explorer.topic_rows.borrow();
+        let mut row = rows.get("home").unwrap().read(cx).item(explorer, cx);
         assert_eq!(row.style().text.color, Some(cx.theme().foreground));
         assert_eq!(window.find("selected-topic").label(), Some("home"));
     })

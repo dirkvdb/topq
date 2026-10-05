@@ -9,36 +9,42 @@ use std::{
 
 use gpui_kit::assets::IconName as AssetIconName;
 use gpui_kit::component::{
-    ActiveTheme, Disableable, Icon, IconName, IndexPath, Sizable, StyledExt, TitleBar, WindowExt,
+    ActiveTheme, Disableable, Icon, IconName, IndexPath, Sizable, StyledExt, TITLE_BAR_HEIGHT, TitleBar, WindowExt,
     alert::Alert,
     button::{Button, ButtonVariant, ButtonVariants},
     input::{Editor, EditorState, Input, InputEvent, InputState},
-    list::ListItem,
     marker::{Marker, MarkerContent},
     menu::{DropdownMenu, PopupMenuItem},
     resizable::{ResizablePanelEvent, ResizableState, h_resizable, resizable_panel, v_resizable},
+    scroll::ScrollableElement,
     select::{SelectEvent, SelectState},
     spinner::Spinner,
     tag::Tag,
     tooltip::Tooltip,
-    tree::{Tree, TreeEntry, TreeEvent, TreeItem, TreeState},
+    tree::{TreeEntry, TreeEvent, TreeItem, TreeState},
 };
 use gpui_kit::{
-    App, ClipboardItem, Context, Entity, FocusHandle, HighlightStyle, IntoElement, KeyBinding, MouseButton, Render, Role, ScrollStrategy,
-    SharedString, StyledText, Subscription, Task, TestSupportExt, Window, div, prelude::*, relative, rems,
+    App, ClipboardItem, Context, Entity, FocusHandle, HighlightStyle, IntoElement, KeyBinding, Render, Role, ScrollStrategy, SharedString,
+    StyleRefinement, StyledText, Subscription, Task, TestSupportExt, Window, div, prelude::*, relative, rems,
 };
 
 use crate::{
     appearance::{self, Appearance},
     config::{self, ConnectionConfig, ConnectionField, SavedConnections, TopicSubscription},
     mqtt::{self, BrokerEvent, Connection},
-    topics::{FLASH_DURATION, TopicStore},
+    topics::TopicStore,
 };
 
+mod explorer_pane;
 mod payload;
 mod payload_diff;
+
+use explorer_pane::{ExplorerPane, ExplorerPaneKind};
 mod publish;
 mod settings;
+mod topic_row;
+
+use topic_row::TopicRow;
 
 gpui_kit::actions!(
     mqtt_ui,
@@ -184,6 +190,11 @@ pub struct Explorer {
     connection_form_open: bool,
     topics: TopicStore,
     tree_state: Entity<TreeState>,
+    topic_rows: Rc<RefCell<BTreeMap<SharedString, Entity<TopicRow>>>>,
+    header_view: Entity<ExplorerPane>,
+    topics_view: Entity<ExplorerPane>,
+    details_view: Entity<ExplorerPane>,
+    publish_view: Entity<ExplorerPane>,
     expanded: BTreeSet<String>,
     selected: Option<String>,
     payload: Entity<EditorState>,
@@ -211,7 +222,6 @@ pub struct Explorer {
     focus: FocusHandle,
     restore_focus: Option<FocusHandle>,
     settings_generation: u64,
-    flash_until: Option<Instant>,
     event_task: Option<Task<()>>,
     received_age_task: Option<Task<()>>,
     animation_scheduled: bool,
@@ -308,6 +318,11 @@ impl Explorer {
                 .folding(false)
         });
         let publish_qos = cx.new(|cx| SelectState::new(vec!["0", "1", "2"], Some(IndexPath::default()), window, cx));
+        let explorer = cx.entity();
+        let header_view = cx.new(|cx| ExplorerPane::new(&explorer, ExplorerPaneKind::Header, cx));
+        let topics_view = cx.new(|cx| ExplorerPane::new(&explorer, ExplorerPaneKind::Topics, cx));
+        let details_view = cx.new(|cx| ExplorerPane::new(&explorer, ExplorerPaneKind::Details, cx));
+        let publish_view = cx.new(|cx| ExplorerPane::new(&explorer, ExplorerPaneKind::Publish, cx));
         let tree_state = cx.new(|cx| TreeState::new(cx));
         // Kit 0.7 exposes focus through the tree state rather than a handle reader.
         // Capture its real handle once and enable the native Tab stop.
@@ -436,6 +451,11 @@ impl Explorer {
             publish_height_fraction: None,
             restore_publish_height: false,
             tree_state,
+            topic_rows: Rc::default(),
+            header_view,
+            topics_view,
+            details_view,
+            publish_view,
             panes,
             topics_width_fraction: width_fraction,
             restore_topics_width: width.is_some() || width_fraction.is_some(),
@@ -456,7 +476,6 @@ impl Explorer {
             focus: cx.focus_handle(),
             restore_focus: None,
             settings_generation: 0,
-            flash_until: None,
             event_task: None,
             received_age_task: None,
             animation_scheduled: false,
@@ -501,9 +520,9 @@ impl Explorer {
         self.publish_pending = false;
         self.publish_feedback = None;
         self.topics = TopicStore::default();
+        self.topic_rows.borrow_mut().clear();
         self.expanded.clear();
         self.selected = None;
-        self.flash_until = None;
         self.sync_tree(cx);
         self.refresh_details(window, cx);
     }
@@ -540,11 +559,16 @@ impl Explorer {
         cx.notify();
     }
 
+    #[hotpath::measure(impl_type = "Explorer")]
     fn apply_broker_events(&mut self, events: impl IntoIterator<Item = BrokerEvent>, window: &mut Window, cx: &mut Context<Self>) {
         let now = Instant::now();
         let mut tree_changed = false;
         let mut payload_changed = false;
+        let mut topics_changed = false;
+        let mut details_changed = false;
+        let mut shell_changed = false;
         for event in events {
+            shell_changed |= !matches!(&event, BrokerEvent::Message(_));
             match event {
                 BrokerEvent::Connecting => self.status = ConnectionStatus::Connecting,
                 BrokerEvent::Connected => {
@@ -561,12 +585,26 @@ impl Explorer {
                     self.publish_feedback = Some(Err(error));
                 }
                 BrokerEvent::Message(message) => {
-                    let has_payload = !message.payload.is_empty();
-                    payload_changed |= self.selected.as_ref() == Some(&message.topic);
-                    tree_changed |= self.topics.receive(message, now);
-                    if has_payload && !cx.reduce_motion() {
-                        self.flash_until = Some(now + FLASH_DURATION);
+                    // Invalidate existing row caches before drawing. The virtual
+                    // list may measure entry zero before painting it, so render-time
+                    // notifications would be too late for that frame's cache reuse.
+                    let rows = self.topic_rows.borrow();
+                    for end in message
+                        .topic
+                        .match_indices('/')
+                        .map(|(index, _)| index)
+                        .chain(std::iter::once(message.topic.len()))
+                    {
+                        if let Some(row) = rows.get(&message.topic[..end]) {
+                            row.update(cx, |_, cx| cx.notify());
+                        }
                     }
+                    topics_changed = true;
+                    payload_changed |= self.selected.as_ref() == Some(&message.topic);
+                    details_changed |= self.selected.as_ref().is_some_and(|path| {
+                        message.topic == *path || message.topic.strip_prefix(path).is_some_and(|suffix| suffix.starts_with('/'))
+                    });
+                    tree_changed |= self.topics.receive(message, now);
                 }
             }
         }
@@ -582,8 +620,15 @@ impl Explorer {
         if payload_changed {
             self.refresh_details(window, cx);
         }
-        self.schedule_animation(window, cx);
-        cx.notify();
+        if topics_changed {
+            self.topics_view.update(cx, |_, cx| cx.notify());
+        }
+        if details_changed {
+            self.details_view.update(cx, |_, cx| cx.notify());
+        }
+        if shell_changed {
+            cx.notify();
+        }
     }
 
     fn schedule_received_age(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -600,7 +645,10 @@ impl Explorer {
         self.received_age_task = Some(cx.spawn_in(window, async move |view, cx| {
             loop {
                 cx.background_executor().timer(received_age_refresh_delay(&received_at)).await;
-                if view.update_in(cx, |_, _, cx| cx.notify()).is_err() {
+                if view
+                    .update_in(cx, |view, _, cx| view.details_view.update(cx, |_, cx| cx.notify()))
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -608,7 +656,7 @@ impl Explorer {
     }
 
     fn schedule_animation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.animation_scheduled || (self.flash_until.is_none() && !self.payload_highlight.is_active()) {
+        if self.animation_scheduled || !self.payload_highlight.is_active() {
             return;
         }
         self.animation_scheduled = true;
@@ -621,13 +669,11 @@ impl Explorer {
         });
     }
 
+    #[hotpath::measure(impl_type = "Explorer")]
     fn refresh_animation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let now = Instant::now();
         self.payload_highlight.refresh(now, cx);
-        if self.flash_until.is_some_and(|deadline| now >= deadline || cx.reduce_motion()) {
-            self.flash_until = None;
-        }
-        cx.notify();
+
         self.schedule_animation(window, cx);
     }
 
@@ -649,11 +695,13 @@ impl Explorer {
         paths
     }
 
+    #[hotpath::measure(impl_type = "Explorer")]
     fn sync_tree(&mut self, cx: &mut Context<Self>) {
         // Children sort after their prefix, so reverse order builds complete roots
         // without recursing through broker-controlled topic depth.
         let filter = self.topic_filter.read(cx).value().to_lowercase();
         let paths = self.filtered_topic_paths(filter.trim());
+        self.topic_rows.borrow_mut().retain(|path, _| paths.contains(path.as_str()));
         let filtering = !filter.trim().is_empty();
         let mut items = BTreeMap::new();
         for (path, node) in self.topics.nodes.iter().rev() {
@@ -1000,73 +1048,6 @@ impl Explorer {
         )
     }
 
-    fn topic_row(&self, entry: &TreeEntry, cx: &App) -> ListItem {
-        let path = entry.item().id.as_str();
-        let node = self.topics.nodes.get(path);
-        let label = path
-            .rsplit('/')
-            .next()
-            .filter(|level| !level.is_empty())
-            .unwrap_or("(empty level)")
-            .to_owned();
-        let preview = node
-            .map(|node| {
-                node.value.as_ref().map_or_else(
-                    || topic_summary(node.topics, node.messages),
-                    |value| format!("= {}", value.preview()),
-                )
-            })
-            .unwrap_or_default();
-        let now = Instant::now();
-        let highlight = if cx.reduce_motion() {
-            0.
-        } else {
-            node.map_or(0., |node| node.flash_amount(now))
-        };
-        let state = self.tree_state.clone();
-        ListItem::new(SharedString::from(format!("topic:{path}")))
-            .accessibility_label(if path.is_empty() {
-                "Empty topic level".to_owned()
-            } else {
-                path.to_owned()
-            })
-            .h_6()
-            .text_sm()
-            .text_color(cx.theme().foreground.blend(cx.theme().warning.opacity(highlight)))
-            .rounded(cx.theme().radius_tokens().sm)
-            .pl(rems(0.625 + entry.depth() as f32 * 0.875))
-            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
-                state.update(cx, |state, cx| state.focus(window, cx))
-            })
-            .child(
-                div()
-                    .h_flex()
-                    .min_w_0()
-                    .gap_1()
-                    .child(div().w_4().flex_none().when(entry.is_folder(), |slot| {
-                        slot.child(
-                            Icon::new(if entry.is_expanded() {
-                                IconName::ChevronDown
-                            } else {
-                                IconName::ChevronRight
-                            })
-                            .small()
-                            .text_color(cx.theme().foreground),
-                        )
-                    }))
-                    .child(div().min_w_0().truncate().font_medium().child(label))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(preview),
-                    ),
-            )
-    }
-
     fn tree(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("topics-pane")
@@ -1084,7 +1065,9 @@ impl Explorer {
                             resizable_panel()
                                 .size_range(rems(4.5).to_pixels(window.rem_size())..gpui_kit::Pixels::MAX)
                                 .min_w_0()
-                                .child(self.topic_list(cx)),
+                                // A cached ancestor refreshes all nested caches when dirty.
+                                // Keep this composition uncached so row caches stay independent.
+                                .child(self.topics_view.clone()),
                         )
                         .child(
                             resizable_panel()
@@ -1106,7 +1089,7 @@ impl Explorer {
                                 .min_w_0()
                                 .flex_grow_0()
                                 .flex_shrink_1()
-                                .child(self.publish_panel(cx)),
+                                .child(self.publish_view.clone().cached(StyleRefinement::default().size_full())),
                         ),
                 ),
             )
@@ -1114,6 +1097,8 @@ impl Explorer {
 
     fn topic_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.weak_entity();
+        let rows = self.topic_rows.clone();
+        let scroll_handle = self.tree_state.read(cx).scroll_handle().clone();
         div()
             .v_flex()
             .size_full()
@@ -1185,32 +1170,37 @@ impl Explorer {
                     )
                 } else {
                     tree.child(
-                        div()
-                            .flex_1()
-                            .min_h_0()
-                            .border_1()
-                            .border_color(cx.theme().sidebar)
-                            .child(Tree::new(&self.tree_state, move |_, entry, _, window, cx| {
-                                let Some(view) = view.upgrade() else {
-                                    return ListItem::new("closed-topic");
-                                };
-                                let view = view.read(cx);
-                                if !cx.reduce_motion()
-                                    && view
-                                        .topics
-                                        .nodes
-                                        .get(entry.item().id.as_str())
-                                        .is_some_and(|node| node.flashing(Instant::now()))
-                                {
-                                    window.request_animation_frame();
-                                }
-                                view.topic_row(entry, cx)
-                            })),
+                        div().flex_1().min_h_0().border_1().border_color(cx.theme().sidebar).child(
+                            div()
+                                .size_full()
+                                .child(
+                                    gpui_kit::base::Tree::new(&self.tree_state)
+                                        .item(move |_, entry, interaction, _, cx| {
+                                            let Some(view) = view.upgrade() else {
+                                                return div().into_any_element();
+                                            };
+                                            // Create only rows visited by the virtual list, retaining
+                                            // shallow metadata rather than cloning entry subtrees.
+                                            let row = rows
+                                                .borrow_mut()
+                                                .entry(entry.item().id.clone())
+                                                .or_insert_with(|| cx.new(|cx| TopicRow::new(&view, entry, interaction, cx)))
+                                                .clone();
+                                            row.update(cx, |row, cx| row.sync(entry, interaction, view.read(cx)));
+                                            row.cached(StyleRefinement::default().w_full().h(rems(1.5))).into_any_element()
+                                        })
+                                        .list_style(StyleRefinement::default().flex_grow_1().size_full())
+                                        .relative()
+                                        .size_full(),
+                                )
+                                .vertical_scrollbar(&scroll_handle),
+                        ),
                     )
                 }
             })
     }
 
+    #[hotpath::measure(impl_type = "Explorer")]
     fn details(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mut panel = div().id("details-pane").test_support().v_flex().size_full().min_h_0().min_w_0();
         let Some(path) = &self.selected else {
@@ -1397,7 +1387,11 @@ impl Explorer {
             .v_flex()
             .size_full()
             .min_w_0()
-            .child(self.header(cx))
+            .child(
+                self.header_view
+                    .clone()
+                    .cached(StyleRefinement::default().w_full().h(TITLE_BAR_HEIGHT).flex_none()),
+            )
             .when(!self.show_config, |content| content.child(self.error_alerts()))
             .child(
                 div().flex_1().min_h_0().min_w_0().child(
@@ -1412,7 +1406,7 @@ impl Explorer {
                         .child(
                             resizable_panel()
                                 .size_range(rems(20.).to_pixels(rem)..gpui_kit::Pixels::MAX)
-                                .child(self.details(cx)),
+                                .child(self.details_view.clone().cached(StyleRefinement::default().size_full())),
                         ),
                 ),
             )
@@ -1420,6 +1414,7 @@ impl Explorer {
 }
 
 impl Render for Explorer {
+    #[hotpath::measure(impl_type = "Explorer")]
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.restore_publish_height && self.publish_open && !self.show_config {
             self.restore_publish_height = false;

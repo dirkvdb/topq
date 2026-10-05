@@ -8,6 +8,7 @@ mod ui;
 
 use gpui_kit::{AppContext, Bounds, WindowBounds, WindowOptions, px, size};
 
+#[hotpath::main]
 fn main() {
     gpui_kit::application().with_assets(gpui_kit::assets::AllAssets).run(|cx| {
         gpui_kit::init(cx);
