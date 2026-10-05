@@ -2,6 +2,6 @@
   {
     "label": "Run application",
     "command": "cargo",
-    "args": ["run"]
+    "args": ["run", "--release"],
   }
 ]
