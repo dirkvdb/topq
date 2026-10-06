@@ -16,7 +16,6 @@ use gpui_kit::base::{
 };
 use gpui_kit::component::{
     ActiveTheme, Disableable, IconName, Sizable, StyledExt,
-    alert::Alert,
     button::{Button, ButtonVariants},
     checkbox::Checkbox,
     collapsible::Collapsible,
@@ -644,7 +643,7 @@ impl Explorer {
                                             ),
                                     ),
                             )
-                            .when(!connected && self.publish_feedback.is_none(), |form| {
+                            .when(!connected, |form| {
                                 form.child(
                                     div()
                                         .flex_none()
@@ -652,29 +651,6 @@ impl Explorer {
                                         .text_color(cx.theme().muted_foreground)
                                         .child("Connect to a broker to publish."),
                                 )
-                            })
-                            .when_some(self.publish_feedback.as_ref(), |form, feedback| match feedback {
-                                Ok(message) => form.child(
-                                    div()
-                                        .id("publish-feedback")
-                                        .test_support()
-                                        .role(Role::Status)
-                                        .aria_label(message.clone())
-                                        .flex_none()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(message.clone()),
-                                ),
-                                Err(message) => form.child(
-                                    div()
-                                        .id("publish-feedback")
-                                        .test_support()
-                                        .aria_label(message.clone())
-                                        .flex_none()
-                                        .max_h_12()
-                                        .overflow_y_scroll()
-                                        .child(Alert::error("publish-feedback-content", message.clone()).banner()),
-                                ),
                             }),
                     ),
             )

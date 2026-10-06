@@ -1033,6 +1033,23 @@ impl Explorer {
                 ),
             );
         }
+        if let Some(Err(message)) = &self.publish_feedback {
+            alerts = alerts.child(
+                div()
+                    .id("publish-error")
+                    .test_support()
+                    .aria_label(message.clone())
+                    .max_w(rems(24.))
+                    .child(
+                        Alert::error("publish-error-content", message.clone())
+                            .bg(cx.theme().background)
+                            .on_close(cx.listener(|view, _, _, cx| {
+                                view.publish_feedback = None;
+                                cx.notify();
+                            })),
+                    ),
+            );
+        }
         alerts
     }
 

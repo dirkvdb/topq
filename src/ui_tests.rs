@@ -750,7 +750,8 @@ fn publish_file_cancel_and_read_errors_preserve_the_text_draft_and_previous_file
             respond_to_publish_file_prompt(cx, Some(path));
             cx.update_window(handle, |_, window, cx| {
                 window.render_frame(cx);
-                assert!(window.find("publish-feedback").visible());
+                assert!(window.find("publish-error").visible());
+                assert!(window.try_find("publish-feedback").is_none());
                 let state = view.read(cx);
                 let feedback = state.publish_feedback.as_ref().unwrap().as_ref().unwrap_err();
                 assert!(feedback.starts_with("Could not load payload file:"), "{feedback}");
@@ -1024,7 +1025,8 @@ fn publish_is_disabled_offline_and_shortcut_reports_error_without_losing_draft(c
     cx.run_until_parked();
     cx.update_window(handle, |_, window, cx| {
         window.render_frame(cx);
-        assert!(window.find("publish-feedback").visible());
+        assert!(window.find("publish-error").visible());
+        assert!(window.try_find("publish-feedback").is_none());
         assert_eq!(
             view.read(cx).publish_feedback.as_ref().unwrap().as_deref().map_err(String::as_str),
             Err("Connect to a broker before publishing.")
@@ -2155,6 +2157,54 @@ fn application_errors_are_shown_in_alerts(cx: &mut TestAppContext) {
         assert!(window.try_find("application-error").is_none());
     })
     .unwrap();
+}
+
+#[gpui_kit::test]
+fn publish_errors_use_dismissible_alerts_without_changing_the_draft_layout(cx: &mut TestAppContext) {
+    for mode in [ThemeMode::Light, ThemeMode::Dark] {
+        for font_size in [16., 20.] {
+            let (handle, view) = open_publish_file_draft(cx, 760., 540.);
+            cx.update(|cx| {
+                Theme::change(mode, None, cx);
+                Theme::update(cx, |theme| theme.font_size = px(font_size));
+            });
+            let payload_bounds = cx
+                .update_window(handle, |_, window, cx| {
+                    window.render_frame(cx);
+                    let bounds = window.find("publish-payload").bounds();
+                    view.update(cx, |view, cx| {
+                        view.publish_pending = true;
+                        view.apply_broker_events(
+                            [crate::mqtt::BrokerEvent::PublishError(
+                                "Broker rejected publish: NotAuthorized".into(),
+                            )],
+                            window,
+                            cx,
+                        );
+                    });
+                    bounds
+                })
+                .unwrap();
+            cx.update_window(handle, |_, window, cx| {
+                window.render_frame(cx);
+                let alert = window.find("publish-error");
+                assert!(alert.visible());
+                assert_eq!(alert.label(), Some("Broker rejected publish: NotAuthorized"));
+                assert!(window.try_find("publish-feedback").is_none());
+                assert_eq!(window.find("publish-payload").bounds(), payload_bounds);
+                assert!(!view.read(cx).publish_pending);
+                assert_eq!(view.read(cx).publish_payload.read(cx).value().as_str(), PUBLISH_FILE_DRAFT);
+                let bounds = alert.bounds();
+                window.click_at("publish-error", gpui_kit::point(bounds.size.width - px(26.), px(20.)), cx);
+                window.render_frame(cx);
+                assert!(window.try_find("publish-error").is_none());
+                assert!(view.read(cx).publish_feedback.is_none());
+                assert_eq!(window.find("publish-payload").bounds(), payload_bounds);
+                assert_eq!(view.read(cx).publish_payload.read(cx).value().as_str(), PUBLISH_FILE_DRAFT);
+            })
+            .unwrap();
+        }
+    }
 }
 
 #[gpui_kit::test]
@@ -5301,6 +5351,12 @@ fn publish_panel_queues_one_retained_qos_one_message_without_claiming_broker_ack
     })
     .unwrap();
     cx.run_until_parked();
+    let payload_bounds = cx
+        .update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.find("publish-payload").bounds()
+        })
+        .unwrap();
     cx.update_window(handle, |_, window, cx| {
         window.render_frame(cx);
         assert_eq!(window.find("publish-topic").value(), Some(topic));
@@ -5346,8 +5402,8 @@ fn publish_panel_queues_one_retained_qos_one_message_without_claiming_broker_ack
         let view = view.read(cx);
         assert!(!view.publish_pending);
         assert_eq!(view.publish_feedback.as_ref().unwrap().as_deref(), Ok(feedback));
-        assert!(window.find("publish-feedback").visible());
-        assert_eq!(window.find("publish-feedback").label(), Some(feedback));
+        assert!(window.try_find("publish-feedback").is_none());
+        assert_eq!(window.find("publish-payload").bounds(), payload_bounds);
         assert_ne!(window.find("publish-message").disabled(), Some(true));
         assert_eq!(window.find("publish-topic").value(), Some(topic));
         assert_eq!(view.publish_payload.read(cx).value().as_str(), payload);
@@ -5500,18 +5556,21 @@ fn publish_file_panel_sends_exact_binary_and_image_bytes_with_content_type_to_th
             );
         });
         respond_to_publish_file_prompt(cx, Some(path));
-        cx.update_window(handle, |_, window, cx| {
-            window.render_frame(cx);
-            assert_eq!(window.find("publish-content-type").label(), Some(content_type));
-            assert!(view.read(cx).publish_file_task.is_none());
-            if shortcut {
-                window.click("publish-topic", cx);
-                window.press("ctrl-enter", cx);
-            } else {
-                window.click("publish-message", cx);
-            }
-        })
-        .unwrap();
+        let payload_bounds = cx
+            .update_window(handle, |_, window, cx| {
+                window.render_frame(cx);
+                let payload_bounds = window.find("publish-payload").bounds();
+                assert_eq!(window.find("publish-content-type").label(), Some(content_type));
+                assert!(view.read(cx).publish_file_task.is_none());
+                if shortcut {
+                    window.click("publish-topic", cx);
+                    window.press("ctrl-enter", cx);
+                } else {
+                    window.click("publish-message", cx);
+                }
+                payload_bounds
+            })
+            .unwrap();
         if !shortcut {
             cx.update_window(handle, |_, window, cx| {
                 assert!(view.read(cx).publish_pending);
@@ -5556,6 +5615,8 @@ fn publish_file_panel_sends_exact_binary_and_image_bytes_with_content_type_to_th
             assert_eq!(state.publish_qos.read(cx).selected_value(), Some(&"1"));
             assert_eq!(window.find("publish-retain").checked(), Some(true));
             assert!(window.find("load-publish-file").visible());
+            assert!(window.try_find("publish-feedback").is_none());
+            assert_eq!(window.find("publish-payload").bounds(), payload_bounds);
         })
         .unwrap();
     }
