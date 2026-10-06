@@ -36,6 +36,7 @@ use crate::{
 
 mod explorer_pane;
 mod payload;
+mod payload_ansi;
 mod payload_diff;
 
 use explorer_pane::{ExplorerPane, ExplorerPaneKind};
@@ -216,6 +217,7 @@ pub struct Explorer {
     payload_topic: Option<String>,
     payload_pending_scroll: Option<gpui_kit::Point<gpui_kit::Pixels>>,
     payload_highlight: payload::PayloadHighlight,
+    payload_ansi: gpui_kit::base::input::TextDecorationCollection,
     publish_open: bool,
     publish_topic: Entity<InputState>,
     publish_topic_completion: Option<topic_completion::TopicCompletion>,
@@ -327,6 +329,7 @@ impl Explorer {
         });
         let payload_highlight =
             payload::PayloadHighlight::new(payload.update(cx, |editor, cx| editor.create_range_decorations_collection(Vec::new(), cx)));
+        let payload_ansi = payload.update(cx, |editor, cx| editor.create_decorations_collection(Vec::new(), cx));
         let publish_topic = cx.new(|cx| InputState::new(window, cx).placeholder("example/topic"));
         let publish_payload = cx.new(|cx| {
             EditorState::new(window, cx)
@@ -434,6 +437,11 @@ impl Explorer {
         subscriptions.push(cx.observe_window_appearance(window, |_, window, cx| {
             appearance::sync_system(window, cx);
         }));
+        subscriptions.push(cx.observe_global_in::<gpui_kit::component::Theme>(window, |view, window, cx| {
+            if view.payload_format == "Text" {
+                view.refresh_details(window, cx);
+            }
+        }));
         subscriptions.push(cx.subscribe_in(&panes, window, |view, state, _: &ResizablePanelEvent, window, cx| {
             view.persist_split(state, window, cx);
         }));
@@ -465,6 +473,7 @@ impl Explorer {
             payload_topic: None,
             payload_pending_scroll: None,
             payload_highlight,
+            payload_ansi,
             publish_open: false,
             publish_topic,
             publish_topic_completion: None,

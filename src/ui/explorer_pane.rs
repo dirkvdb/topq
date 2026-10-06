@@ -67,6 +67,73 @@ mod tests {
     use super::Explorer;
     use crate::topics::{Message, MessageProperties};
 
+    #[gpui_kit::test]
+    fn ansi_payload_display_updates_styles_and_preserves_raw_copy(cx: &mut TestAppContext) {
+        for mode in [ThemeMode::Light, ThemeMode::Dark] {
+            let (handle, view) = cx.update(|cx| {
+                if !cx.has_global::<Theme>() {
+                    gpui_kit::init(cx);
+                    crate::appearance::register_bundled(cx).unwrap();
+                    super::super::init(cx);
+                }
+                Theme::change(mode, None, cx);
+                gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                    cx.new(|cx| {
+                        let mut explorer = Explorer::with_settings(None, None, None, window, cx);
+                        explorer.show_config = false;
+                        explorer.selected = Some("test".into());
+                        explorer
+                    })
+                })
+                .unwrap()
+            });
+            for (raw, displayed, styled) in [
+                ("\x1b[1;31mNo clients; rebooting\x1b[0m", "No clients; rebooting", true),
+                ("\x1b[32mNo clients; rebooting\x1b[0m", "No clients; rebooting", true),
+                ("No clients; rebooting", "No clients; rebooting", false),
+                ("\x1b[31mé世界\x1b[0m", "é世界", true),
+                ("{\"on\":true}", "{\n  \"on\": true\n}", false),
+            ] {
+                cx.update_window(handle, |_, window, cx| {
+                    view.update(cx, |view, cx| {
+                        let mut incoming = message(None);
+                        incoming.payload = Bytes::copy_from_slice(raw.as_bytes());
+                        view.topics.receive(incoming, Instant::now());
+                        view.refresh_details(window, cx);
+                        assert_eq!(view.payload.read(cx).value().as_str(), displayed);
+                        let expected: Vec<_> = styled.then_some(0..displayed.len()).into_iter().collect();
+                        assert_eq!(view.payload_ansi.get_ranges(cx), expected);
+                    });
+                    window.render_frame(cx);
+                    assert!(window.find("payload-editor").visible());
+                    window.click("copy-value", cx);
+                    assert_eq!(cx.read_from_clipboard().unwrap().text().unwrap(), raw);
+                })
+                .unwrap();
+                cx.run_until_parked();
+            }
+            cx.update_window(handle, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    let mut incoming = message(None);
+                    incoming.payload = Bytes::from_static(b"\x1b[31mA\x1b[32mB");
+                    view.topics.receive(incoming, Instant::now());
+                    view.refresh_details(window, cx);
+                    assert_eq!(view.payload_ansi.get_ranges(cx), vec![0..1, 1..2]);
+                });
+            })
+            .unwrap();
+            // Equal theme colors merge adjacent runs, proving that a theme-only
+            // update refreshes decorations without needing another MQTT message.
+            cx.update(|cx| Theme::update(cx, |theme| theme.danger = theme.success));
+            cx.run_until_parked();
+            cx.update(|cx| {
+                let ranges = view.read(cx).payload_ansi.get_ranges(cx);
+                assert_eq!(ranges.len(), 1);
+                assert_eq!(ranges[0], 0..2);
+            });
+        }
+    }
+
     fn message(content_type: Option<&str>) -> Message {
         Message {
             topic: "test".into(),

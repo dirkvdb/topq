@@ -175,6 +175,11 @@ impl Explorer {
             .filter(|_| image_type.is_none())
             .map(|value| value.display_payload())
             .unwrap_or_default();
+        let (text, ansi_styles) = if format == "Text" && text.contains('\x1b') {
+            super::payload_ansi::parse(&text, cx.theme())
+        } else {
+            (text, Vec::new())
+        };
         let same_topic = self.payload_topic == self.selected;
         let previous = self.payload.read(cx).value();
         let changed = previous.as_str() != text;
@@ -213,6 +218,13 @@ impl Explorer {
         } else if format == "Image" || Appearance::motion_reduced(cx) {
             self.payload_highlight.clear(cx);
         }
+        self.payload_ansi.set(
+            ansi_styles
+                .into_iter()
+                .map(|(range, style)| gpui_kit::base::input::TextDecoration::new(range, style))
+                .collect(),
+            cx,
+        );
         self.schedule_received_age(window, cx);
         self.schedule_animation(window, cx);
         self.details_view.update(cx, |_, cx| cx.notify());

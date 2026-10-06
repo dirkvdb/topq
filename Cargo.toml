@@ -6,6 +6,7 @@ description = "A minimal MQTT explorer built with GPUI Kit"
 
 [dependencies]
 anyhow = "1"
+anstyle-parse = "1"
 bytes = "1"
 chrono = "0.4"
 directories = "6"
