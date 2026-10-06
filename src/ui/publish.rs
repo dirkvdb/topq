@@ -592,7 +592,7 @@ impl Explorer {
                                         div()
                                             .h_flex()
                                             .flex_none()
-                                            .gap_1()
+                                            .gap_3()
                                             .child(
                                                 div()
                                                     .id("publish-qos-field")
