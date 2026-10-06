@@ -204,7 +204,11 @@ impl FieldKey {
     }
 
     fn label(&self) -> String {
-        format!("{} {}", self.topic, if self.pointer.is_empty() { "(root)" } else { &self.pointer })
+        if self.pointer.is_empty() {
+            format!("{} (root)", self.topic)
+        } else {
+            format!("{}{}", self.topic, self.pointer)
+        }
     }
 
     fn field_name(&self) -> String {
@@ -984,6 +988,12 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn labels_join_topic_and_pointer_without_extra_space() {
+        assert_eq!(FieldKey::new("energy/solar", "/OutputPower").label(), "energy/solar/OutputPower");
+        assert_eq!(FieldKey::new("energy/solar", "").label(), "energy/solar (root)");
     }
 
     #[test]
