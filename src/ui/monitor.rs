@@ -511,7 +511,6 @@ enum ChartKind {
 #[derive(Default)]
 struct Series {
     samples: VecDeque<Sample>,
-    color_ix: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -527,6 +526,13 @@ struct Chart {
     members: Vec<FieldKey>,
     kind: ChartKind,
     smooth: bool,
+    color_ix: usize,
+}
+
+impl Chart {
+    fn member_color_ix(&self, member_ix: usize) -> usize {
+        (self.color_ix + member_ix) % CHART_COLOR_COUNT
+    }
 }
 
 impl Series {
@@ -576,15 +582,10 @@ impl Monitoring {
         let Some(value) = payload.pointer(pointer).and_then(finite_number) else {
             return false;
         };
-        let mut series = Series {
-            color_ix: self.next_color_ix,
-            ..Series::default()
-        };
+        let mut series = Series::default();
         series.push(time, value);
         self.topics.entry(topic.to_owned()).or_default().insert(pointer.to_owned(), series);
-        self.open_chart(FieldKey::new(topic, pointer));
-        self.next_color_ix = (self.next_color_ix + 1) % CHART_COLOR_COUNT;
-        true
+        self.open_chart(FieldKey::new(topic, pointer))
     }
 
     fn open_chart(&mut self, field: FieldKey) -> bool {
@@ -599,8 +600,10 @@ impl Monitoring {
                 members: vec![field],
                 kind: ChartKind::Line,
                 smooth: true,
+                color_ix: self.next_color_ix,
             },
         );
+        self.next_color_ix = (self.next_color_ix + 1) % CHART_COLOR_COUNT;
         true
     }
 
@@ -660,16 +663,12 @@ impl Monitoring {
             return false;
         };
         if !self.contains(&field.topic, &field.pointer) {
-            let mut series = Series {
-                color_ix: self.next_color_ix,
-                ..Series::default()
-            };
+            let mut series = Series::default();
             series.push(time, value);
             self.topics
                 .entry(field.topic.clone())
                 .or_default()
                 .insert(field.pointer.clone(), series);
-            self.next_color_ix = (self.next_color_ix + 1) % CHART_COLOR_COUNT;
         }
         let source = self.charts.iter().find_map(|(source, chart)| {
             (*source != id && chart.members.len() == 1 && chart.members.first() == Some(field)).then_some(*source)
@@ -742,7 +741,7 @@ impl Monitoring {
             let label = first.label();
 
             let (min, max) = series.y_domain();
-            let color = colors[series.color_ix % colors.len()];
+            let color = colors[options.member_color_ix(0)];
             let (switch_label, switch_icon) = match options.kind {
                 ChartKind::Line => ("Show area chart", gpui_kit::assets::IconName::ChartArea),
                 ChartKind::Area => ("Show line chart", gpui_kit::assets::IconName::ChartLine),
@@ -753,13 +752,14 @@ impl Monitoring {
                     left: 0.,
                     series: members
                         .iter()
-                        .filter_map(|member| {
+                        .enumerate()
+                        .filter_map(|(member_ix, member)| {
                             let series = self.series(member)?;
                             Some(PlotSeries {
                                 id: member.id(),
                                 label: member.label(),
                                 samples: series.samples.iter().cloned().collect(),
-                                color: colors[series.color_ix % colors.len()],
+                                color: colors[options.member_color_ix(member_ix)],
                             })
                         })
                         .collect(),
@@ -844,12 +844,12 @@ impl Monitoring {
                                     .flex_wrap()
                                     .gap_3()
                                     .min_w_0()
-                                    .children(members.iter().map(|member| {
+                                    .children(members.iter().enumerate().map(|(member_ix, member)| {
                                         let text = member.field_name();
                                         let full_topic = member.label();
                                         let color = self
                                             .series(member)
-                                            .map_or(cx.theme().muted_foreground, |series| colors[series.color_ix % colors.len()]);
+                                            .map_or(cx.theme().muted_foreground, |_| colors[options.member_color_ix(member_ix)]);
                                         div()
                                             .id((member.id(), "legend"))
                                             .test_support()
@@ -1037,7 +1037,7 @@ mod tests {
         }
         monitoring.receive(&message("a", r#"{"a":4,"b":5,"c":6}"#));
         let b = FieldKey::new("a", "/b");
-        let color = monitoring.series(&b).unwrap().color_ix;
+        let color = monitoring.charts[&ChartId(0)].color_ix;
         monitoring.toggle_chart(ChartId(0));
         monitoring.set_smoothing(ChartId(0), false);
         assert!(monitoring.add(ChartId(0), &b, &seed.payload, seed.received_at));
@@ -1052,7 +1052,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             [2., 5.]
         );
-        assert_eq!(monitoring.series(&b).unwrap().color_ix, color);
+        assert_eq!(monitoring.charts[&ChartId(0)].member_color_ix(0), color);
+        assert_eq!(monitoring.charts[&ChartId(0)].member_color_ix(1), (color + 1) % CHART_COLOR_COUNT);
         assert_eq!(monitoring.charts[&ChartId(0)].kind, ChartKind::Area);
         assert!(!monitoring.charts[&ChartId(0)].smooth);
         assert!(!monitoring.add(ChartId(0), &b, &seed.payload, seed.received_at));
@@ -1101,22 +1102,23 @@ mod tests {
                 monitoring.set_smoothing(ChartId(0), false);
                 let original = monitoring.members(ChartId(0)).unwrap().to_vec();
                 monitoring.receive(&message("topic", r#"{"a":3,"b":4}"#));
-                let color = monitoring.series(&field).unwrap().color_ix;
+                let color = monitoring.charts[&ChartId(0)].color_ix;
                 let next_color = monitoring.next_color_ix;
-                for id in [ChartId(1), ChartId(2)] {
+                for (ix, id) in [ChartId(1), ChartId(2)].into_iter().enumerate() {
                     // An existing dataset can be reused even if the latest payload is invalid.
                     assert!(monitoring.start("topic", pointer, b"invalid", seed.received_at));
                     assert_eq!(monitoring.members(id).unwrap(), std::slice::from_ref(&field));
                     assert_eq!(monitoring.charts[&id].kind, ChartKind::Line);
                     assert!(monitoring.charts[&id].smooth);
+                    assert_eq!(monitoring.charts[&id].color_ix, (next_color + ix) % CHART_COLOR_COUNT);
                 }
                 assert_eq!(monitoring.charts.len(), 3);
                 assert_eq!(monitoring.members(ChartId(0)).unwrap(), original);
                 assert_eq!(monitoring.charts[&ChartId(0)].kind, ChartKind::Area);
                 assert!(!monitoring.charts[&ChartId(0)].smooth);
                 assert_eq!(monitoring.series(&field).unwrap().samples.len(), 2);
-                assert_eq!(monitoring.series(&field).unwrap().color_ix, color);
-                assert_eq!(monitoring.next_color_ix, next_color);
+                assert_eq!(monitoring.charts[&ChartId(0)].color_ix, color);
+                assert_eq!(monitoring.next_color_ix, (next_color + 2) % CHART_COLOR_COUNT);
                 monitoring.receive(&message("topic", r#"{"a":5,"b":6}"#));
                 assert_eq!(monitoring.series(&field).unwrap().samples.len(), 3);
             }
@@ -1322,18 +1324,22 @@ mod tests {
             let topic = format!("topic/{ix}");
             assert!(!monitoring.start(&topic, "", b"invalid", Local::now()));
             assert!(monitoring.start(&topic, "", b"1", Local::now()));
-            assert_eq!(monitoring.topics[&topic][""].color_ix, ix % CHART_COLOR_COUNT);
+            assert_eq!(monitoring.charts[&ChartId(ix * 2)].color_ix, ix as usize * 2 % CHART_COLOR_COUNT);
             assert!(monitoring.start(&topic, "", b"2", Local::now()));
+            assert_eq!(
+                monitoring.charts[&ChartId(ix * 2 + 1)].color_ix,
+                (ix as usize * 2 + 1) % CHART_COLOR_COUNT
+            );
         }
-        monitoring.stop(chart_id(&monitoring, "topic/0", ""));
-        monitoring.toggle_chart(chart_id(&monitoring, "topic/1", ""));
+        monitoring.stop(ChartId(0));
+        monitoring.toggle_chart(ChartId(2));
         monitoring.receive(&message("topic/1", "3"));
-        assert_eq!(monitoring.topics["topic/1"][""].color_ix, 1);
+        assert_eq!(monitoring.charts[&ChartId(2)].color_ix, 2);
         assert!(monitoring.start("next", "", b"4", Local::now()));
-        assert_eq!(monitoring.topics["next"][""].color_ix, 2);
+        assert_eq!(monitoring.charts[&ChartId(14)].color_ix, 4);
         monitoring.clear();
         assert!(monitoring.start("fresh", "", b"5", Local::now()));
-        assert_eq!(monitoring.topics["fresh"][""].color_ix, 0);
+        assert_eq!(monitoring.charts[&ChartId(15)].color_ix, 0);
     }
 
     #[test]
