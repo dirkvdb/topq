@@ -37,11 +37,11 @@ TopQ reads these files at startup and writes changes made in the application bac
       "validate_certificate": true
     }
   ],
-  "selected": 0
+  "active_connection": "Home broker"
 }
 ```
 
-- `selected` is the zero-based index of the connection to connect to at startup. Use `null` or omit it to start without connecting. An out-of-range index falls back to the first connection.
+- `active_connection` is the name of the connection to connect to at startup. Use `null` or omit it to start without connecting. An unknown name falls back to the first connection. When multiple connections have the same non-empty name, only the first is loaded; give each connection a unique name.
 - `connection` is the broker URI: use `mqtt://`, `mqtts://`, `ws://`, or `wss://` to select MQTT, MQTT over TLS, WebSocket, or secure WebSocket. Include the broker host and preferably an explicit port, for example `mqtts://mqtt-user@mqtt.lan:8883`. Put the username before `@`; omit it for an empty username. URL-encode reserved characters in the username. Do not put a password in the URI. If the URI omits the port, it defaults to `1883`, `8883`, `80`, or `443` for those schemes, respectively. IPv6 hosts must be bracketed, for example `mqtt://user@[::1]:1883`.
 - Older settings files may still use a separate `username` field; TopQ reads it and moves it into the URI when saving.
 - `client_id` identifies the MQTT client. Use a different ID for each concurrently connected client on the same broker to avoid disconnecting each other. If omitted, TopQ generates an ID on load.

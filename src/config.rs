@@ -305,7 +305,7 @@ pub(crate) fn save_connections(saved: &SavedConnections) -> Result<()> {
 #[derive(Default, Serialize, Deserialize)]
 struct StoredConnections {
     connections: Vec<SavedConnection>,
-    selected: Option<usize>,
+    active_connection: Option<String>,
 }
 
 fn read_connections(path: &Path) -> Result<Option<StoredConnections>> {
@@ -324,8 +324,12 @@ fn load_connections_from(path: &Path, entry: &impl Fn(&ConnectionConfig) -> Resu
     };
     let mut connections = Vec::with_capacity(stored.connections.len());
     let mut accounts = HashSet::new();
+    let mut names = HashSet::new();
     for saved in stored.connections {
         let mut config = saved.config;
+        if !config.name.is_empty() && !names.insert(config.name.clone()) {
+            continue;
+        }
         config.validate()?;
         if !accounts.insert(credential_account(&config)) {
             return Err(anyhow!("Duplicate saved MQTT connection account."));
@@ -340,11 +344,13 @@ fn load_connections_from(path: &Path, entry: &impl Fn(&ConnectionConfig) -> Resu
         }
         connections.push(config);
     }
-    // A stale index must not prevent access to the other saved connections.
-    let selected = stored
-        .selected
-        .filter(|&index| index < connections.len())
-        .or_else(|| (stored.selected.is_some() && !connections.is_empty()).then_some(0));
+    // An unknown name must not prevent access to the saved connections.
+    let selected = stored.active_connection.and_then(|name| {
+        connections
+            .iter()
+            .position(|config| config.name == name)
+            .or_else(|| (!connections.is_empty()).then_some(0))
+    });
     Ok(SavedConnections { connections, selected })
 }
 
@@ -437,7 +443,7 @@ fn save_connections_to(path: &Path, saved: &SavedConnections, entry: &impl Fn(&C
             .iter()
             .map(|config| SavedConnection { config: config.clone() })
             .collect(),
-        selected: saved.selected,
+        active_connection: saved.selected.map(|index| saved.connections[index].name.clone()),
     };
     let mut applied = Vec::new();
     let result = (|| {
@@ -1165,7 +1171,7 @@ mod tests {
         };
         entries(&tcp).unwrap().set_password(&tcp.password).unwrap();
         entries(&tls).unwrap().set_password(&tls.password).unwrap();
-        fs::write(&path, r#"{"connections":[{"host":"localhost","username":"mqtt-user","password_in_keyring":true},{"host":"localhost","username":"mqtt-user","tls":true,"password_in_keyring":true}],"selected":1}"#).unwrap();
+        fs::write(&path, r#"{"connections":[{"host":"localhost","username":"mqtt-user","password_in_keyring":true},{"host":"localhost","username":"mqtt-user","tls":true,"password_in_keyring":true}]}"#).unwrap();
         let saved = load_connections_from(&path, &entries).unwrap();
         assert_eq!(saved.connections[0].password, tcp.password);
         assert_eq!(saved.connections[1].password, tls.password);
@@ -1194,7 +1200,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("connections.json");
         let entries = mock_entries();
-        fs::write(&path, r#"{"connections":[{"tls":true}],"selected":0}"#).unwrap();
+        fs::write(&path, r#"{"connections":[{"tls":true}]}"#).unwrap();
         let saved = load_connections_from(&path, &entries).unwrap();
         assert!(saved.connections[0].validate_certificate);
         save_connections_to(&path, &saved, &entries).unwrap();
@@ -1248,11 +1254,13 @@ mod tests {
         let entries = mock_entries();
         let tcp = authenticated_config();
         let tls = ConnectionConfig {
+            name: "Home TLS".into(),
             tls: true,
             password: "tls-secret".into(),
             ..tcp.clone()
         };
         let websocket = ConnectionConfig {
+            name: "Home WebSocket".into(),
             websocket: true,
             password: "ws-secret".into(),
             ..tcp.clone()
@@ -1613,7 +1621,7 @@ mod tests {
         let path = dir.path().join("connections.json");
         fs::write(
             &path,
-            r#"{"connections":[{"host":"legacy-broker","base_topic":"home/#","password":"plaintext-secret"},{"host":"default-broker"}],"selected":0}"#,
+            r#"{"connections":[{"name":"Legacy","host":"legacy-broker","base_topic":"home/#","password":"plaintext-secret"},{"host":"default-broker"}],"active_connection":"Legacy"}"#,
         ).unwrap();
         let entries = mock_entries();
         let saved = load_connections_from(&path, &entries).unwrap();
@@ -1629,6 +1637,8 @@ mod tests {
         assert!(saved.connections.iter().all(|config| config.password.is_empty()));
         save_connections_to(&path, &saved, &entries).unwrap();
         let json: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(json["active_connection"], "Legacy");
+        assert!(json.get("selected").is_none());
         assert!(
             json["connections"]
                 .as_array()
@@ -1706,6 +1716,8 @@ mod tests {
         assert_eq!(loaded.connections[1].client_id, second.client_id);
         let bytes = fs::read(&path).unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["active_connection"], "Workshop");
+        assert!(json.get("selected").is_none());
         assert!(
             json["connections"]
                 .as_array()
@@ -1720,7 +1732,7 @@ mod tests {
     }
 
     #[test]
-    fn selection_can_be_cleared_and_stale_index_falls_back_to_first() {
+    fn selection_can_be_cleared_and_invalid_index_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("connection.json");
         let entries = mock_entries();
@@ -1730,12 +1742,75 @@ mod tests {
         };
         save_connections_to(&path, &saved, &entries).unwrap();
         assert_eq!(load_connections_from(&path, &entries).unwrap().selected, None);
-        fs::write(&path, r#"{"connections":[{"host":"localhost"}],"selected":99}"#).unwrap();
-        assert_eq!(load_connections_from(&path, &entries).unwrap().selected, Some(0));
+        let json: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(json["active_connection"].is_null());
+        assert!(json.get("selected").is_none());
         saved.selected = Some(1);
         let before = fs::read(&path).unwrap();
         assert!(save_connections_to(&path, &saved, &entries).is_err());
         assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn active_connection_resolves_by_name_when_connections_are_reordered() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("connections.json");
+        let entries = mock_entries();
+        fs::write(
+            &path,
+            r#"{"connections":[{"name":"Workshop","host":"workshop"},{"name":"Home","host":"home"}],"active_connection":"Home"}"#,
+        )
+        .unwrap();
+        assert_eq!(load_connections_from(&path, &entries).unwrap().selected, Some(1));
+        fs::write(
+            &path,
+            r#"{"connections":[{"name":"Home","host":"home"},{"name":"Workshop","host":"workshop"}],"active_connection":"Home"}"#,
+        )
+        .unwrap();
+        assert_eq!(load_connections_from(&path, &entries).unwrap().selected, Some(0));
+    }
+
+    #[test]
+    fn loading_connections_with_duplicate_names_keeps_only_the_first_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("connections.json");
+        fs::write(
+            &path,
+            r#"{"connections":[{"name":"Home","host":"first-broker"},{"name":"Home","host":"second-broker"}],"active_connection":"Home"}"#,
+        )
+        .unwrap();
+
+        let saved = load_connections_from(&path, &mock_entries()).unwrap();
+        assert_eq!(saved.connections.len(), 1);
+        assert_eq!(saved.connections[0].host, "first-broker");
+        assert_eq!(saved.selected, Some(0));
+    }
+
+    #[test]
+    fn active_connection_tracks_remaining_entries_after_duplicate_names_are_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("connections.json");
+        fs::write(
+            &path,
+            r#"{"connections":[{"name":"Home","host":"first"},{"name":"Home","host":"duplicate"},{"name":"Workshop","host":"third"}],"active_connection":"Workshop"}"#,
+        )
+        .unwrap();
+
+        let saved = load_connections_from(&path, &mock_entries()).unwrap();
+        assert_eq!(saved.connections.len(), 2);
+        assert_eq!(saved.connections[1].host, "third");
+        assert_eq!(saved.selected, Some(1));
+    }
+
+    #[test]
+    fn unknown_active_connection_falls_back_to_first_and_null_clears_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("connections.json");
+        let entries = mock_entries();
+        fs::write(&path, r#"{"connections":[{"name":"Home"}],"active_connection":"Removed"}"#).unwrap();
+        assert_eq!(load_connections_from(&path, &entries).unwrap().selected, Some(0));
+        fs::write(&path, r#"{"connections":[{"name":"Home"}],"active_connection":null}"#).unwrap();
+        assert_eq!(load_connections_from(&path, &entries).unwrap().selected, None);
     }
 
     #[test]
@@ -1896,6 +1971,7 @@ mod tests {
         let entries = mock_entries();
         let missing = authenticated_config();
         let available = ConnectionConfig {
+            name: "Another".into(),
             host: "another-broker".into(),
             ..missing.clone()
         };
@@ -1919,11 +1995,7 @@ mod tests {
     fn a_username_without_a_stored_password_loads_without_a_flag() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("connection.json");
-        fs::write(
-            &path,
-            r#"{"connections":[{"connection":"mqtt://mqtt-user@localhost:1883"}],"selected":0}"#,
-        )
-        .unwrap();
+        fs::write(&path, r#"{"connections":[{"connection":"mqtt://mqtt-user@localhost:1883"}]}"#).unwrap();
         let loaded = load_connections_from(&path, &mock_entries()).unwrap();
         assert!(loaded.connections[0].password.is_empty());
     }
@@ -1932,7 +2004,7 @@ mod tests {
     fn anonymous_connection_does_not_need_a_credential_store_to_load() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("connection.json");
-        fs::write(&path, r#"{"connections":[{"connection":"mqtt://localhost:1883"}],"selected":0}"#).unwrap();
+        fs::write(&path, r#"{"connections":[{"connection":"mqtt://localhost:1883"}]}"#).unwrap();
         let entries = |_: &ConnectionConfig| -> Result<Entry> { panic!("anonymous connections must not access the keychain") };
         let loaded = load_connections_from(&path, &entries).unwrap();
         assert!(loaded.connections[0].password.is_empty());
@@ -1947,7 +2019,7 @@ mod tests {
         entries(&config).unwrap().set_password(&config.password).unwrap();
         fs::write(
             &path,
-            r#"{"connections":[{"connection":"mqtt://mqtt-user@localhost:1883","password_in_keyring":false}],"selected":0}"#,
+            r#"{"connections":[{"connection":"mqtt://mqtt-user@localhost:1883","password_in_keyring":false}]}"#,
         )
         .unwrap();
         let loaded = load_connections_from(&path, &entries).unwrap();
@@ -1962,11 +2034,7 @@ mod tests {
         let path = dir.path().join("connection.json");
         let entries = mock_entries();
         let config = authenticated_config();
-        fs::write(
-            &path,
-            r#"{"connections":[{"connection":"mqtt://mqtt-user@localhost:1883"}],"selected":0}"#,
-        )
-        .unwrap();
+        fs::write(&path, r#"{"connections":[{"connection":"mqtt://mqtt-user@localhost:1883"}]}"#).unwrap();
         entries(&config)
             .unwrap()
             .inner
