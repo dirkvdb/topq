@@ -1574,7 +1574,7 @@ impl Render for Explorer {
             let view = cx.weak_entity();
             window.on_next_frame(move |window, cx| {
                 if let Some(view) = view.upgrade() {
-                    let _ = view.update(cx, |view, cx| {
+                    view.update(cx, |view, cx| {
                         view.panes.update(cx, |state, cx| {
                             let width = width_fraction
                                 .map(|fraction| state.container_size() * fraction)

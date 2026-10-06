@@ -58,6 +58,10 @@ enum SessionState {
 }
 
 /// Quality of service for an MQTT publish.
+#[expect(
+    clippy::enum_variant_names,
+    reason = "Variants use the standard MQTT delivery-guarantee terminology"
+)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Qos {
     AtMostOnce,
