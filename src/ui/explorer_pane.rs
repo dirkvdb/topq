@@ -134,6 +134,229 @@ mod tests {
         }
     }
 
+    #[gpui_kit::test]
+    fn preview_toggle_switches_processing_and_keeps_live_updates_raw(cx: &mut TestAppContext) {
+        for mode in [ThemeMode::Light, ThemeMode::Dark] {
+            let (handle, view) = cx.update(|cx| {
+                if !cx.has_global::<Theme>() {
+                    gpui_kit::init(cx);
+                    crate::appearance::register_bundled(cx).unwrap();
+                    super::super::init(cx);
+                }
+                Theme::change(mode, None, cx);
+                gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                    cx.new(|cx| {
+                        let mut explorer = Explorer::with_settings(None, None, None, window, cx);
+                        explorer.show_config = false;
+                        explorer.selected = Some("test".into());
+                        explorer
+                    })
+                })
+                .unwrap()
+            });
+            for (content_type, raw, processed, language) in [
+                (None, "{\"on\":true}", "{\n  \"on\": true\n}", "json"),
+                // Formatting does not always change text; the highlighter must still switch.
+                (None, "true", "true", "json"),
+                (None, "\x1b[1;31mé世界\x1b[0m", "é世界", "plaintext"),
+                (
+                    Some("image/svg+xml"),
+                    "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"1\" height=\"1\"/>",
+                    "",
+                    "plaintext",
+                ),
+                (Some("image/png"), "invalid image", "", "plaintext"),
+            ] {
+                cx.update_window(handle, |_, window, cx| {
+                    window.activate_window();
+                    view.update(cx, |view, cx| {
+                        let mut incoming = message(content_type);
+                        incoming.payload = Bytes::copy_from_slice(raw.as_bytes());
+                        view.topics.receive(incoming, Instant::now());
+                        view.refresh_details(window, cx);
+                    });
+                    window.render_frame(cx);
+                    assert_eq!(window.find("preview-value").label(), Some("Show raw payload"));
+                    assert!(view.read(cx).payload_preview);
+                    assert_eq!(view.read(cx).payload.read(cx).value().as_str(), processed);
+                    assert_eq!(view.read(cx).payload.read(cx).language_name(), language);
+                    let preview = window.find("preview-value").bounds();
+                    assert!(preview.right() <= window.find("edit-value").bounds().left());
+
+                    window.click("preview-value", cx);
+                    assert_eq!(window.find("preview-value").label(), Some("Render payload"));
+                    assert!(!view.read(cx).payload_preview);
+                    if content_type.is_some() {
+                        assert!(window.find("payload-raw").visible());
+                        assert!(window.try_find("payload-editor").is_none());
+                        let raw_view = view.read(cx).payload_raw.as_ref().unwrap().read(cx);
+                        assert_eq!(raw_view.bytes().as_ref(), raw.as_bytes());
+                        assert!(view.read(cx).payload.read(cx).value().is_empty());
+                    } else {
+                        assert!(window.find("payload-editor").visible());
+                        assert_eq!(view.read(cx).payload.read(cx).value().as_str(), raw);
+                    }
+                    assert!(window.try_find("payload-image").is_none());
+                    assert!(window.try_find("payload-image-error").is_none());
+                    assert!(view.read(cx).payload_image.is_none());
+                    assert_eq!(view.read(cx).payload.read(cx).language_name(), "plaintext");
+                    assert!(view.read(cx).payload_ansi.get_ranges(cx).is_empty());
+                    assert!(view.read(cx).payload_highlight.ranges(cx).is_empty());
+
+                    // Updates retain the selected mode, including on another topic.
+                    view.update(cx, |view, cx| {
+                        let mut incoming = message(None);
+                        incoming.topic = "other".into();
+                        incoming.payload = Bytes::from_static(b"\x1b[32m{\"updated\":true}\x1b[0m");
+                        view.topics.receive(incoming, Instant::now());
+                        view.selected = Some("other".into());
+                        view.refresh_details(window, cx);
+                    });
+                    assert_eq!(view.read(cx).payload.read(cx).value().as_str(), "\x1b[32m{\"updated\":true}\x1b[0m");
+                    assert!(view.read(cx).payload_ansi.get_ranges(cx).is_empty());
+                    view.update(cx, |view, cx| {
+                        view.selected = Some("test".into());
+                        view.refresh_details(window, cx);
+                    });
+                    window.render_frame(cx);
+                    // Clicking the toggle focuses it; Space re-enables Preview.
+                    window.press("space", cx);
+                    assert_eq!(window.find("preview-value").label(), Some("Show raw payload"));
+                    assert!(view.read(cx).payload_preview);
+                    assert_eq!(view.read(cx).payload.read(cx).value().as_str(), processed);
+                    assert_eq!(view.read(cx).payload.read(cx).language_name(), language);
+                    assert!(view.read(cx).payload_highlight.ranges(cx).is_empty());
+                    if content_type.is_some() {
+                        assert!(window.find("payload-image").visible());
+                        assert!(window.try_find("payload-editor").is_none());
+                    } else {
+                        assert!(window.find("payload-editor").visible());
+                    }
+                    if raw.contains('\x1b') {
+                        assert!(!view.read(cx).payload_ansi.get_ranges(cx).is_empty());
+                    }
+                    window.click("copy-value", cx);
+                    assert_eq!(cx.read_from_clipboard().unwrap().text().unwrap(), raw);
+                })
+                .unwrap();
+                cx.run_until_parked();
+            }
+            cx.update_window(handle, |_, window, cx| {
+                window.click("preview-value", cx);
+                view.update(cx, |view, cx| {
+                    let mut incoming = message(Some("image/png"));
+                    incoming.payload = Bytes::from_static(b"\xff\x00A");
+                    view.topics.receive(incoming, Instant::now());
+                    view.refresh_details(window, cx);
+                });
+                window.render_frame(cx);
+                assert!(view.read(cx).payload.read(cx).value().is_empty());
+                assert!(window.find("payload-raw").visible());
+                assert!(window.find(("payload-raw-row", 0usize)).label().unwrap().contains("ff 00 41"));
+            })
+            .unwrap();
+            cx.run_until_parked();
+        }
+    }
+
+    #[gpui_kit::test]
+    fn large_raw_images_only_format_visible_bytes_and_support_navigation(cx: &mut TestAppContext) {
+        let (handle, view) = cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::appearance::register_bundled(cx).unwrap();
+            super::super::init(cx);
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::new(Default::default(), size(px(760.), px(540.))))),
+                    ..TitleBar::window_options()
+                },
+                cx,
+                |window, cx| {
+                    cx.new(|cx| {
+                        let mut explorer = Explorer::with_settings(None, None, None, window, cx);
+                        explorer.show_config = false;
+                        explorer.selected = Some("test".into());
+                        explorer.topics.receive(message(Some("image/png")), Instant::now());
+                        explorer.refresh_details(window, cx);
+                        explorer
+                    })
+                },
+            )
+            .unwrap()
+        });
+        // Include both binary and huge single-line textual image data.
+        for (content_type, byte) in [("image/png", 0xff), ("image/svg+xml", b'x')] {
+            let payload = Bytes::from(vec![byte; 32 * 1024 * 1024 + 3]);
+            let last_offset = (payload.len() - 1) / 16 * 16;
+            cx.update_window(handle, |_, window, cx| {
+                window.activate_window();
+                window.render_frame(cx);
+                if view.read(cx).payload_preview {
+                    window.click("preview-value", cx);
+                }
+                view.update(cx, |view, cx| {
+                    let mut incoming = message(Some(content_type));
+                    incoming.payload = payload.clone();
+                    view.topics.receive(incoming, Instant::now());
+                    view.refresh_details(window, cx);
+                });
+                window.render_frame(cx);
+                let raw = view.read(cx).payload_raw.as_ref().unwrap().clone();
+                assert!(window.find("payload-raw").visible());
+                assert!(window.try_find("payload-editor").is_none());
+                assert!(view.read(cx).payload.read(cx).value().is_empty());
+                assert_eq!(raw.read(cx).byte_count(), payload.len());
+                assert_eq!(
+                    raw.read(cx).bytes().as_ptr(),
+                    payload.as_ptr(),
+                    "Raw view must share, not copy, the payload"
+                );
+                assert!(raw.read(cx).rendered_rows > 0 && raw.read(cx).rendered_rows < 100);
+                assert!(window.find(("payload-raw-row", 0usize)).visible());
+                assert!(window.try_find(("payload-raw-row", 16_000usize)).is_none());
+
+                window.click("payload-raw", cx);
+                window.press("end", cx);
+                assert!(window.find(("payload-raw-row", last_offset)).visible());
+                assert!(raw.read(cx).rendered_rows < 100);
+                window.press("home", cx);
+                assert!(window.find(("payload-raw-row", 0usize)).visible());
+                window.press("pagedown", cx);
+                let offset = raw.read(cx).scroll_handle().0.borrow().base_handle.offset();
+                assert!(offset.y < px(0.));
+                window.press("down", cx);
+                assert!(raw.read(cx).scroll_handle().0.borrow().base_handle.offset().y < offset.y);
+                window.press("home", cx);
+                window.press("right", cx);
+                assert!(raw.read(cx).scroll_handle().0.borrow().base_handle.offset().x < px(0.));
+
+                // Updates preserve the entity/viewport without materializing all bytes.
+                window.press("end", cx);
+                view.update(cx, |view, cx| view.refresh_details(window, cx));
+                assert_eq!(raw, view.read(cx).payload_raw.as_ref().unwrap().clone());
+                window.render_frame(cx);
+                assert!(window.find(("payload-raw-row", last_offset)).visible());
+                assert!(raw.read(cx).rendered_rows < 100);
+                // Replacing a large payload with a short one clamps the viewport.
+                view.update(cx, |view, cx| {
+                    let mut incoming = message(Some(content_type));
+                    incoming.payload = Bytes::from_static(b"short image");
+                    view.topics.receive(incoming, Instant::now());
+                    view.refresh_details(window, cx);
+                });
+                window.render_frame(cx);
+                assert!(window.find(("payload-raw-row", 0usize)).visible());
+                assert_eq!(raw.read(cx).byte_count(), 11);
+                window.click("preview-value", cx);
+                assert!(window.find("payload-image").visible());
+                assert!(window.try_find("payload-raw").is_none());
+                assert!(view.read(cx).payload_raw.is_none());
+            })
+            .unwrap();
+            cx.run_until_parked();
+        }
+    }
+
     fn message(content_type: Option<&str>) -> Message {
         Message {
             topic: "test".into(),

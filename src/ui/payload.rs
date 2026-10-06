@@ -102,7 +102,10 @@ fn image_status(id: &'static str, message: &'static str, color: gpui_kit::Hsla) 
 
 impl Explorer {
     pub(super) fn payload_view(&self, cx: &Context<Self>) -> AnyElement {
-        if self.payload_format == "Image" {
+        if let Some(raw) = &self.payload_raw {
+            return raw.clone().into_any_element();
+        }
+        if self.payload_preview && self.payload_format == "Image" {
             let color = cx.theme().muted_foreground;
             let Some(image) = &self.payload_image else {
                 return image_status("payload-image-error", "Unsupported image content type", color);
@@ -145,6 +148,10 @@ impl Explorer {
             .into_any_element()
     }
 
+    pub(super) fn clear_payload_highlights(&mut self, cx: &mut App) {
+        self.payload_highlight.clear(cx);
+    }
+
     #[hotpath::measure(impl_type = "Explorer")]
     pub(super) fn refresh_details(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let value = self
@@ -152,9 +159,22 @@ impl Explorer {
             .as_ref()
             .and_then(|path| self.topics.nodes.get(path))
             .and_then(|node| node.value.as_ref());
+        let same_topic = self.payload_topic == self.selected;
         let image_type = value.and_then(|value| image_content_type(value.properties.content_type()));
+        // Images stay as shared bytes in raw mode. Never decode the complete payload
+        // into a text editor: binary data can produce enormous logical lines.
+        let raw_bytes = value.filter(|_| !self.payload_preview && image_type.is_some());
+        if let Some(value) = raw_bytes {
+            if same_topic && let Some(raw) = &self.payload_raw {
+                raw.update(cx, |raw, cx| raw.set_bytes(value.payload.clone(), cx));
+            } else {
+                self.payload_raw = Some(cx.new(|cx| super::payload_raw::RawPayload::new(value.payload.clone(), cx)));
+            }
+        } else {
+            self.payload_raw = None;
+        }
         let image_format = image_type.and_then(|mime_type| ImageFormat::from_mime_type(&mime_type.to_ascii_lowercase()));
-        let image_value = value.zip(image_format);
+        let image_value = value.zip(image_format).filter(|_| self.payload_preview);
         let same_image = match (&self.payload_image, image_value) {
             (Some(image), Some((value, format))) => image.format() == format && image.bytes() == value.payload.as_ref(),
             (None, None) => true,
@@ -173,25 +193,41 @@ impl Explorer {
         };
         let text = value
             .filter(|_| image_type.is_none())
-            .map(|value| value.display_payload())
+            .map(|value| {
+                if self.payload_preview {
+                    value.display_payload()
+                } else {
+                    String::from_utf8_lossy(&value.payload).into_owned()
+                }
+            })
             .unwrap_or_default();
-        let (text, ansi_styles) = if format == "Text" && text.contains('\x1b') {
+        let (text, ansi_styles) = if self.payload_preview && format == "Text" && text.contains('\x1b') {
             super::payload_ansi::parse(&text, cx.theme())
         } else {
             (text, Vec::new())
         };
-        let same_topic = self.payload_topic == self.selected;
         let previous = self.payload.read(cx).value();
         let changed = previous.as_str() != text;
-        let ranges = if same_topic && changed && self.payload_format == "JSON" && format == "JSON" && !Appearance::motion_reduced(cx) {
+        let ranges = if self.payload_preview
+            && same_topic
+            && changed
+            && self.payload_format == "JSON"
+            && self.payload.read(cx).language_name() == "json"
+            && format == "JSON"
+            && !Appearance::motion_reduced(cx)
+        {
             payload_diff::changed_ranges(previous.as_str(), &text)
         } else {
             Vec::new()
         };
         self.payload_format = format;
         self.payload_topic = self.selected.clone();
-        if !same_topic || changed {
-            let language = if format == "JSON" { "json" } else { "plaintext" };
+        let language = if self.payload_preview && format == "JSON" {
+            "json"
+        } else {
+            "plaintext"
+        };
+        if !same_topic || changed || self.payload.read(cx).language_name() != language {
             let offset = if same_topic {
                 self.payload_pending_scroll.unwrap_or_else(|| self.payload.read(cx).scroll_offset())
             } else {
@@ -215,7 +251,7 @@ impl Explorer {
                 editor.set_scroll_offset(offset, cx);
             });
             self.payload_highlight.set(ranges, Instant::now(), cx);
-        } else if format == "Image" || Appearance::motion_reduced(cx) {
+        } else if !self.payload_preview || format == "Image" || Appearance::motion_reduced(cx) {
             self.payload_highlight.clear(cx);
         }
         self.payload_ansi.set(

@@ -11,7 +11,7 @@ use gpui_kit::assets::IconName as AssetIconName;
 use gpui_kit::component::{
     ActiveTheme, Disableable, Icon, IconName, IndexPath, Sizable, StyledExt, TITLE_BAR_HEIGHT, TitleBar, WindowExt,
     alert::Alert,
-    button::{Button, ButtonVariant, ButtonVariants},
+    button::{Button, ButtonVariant, ButtonVariants, Toggle},
     input::{EditorState, Input, InputEvent, InputState},
     marker::{Marker, MarkerContent},
     menu::{DropdownMenu, PopupMenuItem},
@@ -38,6 +38,7 @@ mod explorer_pane;
 mod payload;
 mod payload_ansi;
 mod payload_diff;
+mod payload_raw;
 
 use explorer_pane::{ExplorerPane, ExplorerPaneKind};
 mod publish;
@@ -66,6 +67,7 @@ gpui_kit::actions!(
 );
 
 pub(crate) fn init(cx: &mut App) {
+    payload_raw::init(cx);
     cx.bind_keys([
         KeyBinding::new("secondary-,", OpenConnection, Some("Explorer")),
         KeyBinding::new("escape", CancelConnection, Some("SettingsDialog")),
@@ -212,6 +214,8 @@ pub struct Explorer {
     expanded: BTreeSet<String>,
     selected: Option<String>,
     payload: Entity<EditorState>,
+    payload_preview: bool,
+    payload_raw: Option<Entity<payload_raw::RawPayload>>,
     payload_image: Option<std::sync::Arc<gpui_kit::Image>>,
     payload_format: &'static str,
     payload_topic: Option<String>,
@@ -468,6 +472,8 @@ impl Explorer {
             username,
             password,
             payload,
+            payload_preview: true,
+            payload_raw: None,
             payload_image: None,
             payload_format: "Text",
             payload_topic: None,
@@ -1447,6 +1453,22 @@ impl Explorer {
                         .h_flex()
                         .flex_none()
                         .child(div().flex_1().font_medium().child("Latest value"))
+                        .child(
+                            Toggle::new("preview-value")
+                                .small()
+                                .icon(AssetIconName::Eye)
+                                .tooltip(if self.payload_preview {
+                                    "Show raw payload"
+                                } else {
+                                    "Render payload"
+                                })
+                                .checked(self.payload_preview)
+                                .on_click(cx.listener(|view, checked, window, cx| {
+                                    view.payload_preview = *checked;
+                                    view.clear_payload_highlights(cx);
+                                    view.refresh_details(window, cx);
+                                })),
+                        )
                         .child(
                             Button::new("edit-value")
                                 .ghost()
