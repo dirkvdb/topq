@@ -178,7 +178,7 @@ pub(crate) fn init(cx: &mut App) {
             if let Err(error) = load_custom(&path.with_file_name("themes"), cx) {
                 eprintln!("Could not load custom themes: {error:#}");
             }
-            load_or_default(&path.with_file_name("appearance.json"), cx)
+            load_or_default(&path, cx)
         }
         Err(error) => {
             eprintln!("Could not locate appearance settings: {error:#}");
@@ -194,10 +194,9 @@ pub(crate) fn init(cx: &mut App) {
 }
 
 pub(crate) fn load(path: &Path, cx: &App) -> Result<Appearance> {
-    let mut preferences = match fs::read(path) {
-        Ok(data) => {
-            let value: serde_json::Value = serde_json::from_slice(&data).context("Could not parse appearance.json.")?;
-            let mut preferences: Appearance = serde_json::from_value(value.clone()).context("Could not parse appearance.json.")?;
+    let mut preferences = match config::read_config_value(path)? {
+        Some(value) => {
+            let mut preferences: Appearance = serde_json::from_value(value.clone()).context("Could not parse appearance settings.")?;
             // New settings take precedence if a file contains both schemas.
             if !["mode", "light_theme", "dark_theme"].iter().any(|key| value.get(key).is_some()) {
                 match value.get("theme") {
@@ -218,13 +217,16 @@ pub(crate) fn load(path: &Path, cx: &App) -> Result<Appearance> {
                         }
                     }
                     None => {}
-                    Some(_) => return Err(anyhow!("Could not parse appearance.json: legacy theme must be a string or null.")),
+                    Some(_) => {
+                        return Err(anyhow!(
+                            "Could not parse appearance settings: legacy theme must be a string or null."
+                        ));
+                    }
                 }
             }
             preferences
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Appearance::default(),
-        Err(error) => return Err(error).context("Could not read appearance.json."),
+        None => Appearance::default(),
     };
     preferences.path = Some(path.to_path_buf());
     preferences.recover_slots(cx);
@@ -362,10 +364,10 @@ pub(crate) fn set_reduce_motion(reduce_motion: ReduceMotion, cx: &mut App) -> Re
 fn save(cx: &mut App) -> Result<()> {
     let path = match &cx.global::<Appearance>().path {
         Some(path) => path.clone(),
-        None => config::config_path()?.with_file_name("appearance.json"),
+        None => config::config_path()?,
     };
     cx.global_mut::<Appearance>().path = Some(path.clone());
-    config::write_json(&path, cx.global::<Appearance>())
+    config::update_json(&path, cx.global::<Appearance>())
 }
 
 pub(crate) fn sync_system(window: &mut Window, cx: &mut App) {
@@ -812,7 +814,7 @@ mod tests {
                 assert_tokens(cx);
             }
             let preferences = cx.global::<Appearance>();
-            config::write_json(&path, preferences).unwrap();
+            config::update_json(&path, preferences).unwrap();
             let loaded = load(&path, cx).unwrap();
             assert_eq!(loaded.light_theme, "Custom Light");
             assert_eq!(loaded.dark_theme, "Custom Dark");
@@ -888,7 +890,7 @@ mod tests {
             setup(cx, &setup_path);
             cx.set_global(Appearance::default());
             assert!(cx.global::<Appearance>().path.is_none());
-            let expected_path = config::config_path().unwrap().with_file_name("appearance.json");
+            let expected_path = config::config_path().unwrap();
             assert_ne!(expected_path, setup_path);
 
             save(cx).unwrap();
@@ -897,7 +899,9 @@ mod tests {
             assert!(!setup_path.exists());
             let saved: serde_json::Value = serde_json::from_slice(&fs::read(&expected_path).unwrap()).unwrap();
             let expected = serde_json::to_value(Appearance::default()).unwrap();
-            assert_eq!(saved, expected);
+            for (key, value) in expected.as_object().unwrap() {
+                assert_eq!(&saved[key], value);
+            }
             let reloaded = load(&expected_path, cx).unwrap();
             assert_eq!(reloaded.path.as_deref(), Some(expected_path.as_path()));
             assert_eq!(serde_json::to_value(reloaded).unwrap(), expected);

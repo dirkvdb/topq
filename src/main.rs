@@ -20,6 +20,7 @@ fn main() {
     init_logging();
     gpui_kit::application().with_assets(gpui_kit::assets::AllAssets).run(|cx| {
         gpui_kit::init(cx);
+
         appearance::init(cx);
         ui::init(cx);
         cx.on_window_closed(|cx, _| {

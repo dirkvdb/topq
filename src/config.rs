@@ -278,13 +278,13 @@ std::thread_local! {
 
 #[cfg(test)]
 pub fn config_path() -> Result<PathBuf> {
-    Ok(TEST_CONFIG_DIR.with(|dir| dir.path().join("topq").join("connections.json")))
+    Ok(TEST_CONFIG_DIR.with(|dir| dir.path().join("topq").join("config.json")))
 }
 
 #[cfg(not(test))]
 pub fn config_path() -> Result<PathBuf> {
     let dirs = ProjectDirs::from("", "", "topq").context("Could not locate your application configuration directory.")?;
-    Ok(dirs.config_dir().join("connections.json"))
+    Ok(dirs.config_dir().join("config.json"))
 }
 
 /// An absent selection means no connection is active, even when the list is nonempty.
@@ -309,12 +309,18 @@ struct StoredConnections {
 }
 
 fn read_connections(path: &Path) -> Result<Option<StoredConnections>> {
-    let data = match fs::read(path) {
-        Ok(data) => data,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error).context("Could not read the saved connections."),
+    let Some(value) = read_config_value(path)? else {
+        return Ok(None);
     };
-    let stored = serde_json::from_slice(&data).context("Could not parse the saved connections.")?;
+    if path.file_name().is_some_and(|name| name == "config.json") && value.get("connections").is_none() {
+        let appearance_only = ["mode", "light_theme", "dark_theme", "reduce_motion", "theme"]
+            .iter()
+            .any(|key| value.get(key).is_some());
+        if appearance_only || value.as_object().is_some_and(serde_json::Map::is_empty) {
+            return Ok(Some(StoredConnections::default()));
+        }
+    }
+    let stored = serde_json::from_value(value).context("Could not parse the saved connections.")?;
     Ok(Some(stored))
 }
 
@@ -454,7 +460,7 @@ fn save_connections_to(path: &Path, saved: &SavedConnections, entry: &impl Fn(&C
                 applied.push(index);
             }
         }
-        write_json(path, &stored)
+        update_json(path, &stored)
     })();
     if let Err(error) = result {
         if rollback_credentials(&changes, &applied, entry).is_err() {
@@ -753,7 +759,30 @@ fn write_toml(path: &Path, value: &impl Serialize) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
+pub(crate) fn update_json(path: &Path, value: &impl Serialize) -> Result<()> {
+    if path.file_name().is_none_or(|name| name != "config.json") {
+        return write_json(path, value);
+    }
+    let mut current = read_config_value(path)?.unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+    let updates = serde_json::to_value(value)?;
+    let (Some(current), Some(updates)) = (current.as_object_mut(), updates.as_object()) else {
+        return Err(anyhow!("Configuration settings must be JSON objects."));
+    };
+    current.extend(updates.clone());
+    write_json(path, &current)
+}
+
+pub(crate) fn read_config_value(path: &Path) -> Result<Option<serde_json::Value>> {
+    match fs::read(path) {
+        Ok(data) => serde_json::from_slice(&data)
+            .map(Some)
+            .context("Could not parse the configuration file."),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).context("Could not read the configuration file."),
+    }
+}
+
+fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
     fs::create_dir_all(path.parent().context("Invalid configuration path.")?).context("Could not create the configuration directory.")?;
     let temp = path.with_extension("json.tmp");
     let mut options = fs::OpenOptions::new();
@@ -1311,16 +1340,40 @@ mod tests {
     }
 
     #[test]
-    fn multi_connection_file_uses_a_new_path() {
-        assert_eq!(config_path().unwrap().file_name().unwrap(), "connections.json");
+    fn application_configuration_uses_a_single_config_file() {
+        assert_eq!(config_path().unwrap().file_name().unwrap(), "config.json");
+    }
+
+    #[test]
+    fn unified_config_updates_preserve_both_settings_sections() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.json");
+        fs::write(
+            &path,
+            r#"{"mode":"dark","reduce_motion":"on","connections":[],"active_connection":null}"#,
+        )
+        .unwrap();
+
+        update_json(&path, &serde_json::json!({"light_theme":"Ayu Light"})).unwrap();
+        update_json(
+            &path,
+            &serde_json::json!({"connections":[{"name":"Home"}],"active_connection":"Home"}),
+        )
+        .unwrap();
+        let saved = read_config_value(&path).unwrap().unwrap();
+        assert_eq!(saved["mode"], "dark");
+        assert_eq!(saved["reduce_motion"], "on");
+        assert_eq!(saved["light_theme"], "Ayu Light");
+        assert_eq!(saved["connections"][0]["name"], "Home");
+        assert_eq!(saved["active_connection"], "Home");
     }
 
     #[test]
     fn application_persistence_uses_temporary_configuration_and_mock_credentials() {
         let path = config_path().unwrap();
         TEST_CONFIG_DIR.with(|dir| {
-            assert_eq!(path, dir.path().join("topq").join("connections.json"));
-            assert!(path.with_file_name("appearance.json").starts_with(dir.path()));
+            assert_eq!(path, dir.path().join("topq").join("config.json"));
+            assert!(path.starts_with(dir.path()));
         });
         let config = authenticated_config();
         let entry = password_entry(&config).unwrap();
