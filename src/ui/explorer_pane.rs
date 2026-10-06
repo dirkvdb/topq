@@ -136,6 +136,11 @@ mod tests {
             for (content_type, payload, expected_error) in [
                 (Some(" image/svg+xml ; charset=utf-8"), SVG, None),
                 (Some("IMAGE/PNG"), PNG, None),
+                (
+                    Some("image/svg+xml; charset=utf-8; profile=very-long-profile-name-for-the-original-image-content-type-badge"),
+                    SVG,
+                    None,
+                ),
                 (Some("image/svg+xml"), SQUARE, None),
                 (Some("image/svg+xml"), WIDE, None),
                 (Some("image/svg+xml"), TALL, None),
@@ -171,6 +176,10 @@ mod tests {
                             content_type.is_some_and(|content_type| content_type.trim().to_ascii_lowercase().starts_with("image/"));
                         if is_image {
                             assert_eq!(explorer.payload_format, "Image");
+                            let badge = window.find("payload-format");
+                            assert_eq!(badge.label(), content_type);
+                            assert!(badge.visible());
+                            assert!(badge.bounds().right() <= window.find("topic-metadata").bounds().right());
                             assert!(explorer.payload.read(cx).value().is_empty());
                             assert!(window.try_find("payload-editor").is_none());
                             if let Some(expected_error) = expected_error {
@@ -216,6 +225,7 @@ mod tests {
                             assert!(explorer.payload_image.is_none());
                             assert!(window.find("payload-editor").visible());
                             assert_ne!(explorer.payload_format, "Image");
+                            assert_eq!(window.find("payload-format").label(), Some(explorer.payload_format));
                         }
                         if let Some(previous) = &previous_image {
                             assert!(!previous.is_asset_cached(cx), "Replaced images must leave the asset cache");
@@ -326,6 +336,7 @@ mod tests {
                     }
                     assert!(window.find("payload").bounds().size.height > px(0.));
                     assert_eq!(view.read(cx).payload_format, "JSON");
+                    assert_eq!(window.find("payload-format").label(), Some("JSON"));
                     assert_eq!(view.read(cx).payload.read(cx).value().as_str(), "{\n  \"on\": true\n}");
                 })
                 .unwrap();

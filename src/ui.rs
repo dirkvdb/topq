@@ -1319,6 +1319,12 @@ impl Explorer {
         );
         let mut content = div().v_flex().p_4().gap_4().flex_1().min_h_0().min_w_0();
         if let Some(value) = &node.value {
+            let payload_format_label = if self.payload_format == "Image" {
+                value.properties.content_type().unwrap_or(self.payload_format)
+            } else {
+                self.payload_format
+            };
+
             content = content
                 .child(
                     div()
@@ -1332,7 +1338,17 @@ impl Explorer {
                                 .test_support()
                                 .gap_2()
                                 .flex_wrap()
-                                .child(Tag::secondary().small().child(self.payload_format))
+                                .child(
+                                    Tag::secondary().small().min_w_0().child(
+                                        div()
+                                            .id("payload-format")
+                                            .test_support()
+                                            .aria_label(payload_format_label.to_owned())
+                                            .min_w_0()
+                                            .truncate()
+                                            .child(payload_format_label.to_owned()),
+                                    ),
+                                )
                                 .child(Tag::secondary().small().child(format!("QoS {}", value.qos)))
                                 .child(Tag::secondary().small().child(format!(
                                     "{} {}",
