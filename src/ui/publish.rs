@@ -1,9 +1,15 @@
 //! Draft composition and publishing below the live topic tree.
 
-use std::ops::Range;
+use std::{fs::File, io::Read, ops::Range, path::Path, sync::Arc};
+
+use anyhow::{Context as _, ensure};
 
 use super::{CompletePublishTopic, Explorer, GrowPublish, PublishMessage, ShrinkPublish};
-use crate::{config, mqtt::Qos};
+use crate::{
+    config,
+    mqtt::{self, Qos},
+};
+use gpui_kit::assets::IconName as AssetIconName;
 use gpui_kit::base::{
     ElementExt,
     input::{Diagnostic, DiagnosticSeverity},
@@ -18,7 +24,85 @@ use gpui_kit::component::{
     resizable::ResizableState,
     select::Select,
 };
-use gpui_kit::{Context, Entity, IntoElement, Role, TestSupportExt, Window, div, prelude::*, relative, rems};
+use gpui_kit::{
+    AnyElement, Context, Entity, Image, ImageFormat, IntoElement, ObjectFit, PathPromptOptions, Role, SharedString, StyledImage,
+    TestSupportExt, Window, div, img, prelude::*, relative, rems,
+};
+
+pub(super) struct PublishFile {
+    name: SharedString,
+    payload: Vec<u8>,
+    content_type: &'static str,
+    image: Option<Arc<Image>>,
+}
+
+impl PublishFile {
+    fn read(path: &Path) -> anyhow::Result<Self> {
+        let metadata = std::fs::metadata(path).with_context(|| format!("Could not read {}", path.display()))?;
+        ensure!(metadata.is_file(), "Select a regular data file.");
+        ensure!(
+            metadata.len() <= u64::from(mqtt::MAX_PACKET_SIZE),
+            "File exceeds the 16 MiB MQTT packet limit."
+        );
+        let file = File::open(path).with_context(|| format!("Could not open {}", path.display()))?;
+        let mut payload = Vec::new();
+        file.take(u64::from(mqtt::MAX_PACKET_SIZE) + 1)
+            .read_to_end(&mut payload)
+            .with_context(|| format!("Could not read {}", path.display()))?;
+        ensure!(
+            payload.len() <= mqtt::MAX_PACKET_SIZE as usize,
+            "File exceeds the 16 MiB MQTT packet limit."
+        );
+        let content_type = file_content_type(path);
+        let image = ImageFormat::from_mime_type(content_type).map(|format| Arc::new(Image::from_bytes(format, payload.clone())));
+        let name = path.file_name().unwrap_or(path.as_os_str()).to_string_lossy().into_owned().into();
+        Ok(Self {
+            name,
+            payload,
+            content_type,
+            image,
+        })
+    }
+}
+
+fn file_content_type(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "png" => "image/png",
+        "jpg" | "jpeg" | "jpe" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "bmp" => "image/bmp",
+        "tif" | "tiff" => "image/tiff",
+        "ico" => "image/ico",
+        "pbm" | "pgm" | "ppm" | "pnm" => "image/x-portable-anymap",
+        "avif" => "image/avif",
+        "json" => "application/json",
+        "pdf" => "application/pdf",
+        "xml" => "application/xml",
+        "txt" | "log" => "text/plain",
+        "csv" => "text/csv",
+        _ => "application/octet-stream",
+    }
+}
+
+fn file_preview_status(message: &'static str, color: gpui_kit::Hsla) -> AnyElement {
+    div()
+        .size_full()
+        .v_flex()
+        .items_center()
+        .justify_center()
+        .text_xs()
+        .text_color(color)
+        .child(message)
+        .into_any_element()
+}
 
 #[derive(Default)]
 pub(super) enum PayloadContent {
@@ -93,6 +177,8 @@ impl Explorer {
             return;
         };
         let payload = value.display_payload();
+        self.publish_file_task = None;
+        self.clear_publish_file(cx);
         self.set_publish_open(true, cx);
         self.publish_topic.update(cx, |input, cx| input.set_value(topic, window, cx));
         self.publish_payload.update(cx, |editor, cx| {
@@ -105,6 +191,9 @@ impl Explorer {
     }
 
     pub(super) fn update_publish_content(&mut self, cx: &mut Context<Self>) {
+        if self.publish_file.is_some() {
+            return;
+        }
         let text = self.publish_payload.read(cx).value();
         self.publish_content = PayloadContent::detect(text.as_str());
         let language = self.publish_content.language();
@@ -133,6 +222,160 @@ impl Explorer {
             cx.notify();
         });
         cx.notify();
+    }
+
+    fn clear_publish_file(&mut self, cx: &mut Context<Self>) {
+        if let Some(file) = self.publish_file.take()
+            && let Some(image) = file.image
+        {
+            image.remove_asset(cx);
+        }
+    }
+
+    fn remove_publish_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.publish_pending || self.publish_file_task.is_some() {
+            return;
+        }
+        self.clear_publish_file(cx);
+        self.publish_feedback = None;
+        self.update_publish_content(cx);
+        self.publish_payload.update(cx, |editor, cx| editor.focus(window, cx));
+    }
+
+    fn choose_publish_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.publish_pending || self.publish_file_task.is_some() {
+            return;
+        }
+        let selection = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Load payload file".into()),
+        });
+        let background = cx.background_executor().clone();
+        let restore_focus = window.focused(cx);
+        self.publish_file_task = Some(cx.spawn_in(window, async move |view, cx| {
+            let result: anyhow::Result<Option<PublishFile>> = async {
+                let Some(path) = selection.await??.and_then(|paths| paths.into_iter().next()) else {
+                    return Ok(None);
+                };
+                background.spawn(async move { PublishFile::read(&path) }).await.map(Some)
+            }
+            .await;
+            _ = view.update_in(cx, |view, window, cx| {
+                view.publish_file_task = None;
+                match result {
+                    Ok(Some(file)) => {
+                        view.clear_publish_file(cx);
+                        view.publish_file = Some(file);
+                        view.publish_feedback = None;
+                        if view.publish_open && !view.show_config {
+                            view.publish_topic.update(cx, |input, cx| input.focus(window, cx));
+                        }
+                    }
+                    Ok(None) => {
+                        if view.publish_open
+                            && !view.show_config
+                            && let Some(focus) = restore_focus
+                        {
+                            focus.focus(window, cx);
+                        }
+                    }
+                    Err(error) => view.publish_feedback = Some(Err(format!("Could not load payload file: {error:#}"))),
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    fn publish_payload_view(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(file) = &self.publish_file else {
+            return Editor::new(&self.publish_payload)
+                .h(relative(1.))
+                .w_full()
+                .text_sm()
+                .aria_label("Publish payload")
+                .into_any_element();
+        };
+        let color = cx.theme().muted_foreground;
+        div()
+            .id("publish-file")
+            .test_support()
+            .v_flex()
+            .size_full()
+            .min_w_0()
+            .min_h_0()
+            .gap_1()
+            .child(
+                div()
+                    .h_flex()
+                    .flex_none()
+                    .min_w_0()
+                    .gap_1()
+                    .child(
+                        div()
+                            .id("publish-file-name")
+                            .test_support()
+                            .aria_label(file.name.clone())
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_sm()
+                            .child(file.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .id("publish-file-size")
+                            .test_support()
+                            .aria_label(format!("{} bytes", file.payload.len()))
+                            .flex_none()
+                            .text_xs()
+                            .text_color(color)
+                            .child(format!("{} bytes", file.payload.len())),
+                    )
+                    .child(
+                        Button::new("remove-publish-file")
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::Close)
+                            .accessibility_label("Remove file and restore text draft")
+                            .tooltip("Remove file")
+                            .disabled(self.publish_pending || self.publish_file_task.is_some())
+                            .on_click(cx.listener(|view, _, window, cx| view.remove_publish_file(window, cx))),
+                    ),
+            )
+            .child(
+                div()
+                    .id("publish-file-preview")
+                    .test_support()
+                    .when(file.image.is_some(), |preview| preview.role(Role::Image))
+                    .aria_label("Payload file preview")
+                    .relative()
+                    .overflow_hidden()
+                    .flex_1()
+                    .min_w_0()
+                    .min_h_0()
+                    .map(|preview| {
+                        if let Some(image) = &file.image {
+                            preview.child(
+                                // Keep the image's intrinsic aspect ratio out of flex sizing.
+                                img(image.clone())
+                                    .id(("publish-file-image", image.id()))
+                                    .absolute()
+                                    .inset_0()
+                                    .size_full()
+                                    .object_fit(ObjectFit::ScaleDown)
+                                    .with_loading(move || file_preview_status("Loading image…", color))
+                                    .with_fallback(move || file_preview_status("Image preview unavailable", color))
+                                    .test_support(),
+                            )
+                        } else {
+                            preview.child(file_preview_status("File bytes will be published unchanged.", color))
+                        }
+                    }),
+            )
+            .into_any_element()
     }
 
     fn resize_publish(&mut self, grow: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -170,7 +413,7 @@ impl Explorer {
     }
 
     fn publish_message(&mut self, _: &mut Window, cx: &mut Context<Self>) {
-        if self.publish_pending {
+        if self.publish_pending || self.publish_file_task.is_some() {
             return;
         }
         let result = if self.status.is_connected() {
@@ -183,12 +426,23 @@ impl Explorer {
                         Some(&"2") => Qos::ExactlyOnce,
                         _ => Qos::AtMostOnce,
                     };
-                    connection.publish(
-                        self.publish_topic.read(cx).value().to_string(),
-                        self.publish_payload.read(cx).value().as_bytes().to_vec(),
-                        qos,
-                        self.publish_retain,
-                    )
+                    let topic = self.publish_topic.read(cx).value().to_string();
+                    if let Some(file) = &self.publish_file {
+                        connection.publish_with_content_type(
+                            topic,
+                            file.payload.clone(),
+                            qos,
+                            self.publish_retain,
+                            Some(file.content_type.to_owned()),
+                        )
+                    } else {
+                        connection.publish(
+                            topic,
+                            self.publish_payload.read(cx).value().as_bytes().to_vec(),
+                            qos,
+                            self.publish_retain,
+                        )
+                    }
                 })
         } else {
             Err(anyhow::anyhow!("Connect to a broker before publishing."))
@@ -205,7 +459,12 @@ impl Explorer {
 
     pub(super) fn publish_panel(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let connected = self.status.is_connected() && self.connection.is_some();
-        let enabled = connected && !self.publish_pending && !self.publish_topic.read(cx).value().is_empty();
+        let enabled =
+            connected && !self.publish_pending && self.publish_file_task.is_none() && !self.publish_topic.read(cx).value().is_empty();
+        let content_type = self
+            .publish_file
+            .as_ref()
+            .map_or(self.publish_content.label(), |file| file.content_type);
         let view = cx.weak_entity();
         div()
             .id("publish-panel")
@@ -292,61 +551,98 @@ impl Explorer {
                                     .min_h_0()
                                     .min_w_0()
                                     .child(
-                                        div().h_flex().justify_between().child("Payload").child(
-                                            div()
-                                                .id("publish-content-type")
-                                                .test_support()
-                                                .aria_label(self.publish_content.label())
-                                                .text_xs()
-                                                .text_color(cx.theme().muted_foreground)
-                                                .child(self.publish_content.label()),
-                                        ),
+                                        div()
+                                            .h_flex()
+                                            .flex_none()
+                                            .min_w_0()
+                                            .gap_2()
+                                            .justify_between()
+                                            .child("Payload")
+                                            .child(
+                                                div()
+                                                    .id("publish-content-type")
+                                                    .test_support()
+                                                    .aria_label(content_type)
+                                                    .min_w_0()
+                                                    .truncate()
+                                                    .text_xs()
+                                                    .text_color(cx.theme().muted_foreground)
+                                                    .child(content_type),
+                                            ),
                                     )
                                     .child(
-                                        div().id("publish-payload").test_support().flex_1().min_h_0().child(
-                                            Editor::new(&self.publish_payload)
-                                                .h(relative(1.))
-                                                .w_full()
-                                                .text_sm()
-                                                .aria_label("Publish payload"),
-                                        ),
+                                        div()
+                                            .id("publish-payload")
+                                            .test_support()
+                                            .flex_1()
+                                            .min_h_0()
+                                            .min_w_0()
+                                            .child(self.publish_payload_view(cx)),
                                     ),
                             )
                             .child(
                                 div()
                                     .h_flex()
                                     .flex_none()
-                                    .gap_2()
-                                    .child("QoS")
+                                    .text_sm()
                                     .child(
-                                        Select::new(&self.publish_qos)
-                                            .id("publish-qos")
-                                            .small()
-                                            .w_16()
-                                            .accessibility_label("Publish QoS"),
+                                        div()
+                                            .h_flex()
+                                            .flex_none()
+                                            .gap_1()
+                                            .child(
+                                                div()
+                                                    .id("publish-qos-field")
+                                                    .test_support()
+                                                    .h_flex()
+                                                    .flex_none()
+                                                    .gap_1()
+                                                    .child("QoS")
+                                                    .child(
+                                                        Select::new(&self.publish_qos)
+                                                            .id("publish-qos")
+                                                            .small()
+                                                            .w(rems(3.5))
+                                                            .accessibility_label("Publish QoS"),
+                                                    ),
+                                            )
+                                            .child(
+                                                Checkbox::new("publish-retain")
+                                                    .small()
+                                                    .label("Retain")
+                                                    .checked(self.publish_retain)
+                                                    .on_change(cx.listener(|view, checked, _, cx| {
+                                                        view.publish_retain = *checked;
+                                                        cx.notify();
+                                                    })),
+                                            ),
                                     )
                                     .child(div().flex_1())
                                     .child(
-                                        Checkbox::new("publish-retain")
-                                            .small()
-                                            .label("Retain")
-                                            .checked(self.publish_retain)
-                                            .on_change(cx.listener(|view, checked, _, cx| {
-                                                view.publish_retain = *checked;
-                                                cx.notify();
-                                            })),
+                                        div()
+                                            .h_flex()
+                                            .flex_none()
+                                            .gap_1()
+                                            .child(
+                                                Button::new("load-publish-file")
+                                                    .small()
+                                                    .icon(AssetIconName::Upload)
+                                                    .tooltip("Load file")
+                                                    .accessibility_label("Load payload from file")
+                                                    .disabled(self.publish_pending || self.publish_file_task.is_some())
+                                                    .loading(self.publish_file_task.is_some())
+                                                    .on_click(cx.listener(|view, _, window, cx| view.choose_publish_file(window, cx))),
+                                            )
+                                            .child(
+                                                Button::new("publish-message")
+                                                    .small()
+                                                    .label("Publish")
+                                                    .disabled(!enabled)
+                                                    .loading(self.publish_pending)
+                                                    .tooltip("Publish message (Ctrl+Enter)")
+                                                    .on_click(cx.listener(|view, _, window, cx| view.publish_message(window, cx))),
+                                            ),
                                     ),
-                            )
-                            .child(
-                                div().h_flex().flex_none().justify_end().child(
-                                    Button::new("publish-message")
-                                        .small()
-                                        .label("Publish")
-                                        .disabled(!enabled)
-                                        .loading(self.publish_pending)
-                                        .tooltip("Publish message (Ctrl+Enter)")
-                                        .on_click(cx.listener(|view, _, window, cx| view.publish_message(window, cx))),
-                                ),
                             )
                             .when(!connected && self.publish_feedback.is_none(), |form| {
                                 form.child(
@@ -373,6 +669,10 @@ impl Explorer {
                                     div()
                                         .id("publish-feedback")
                                         .test_support()
+                                        .aria_label(message.clone())
+                                        .flex_none()
+                                        .max_h_12()
+                                        .overflow_y_scroll()
                                         .child(Alert::error("publish-feedback-content", message.clone()).banner()),
                                 ),
                             }),
@@ -383,7 +683,58 @@ impl Explorer {
 
 #[cfg(test)]
 mod tests {
-    use super::{PayloadContent, json_error_range};
+    use std::path::Path;
+
+    use super::{PayloadContent, PublishFile, file_content_type, json_error_range};
+
+    #[test]
+    fn file_content_type_recognizes_image_extensions_and_binary_fallback() {
+        for (name, expected) in [
+            ("photo.PNG", "image/png"),
+            ("photo.jpeg", "image/jpeg"),
+            ("photo.jpg", "image/jpeg"),
+            ("animation.GIF", "image/gif"),
+            ("photo.webp", "image/webp"),
+            ("drawing.svg", "image/svg+xml"),
+            ("scan.tiff", "image/tiff"),
+            ("icon.ico", "image/ico"),
+            ("data.json", "application/json"),
+            ("data.csv", "text/csv"),
+            ("data.unknown", "application/octet-stream"),
+            ("no-extension", "application/octet-stream"),
+        ] {
+            assert_eq!(file_content_type(Path::new(name)), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn data_files_preserve_binary_text_and_empty_bytes_without_formatting() {
+        let directory = tempfile::tempdir().unwrap();
+        for (name, payload) in [
+            ("raw.bin", b"\x00\xff\x80\r\n".as_slice()),
+            ("data.json", b"{\r\n\"value\":1}\r\n".as_slice()),
+            ("empty.txt", b"".as_slice()),
+        ] {
+            let path = directory.path().join(name);
+            std::fs::write(&path, payload).unwrap();
+            let file = PublishFile::read(&path).unwrap();
+            assert_eq!(file.payload, payload);
+            assert_eq!(file.name.as_str(), name);
+            assert!(file.image.is_none());
+        }
+    }
+
+    #[test]
+    fn image_file_preview_uses_the_same_unmodified_bytes_as_the_payload() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("image.SVG");
+        let payload = br#"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"/>"#;
+        std::fs::write(&path, payload).unwrap();
+        let file = PublishFile::read(&path).unwrap();
+        assert_eq!(file.content_type, "image/svg+xml");
+        assert_eq!(file.image.as_ref().unwrap().bytes(), file.payload);
+        assert_eq!(file.payload, payload);
+    }
 
     #[test]
     fn only_a_literal_leading_brace_enables_json() {

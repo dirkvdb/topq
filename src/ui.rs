@@ -12,7 +12,7 @@ use gpui_kit::component::{
     ActiveTheme, Disableable, Icon, IconName, IndexPath, Sizable, StyledExt, TITLE_BAR_HEIGHT, TitleBar, WindowExt,
     alert::Alert,
     button::{Button, ButtonVariant, ButtonVariants},
-    input::{Editor, EditorState, Input, InputEvent, InputState},
+    input::{EditorState, Input, InputEvent, InputState},
     marker::{Marker, MarkerContent},
     menu::{DropdownMenu, PopupMenuItem},
     resizable::{ResizablePanelEvent, ResizableState, h_resizable, resizable_panel, v_resizable},
@@ -24,7 +24,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::{
     App, ClipboardItem, Context, Entity, FocusHandle, HighlightStyle, IntoElement, KeyBinding, Render, Role, ScrollStrategy, SharedString,
-    StyleRefinement, StyledText, Subscription, Task, TestSupportExt, Window, div, prelude::*, relative, rems,
+    StyleRefinement, StyledText, Subscription, Task, TestSupportExt, Window, div, prelude::*, rems,
 };
 
 use crate::{
@@ -200,6 +200,7 @@ pub struct Explorer {
     expanded: BTreeSet<String>,
     selected: Option<String>,
     payload: Entity<EditorState>,
+    payload_image: Option<std::sync::Arc<gpui_kit::Image>>,
     payload_format: &'static str,
     payload_topic: Option<String>,
     payload_pending_scroll: Option<gpui_kit::Point<gpui_kit::Pixels>>,
@@ -209,6 +210,8 @@ pub struct Explorer {
     publish_topic_completion: Option<topic_completion::TopicCompletion>,
     publish_payload: Entity<EditorState>,
     publish_content: publish::PayloadContent,
+    publish_file: Option<publish::PublishFile>,
+    publish_file_task: Option<Task<()>>,
     publish_qos: Entity<SelectState<Vec<&'static str>>>,
     publish_retain: bool,
     publish_pending: bool,
@@ -443,6 +446,7 @@ impl Explorer {
             username,
             password,
             payload,
+            payload_image: None,
             payload_format: "Text",
             payload_topic: None,
             payload_pending_scroll: None,
@@ -452,6 +456,8 @@ impl Explorer {
             publish_topic_completion: None,
             publish_payload,
             publish_content: publish::PayloadContent::default(),
+            publish_file: None,
+            publish_file_task: None,
             publish_qos,
             publish_retain: false,
             publish_pending: false,
@@ -1407,14 +1413,14 @@ impl Explorer {
                         ),
                 )
                 .child(
-                    div().id("payload").test_support().flex_1().min_h_0().min_w_0().w_full().child(
-                        Editor::new(&self.payload)
-                            .readonly(true)
-                            .h(relative(1.))
-                            .w_full()
-                            .text_sm()
-                            .aria_label("Latest topic payload"),
-                    ),
+                    div()
+                        .id("payload")
+                        .test_support()
+                        .flex_1()
+                        .min_h_0()
+                        .min_w_0()
+                        .w_full()
+                        .child(self.payload_view(cx)),
                 )
                 .when(value.payload.is_empty(), |content| {
                     content.child(div().text_sm().text_color(cx.theme().muted_foreground).child("Empty payload"))
@@ -1435,7 +1441,8 @@ impl Explorer {
     fn explorer(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         // The resize API takes resolved pixels; derive all pane constraints from rem.
         let rem = window.rem_size();
-        let width = self.topics_width_rem.unwrap_or(24.).clamp(15., 50.);
+        let minimum_width = if self.publish_open { 20. } else { 15. };
+        let width = self.topics_width_rem.unwrap_or(24.).clamp(minimum_width, 50.);
         div()
             .relative()
             .v_flex()
@@ -1453,12 +1460,12 @@ impl Explorer {
                         .child(
                             resizable_panel()
                                 .size(rems(width).to_pixels(rem))
-                                .size_range(rems(15.).to_pixels(rem)..rems(50.).to_pixels(rem))
+                                .size_range(rems(minimum_width).to_pixels(rem)..rems(50.).to_pixels(rem))
                                 .child(self.tree(window, cx)),
                         )
                         .child(
                             resizable_panel()
-                                .size_range(rems(20.).to_pixels(rem)..gpui_kit::Pixels::MAX)
+                                .size_range(rems(if self.publish_open { 18. } else { 20. }).to_pixels(rem)..gpui_kit::Pixels::MAX)
                                 .child(self.details_view.clone().cached(StyleRefinement::default().size_full())),
                         ),
                 ),

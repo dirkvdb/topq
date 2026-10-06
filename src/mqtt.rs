@@ -16,7 +16,9 @@ use rumqttc::v5::{
     AsyncClient, Event, MqttOptions,
     mqttbytes::{
         QoS,
-        v5::{ConnAckProperties, Filter, Packet, PubAckReason, PubCompReason, PubRecReason, Subscribe, SubscribeReasonCode},
+        v5::{
+            ConnAckProperties, Filter, Packet, PubAckReason, PubCompReason, PubRecReason, PublishProperties, Subscribe, SubscribeReasonCode,
+        },
     },
 };
 use rumqttc::{Outgoing, Transport};
@@ -69,7 +71,7 @@ impl From<Qos> for QoS {
 }
 
 const COMMAND_CAPACITY: usize = 16;
-const MAX_PACKET_SIZE: u32 = 16 * 1024 * 1024;
+pub(crate) const MAX_PACKET_SIZE: u32 = 16 * 1024 * 1024;
 
 #[derive(Clone, Copy)]
 struct PublishCapabilities {
@@ -90,23 +92,29 @@ impl PublishCapabilities {
         }
     }
 
-    fn validate_publish(&self, topic: &str, payload_len: usize, qos: QoS, retain: bool) -> Result<()> {
+    fn validate_publish(&self, topic: &str, payload_len: usize, qos: QoS, retain: bool, content_type: Option<&str>) -> Result<()> {
         ensure!(
             qos as u8 <= self.max_qos,
             "Broker supports a maximum publish QoS of {}.",
             self.max_qos
         );
         ensure!(!retain || self.retain_available, "Broker does not support retained publishes.");
-        ensure_publish_packet_size(topic, payload_len, qos, self.max_packet_size)
+        ensure_publish_packet_size(topic, payload_len, qos, content_type, self.max_packet_size)
     }
 
     fn validate_command(&self, command: &Command) -> Result<()> {
         match command {
-            Command::Publish(command) => self.validate_publish(&command.topic, command.payload.len(), command.qos, command.retain),
+            Command::Publish(command) => self.validate_publish(
+                &command.topic,
+                command.payload.len(),
+                command.qos,
+                command.retain,
+                command.content_type.as_deref(),
+            ),
             Command::DeleteTopics(command) => {
                 // Check the whole batch before clearing anything on the broker.
                 for topic in &command.topics {
-                    self.validate_publish(topic, 0, QoS::AtMostOnce, true)?;
+                    self.validate_publish(topic, 0, QoS::AtMostOnce, true, None)?;
                 }
                 Ok(())
             }
@@ -123,6 +131,7 @@ struct PublishCommandData {
     payload: Vec<u8>,
     qos: QoS,
     retain: bool,
+    content_type: Option<String>,
 }
 
 enum Command {
@@ -168,17 +177,35 @@ fn ensure_valid_topic(topic: &str) -> Result<()> {
     Ok(())
 }
 
-fn ensure_publish_packet_size(topic: &str, payload_len: usize, qos: QoS, max_packet_size: u32) -> Result<()> {
-    // Topic length, topic, optional packet ID, property length (zero), payload.
-    let remaining_length = 2 + topic.len() + usize::from(qos != QoS::AtMostOnce) * 2 + 1 + payload_len;
+fn ensure_valid_content_type(content_type: &str) -> Result<()> {
+    ensure!(
+        content_type.len() <= u16::MAX as usize,
+        "MQTT content type must not exceed 65535 UTF-8 bytes."
+    );
+    ensure!(!content_type.contains('\0'), "MQTT content type must not contain a null character.");
+    Ok(())
+}
+
+fn variable_integer_len(mut length: usize) -> usize {
     let mut length_bytes = 1;
-    let mut length = remaining_length;
     while length >= 128 {
         length_bytes += 1;
         length /= 128;
     }
+    length_bytes
+}
+
+fn ensure_publish_packet_size(topic: &str, payload_len: usize, qos: QoS, content_type: Option<&str>, max_packet_size: u32) -> Result<()> {
+    // Content type includes its property ID and two-byte UTF-8 string length.
+    let properties_length = content_type.map_or(0, |value| 1 + 2 + value.len());
+    let remaining_length = 2
+        + topic.len()
+        + usize::from(qos != QoS::AtMostOnce) * 2
+        + variable_integer_len(properties_length)
+        + properties_length
+        + payload_len;
     ensure!(
-        1 + length_bytes + remaining_length <= max_packet_size as usize,
+        1 + variable_integer_len(remaining_length) + remaining_length <= max_packet_size as usize,
         "MQTT publish packet exceeds the maximum packet size of {max_packet_size} bytes."
     );
     Ok(())
@@ -198,8 +225,27 @@ impl Connection {
     /// `BrokerEvent::PublishQueued` or `BrokerEvent::PublishError`; a disconnect
     /// can produce an error even after `PublishQueued`.
     pub fn publish(&self, topic: String, payload: Vec<u8>, qos: Qos, retain: bool) -> Result<()> {
+        self.publish_with_content_type(topic, payload, qos, retain, None)
+    }
+
+    /// Queues unmodified payload bytes with an optional MQTT 5 content type.
+    /// `None` omits the property; `Some` preserves the string exactly, including
+    /// an empty string. Content types must fit in 65535 UTF-8 bytes and contain
+    /// no null characters. No payload-format indicator is set.
+    /// Validation and queue/delivery semantics are the same as [`Self::publish`].
+    pub fn publish_with_content_type(
+        &self,
+        topic: String,
+        payload: Vec<u8>,
+        qos: Qos,
+        retain: bool,
+        content_type: Option<String>,
+    ) -> Result<()> {
         ensure_valid_topic(&topic)?;
-        ensure_publish_packet_size(&topic, payload.len(), qos.into(), MAX_PACKET_SIZE)?;
+        if let Some(content_type) = content_type.as_deref() {
+            ensure_valid_content_type(content_type)?;
+        }
+        ensure_publish_packet_size(&topic, payload.len(), qos.into(), content_type.as_deref(), MAX_PACKET_SIZE)?;
 
         self.commands
             .try_send(Command::Publish(PublishCommandData {
@@ -207,6 +253,7 @@ impl Connection {
                 payload,
                 qos: qos.into(),
                 retain,
+                content_type,
             }))
             .context("Could not queue publish (queue full or worker stopped).")
     }
@@ -342,7 +389,19 @@ async fn queue_command(
         Command::DeleteTopics(command) => publish_clear_retained(client, command.topics, queued).await,
         Command::Publish(command) => {
             queued.borrow_mut().push_back(OperationKind::Publish);
-            if let Err(error) = client.publish(command.topic, command.qos, command.retain, command.payload).await {
+            let result = match command.content_type {
+                Some(content_type) => {
+                    let properties = PublishProperties {
+                        content_type: Some(content_type),
+                        ..Default::default()
+                    };
+                    client
+                        .publish_with_properties(command.topic, command.qos, command.retain, command.payload, properties)
+                        .await
+                }
+                None => client.publish(command.topic, command.qos, command.retain, command.payload).await,
+            };
+            if let Err(error) = result {
                 queued.borrow_mut().pop_back();
                 return Err(error).context("Could not queue publish to rumqttc.");
             }
@@ -838,6 +897,7 @@ mod tests {
             payload: vec![b'x'; payload_len],
             qos,
             retain,
+            content_type: None,
         })
     }
 
@@ -946,6 +1006,28 @@ mod tests {
     }
 
     #[test]
+    fn connack_packet_limit_includes_content_type_and_multi_byte_property_length_without_disconnect() {
+        for (limit, content_type) in [(20u32, "image/png".into()), (144, "x".repeat(125))] {
+            let mut properties = vec![0x27];
+            properties.extend_from_slice(&limit.to_be_bytes());
+            assert_capability_rejections(
+                properties,
+                Qos::AtLeastOnce,
+                vec![(
+                    Command::Publish(PublishCommandData {
+                        topic: "test/value".into(),
+                        payload: Vec::new(),
+                        qos: QoS::AtMostOnce,
+                        retain: false,
+                        content_type: Some(content_type),
+                    }),
+                    "maximum packet size",
+                )],
+            );
+        }
+    }
+
+    #[test]
     fn connack_capabilities_use_protocol_defaults_and_cap_broker_packet_limit_locally() {
         let defaults = PublishCapabilities::from_connack(None);
         assert_eq!(defaults.max_qos, 2);
@@ -960,7 +1042,7 @@ mod tests {
         assert_eq!(capabilities.max_packet_size, MAX_PACKET_SIZE);
         assert!(
             capabilities
-                .validate_publish("test/value", MAX_PACKET_SIZE as usize, QoS::AtMostOnce, false)
+                .validate_publish("test/value", MAX_PACKET_SIZE as usize, QoS::AtMostOnce, false, None)
                 .is_err()
         );
     }
@@ -1492,9 +1574,60 @@ mod tests {
             // At this size the remaining-length field occupies four bytes.
             let overhead = 1 + 4 + 2 + "test/é".len() + usize::from(qos != QoS::AtMostOnce) * 2 + 1;
             let maximum_payload = MAX_PACKET_SIZE as usize - overhead;
-            assert!(ensure_publish_packet_size("test/é", maximum_payload, qos, MAX_PACKET_SIZE).is_ok());
-            assert!(ensure_publish_packet_size("test/é", maximum_payload + 1, qos, MAX_PACKET_SIZE).is_err());
+            assert!(ensure_publish_packet_size("test/é", maximum_payload, qos, None, MAX_PACKET_SIZE).is_ok());
+            assert!(ensure_publish_packet_size("test/é", maximum_payload + 1, qos, None, MAX_PACKET_SIZE).is_err());
         }
+    }
+
+    #[test]
+    fn publish_packet_limit_matches_encoded_content_type_properties_and_variable_length_fields() {
+        use rumqttc::v5::mqttbytes::v5::Publish;
+
+        // Property lengths on both sides of the two- and three-byte boundaries.
+        let content_types = std::iter::once(None).chain([0, 9, 124, 125, 16380, 16381, 65535].map(|len| Some("x".repeat(len))));
+        for content_type in content_types {
+            for qos in [QoS::AtMostOnce, QoS::AtLeastOnce, QoS::ExactlyOnce] {
+                // With a nine-byte content type these cross remaining lengths 127 and 16383.
+                for payload_len in [0, 103, 104, 105, 106, 16359, 16360, 16361, 16362] {
+                    let properties = content_type.as_ref().map(|value| PublishProperties {
+                        content_type: Some(value.clone()),
+                        ..Default::default()
+                    });
+                    let mut publish = Publish::new("test/é", qos, vec![0xff; payload_len], properties);
+                    publish.pkid = 1; // rumqttc assigns this before encoding QoS 1/2 packets.
+                    let mut wire = bytes::BytesMut::new();
+                    publish.write(&mut wire).unwrap();
+                    let size = wire.len() as u32;
+                    assert!(ensure_publish_packet_size("test/é", payload_len, qos, content_type.as_deref(), size).is_ok());
+                    assert!(ensure_publish_packet_size("test/é", payload_len, qos, content_type.as_deref(), size - 1).is_err());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn publish_with_content_type_enforces_the_local_packet_limit_before_queueing() {
+        let (connection, mut commands, _) = command_connection();
+        // Four-byte remaining length, topic, properties length, content-type ID/string.
+        let overhead = 1 + 4 + 2 + "test/é".len() + 1 + 1 + 2 + "image/png".len();
+        let payload = vec![0xff; MAX_PACKET_SIZE as usize - overhead + 1];
+        let error = connection
+            .publish_with_content_type("test/é".into(), payload.clone(), Qos::AtMostOnce, false, Some("image/png".into()))
+            .unwrap_err();
+        assert!(error.to_string().contains("maximum packet size"));
+        assert!(matches!(commands.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+        connection.publish("test/é".into(), payload, Qos::AtMostOnce, false).unwrap();
+        commands.try_recv().unwrap();
+        connection
+            .publish_with_content_type(
+                "test/é".into(),
+                vec![0xff; MAX_PACKET_SIZE as usize - overhead],
+                Qos::AtMostOnce,
+                false,
+                Some("image/png".into()),
+            )
+            .unwrap();
+        assert!(matches!(commands.try_recv(), Ok(Command::Publish(_))));
     }
 
     #[test]
@@ -1520,8 +1653,62 @@ mod tests {
                     assert_eq!(command.payload, payload);
                     assert_eq!(command.qos, qos.into());
                     assert_eq!(command.retain, retain);
+                    assert_eq!(command.content_type, None);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn publish_with_content_type_preserves_raw_bytes_topic_options_and_optional_property() {
+        let (connection, mut commands, _) = command_connection();
+        for content_type in [None, Some(String::new()), Some(" image/png; note=é ".into())] {
+            for qos in [Qos::AtMostOnce, Qos::AtLeastOnce, Qos::ExactlyOnce] {
+                for retain in [false, true] {
+                    let payload = vec![0x89, b'P', b'N', b'G', b'\r', b'\n', 0, 0xff];
+                    connection
+                        .publish_with_content_type(" raw//é ".into(), payload.clone(), qos, retain, content_type.clone())
+                        .unwrap();
+                    let Command::Publish(command) = commands.try_recv().unwrap() else {
+                        panic!("expected a publish command");
+                    };
+                    assert_eq!(command.topic, " raw//é ");
+                    assert_eq!(command.payload, payload);
+                    assert_eq!(command.qos, qos.into());
+                    assert_eq!(command.retain, retain);
+                    assert_eq!(command.content_type, content_type);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn publish_with_content_type_rejects_null_and_oversized_utf8_strings_before_queueing() {
+        let (connection, mut commands, _) = command_connection();
+        for (content_type, expected) in [
+            ("image/\0png".into(), "null character"),
+            ("x".repeat(65536), "65535 UTF-8 bytes"),
+            ("é".repeat(32768), "65535 UTF-8 bytes"),
+        ] {
+            let error = connection
+                .publish_with_content_type("test/value".into(), Vec::new(), Qos::AtMostOnce, false, Some(content_type))
+                .unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+        assert!(matches!(commands.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn publish_with_content_type_accepts_empty_and_maximum_utf8_byte_length_strings() {
+        let (connection, mut commands, _) = command_connection();
+        for content_type in [String::new(), "x".repeat(65535), format!("{}a", "é".repeat(32767))] {
+            connection
+                .publish_with_content_type("test/value".into(), Vec::new(), Qos::AtMostOnce, false, Some(content_type.clone()))
+                .unwrap();
+            let Command::Publish(command) = commands.try_recv().unwrap() else {
+                panic!("expected a publish command");
+            };
+            assert_eq!(command.content_type, Some(content_type));
         }
     }
 
@@ -1672,6 +1859,87 @@ mod tests {
             }
             _ => panic!("expected the shutdown barrier, not a publish acknowledgement or error"),
         }
+        assert!(matches!(
+            connection.events.as_mut().unwrap().try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        drop(connection);
+        broker.join().unwrap();
+    }
+
+    #[test]
+    fn publish_with_content_type_sends_raw_image_bytes_and_only_the_requested_property() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (acknowledge, acknowledged) = std::sync::mpsc::channel();
+        let (finished, received) = std::sync::mpsc::channel();
+        let content_types = [None, Some(String::new()), Some("image/png".into()), Some("é".repeat(63))];
+        let expected_content_types = content_types.clone();
+        let payload = vec![0x89, b'P', b'N', b'G', b'\r', b'\n', 0, 0xff];
+        let expected_payload = payload.clone();
+        let broker = std::thread::spawn(move || {
+            let mut stream = handshake(&listener, 0);
+            for content_type in expected_content_types {
+                for qos in 0..=2 {
+                    for retain in [false, true] {
+                        let (header, body) = read_packet(&mut stream);
+                        assert_eq!(header, 0x30 | (qos << 1) | u8::from(retain));
+                        let topic_len = usize::from(u16::from_be_bytes([body[0], body[1]]));
+                        assert_eq!(&body[2..2 + topic_len], "test/é".as_bytes());
+                        let offset = 2 + topic_len;
+                        let properties_offset = offset + if qos == 0 { 0 } else { 2 };
+                        let (properties_len, length_bytes) = variable_integer(&body[properties_offset..]);
+                        let mut expected = Vec::new();
+                        if let Some(content_type) = content_type.as_deref() {
+                            expected.push(0x03);
+                            write_string(&mut expected, content_type);
+                        }
+                        assert_eq!(properties_len, expected.len());
+                        if properties_len >= 128 {
+                            assert_eq!(length_bytes, 2, "exercise multi-byte property lengths on the wire");
+                        }
+                        let start = properties_offset + length_bytes;
+                        assert_eq!(&body[start..start + properties_len], expected.as_slice());
+                        assert_eq!(&body[start + properties_len..], expected_payload.as_slice());
+                        acknowledged.recv_timeout(Duration::from_secs(5)).unwrap();
+                        if qos != 0 {
+                            let pkid = &body[offset..offset + 2];
+                            stream
+                                .write_all(&[if qos == 1 { 0x40 } else { 0x50 }, 2, pkid[0], pkid[1]])
+                                .unwrap();
+                            if qos == 2 {
+                                assert_eq!(read_packet(&mut stream), (0x62, pkid.to_vec()));
+                                stream.write_all(&[0x70, 2, pkid[0], pkid[1]]).unwrap();
+                            }
+                        }
+                        finished.send(()).unwrap();
+                    }
+                }
+            }
+            stream.write_all(b"\x30\x17\0\x10test/ack-barrier\0done").unwrap();
+            assert_eq!(stream.read(&mut [0]).unwrap(), 0);
+        });
+        let runtime = runtime();
+        let mut connection = connect(ConnectionConfig {
+            host: "127.0.0.1".into(),
+            port,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(matches!(next_event(&runtime, &mut connection), BrokerEvent::Connected));
+        for content_type in content_types {
+            for qos in [Qos::AtMostOnce, Qos::AtLeastOnce, Qos::ExactlyOnce] {
+                for retain in [false, true] {
+                    connection
+                        .publish_with_content_type("test/é".into(), payload.clone(), qos, retain, content_type.clone())
+                        .unwrap();
+                    assert!(matches!(next_event(&runtime, &mut connection), BrokerEvent::PublishQueued));
+                    acknowledge.send(()).unwrap();
+                    received.recv_timeout(Duration::from_secs(5)).unwrap();
+                }
+            }
+        }
+        assert!(matches!(next_event(&runtime, &mut connection), BrokerEvent::Message(_)));
         assert!(matches!(
             connection.events.as_mut().unwrap().try_recv(),
             Err(mpsc::error::TryRecvError::Empty)
@@ -1897,6 +2165,7 @@ mod tests {
                     payload: Vec::new(),
                     qos: QoS::AtMostOnce,
                     retain: false,
+                    content_type: None,
                 }))
                 .is_ok()
         );

@@ -427,8 +427,8 @@ fn publish_disclosure_preserves_draft_and_options_across_keyboard_and_pointer_to
     })
     .unwrap();
     cx.run_until_parked();
-    for _ in 0..2 {
-        cx.update_window(handle, |_, window, cx| window.press("down", cx)).unwrap();
+    for key in ["home", "down"] {
+        cx.update_window(handle, |_, window, cx| window.press(key, cx)).unwrap();
         cx.run_until_parked();
     }
     cx.update_window(handle, |_, window, cx| window.press("enter", cx)).unwrap();
@@ -642,6 +642,371 @@ fn publish_payload_keyboard_editing_undo_and_redo_preserve_detection_and_cursor(
     }
 }
 
+const PUBLISH_FILE_DRAFT: &str = "draft é\nkeep me";
+const PUBLISH_FILE_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2"><path d="M0 0h2v2H0z"/></svg>"#;
+
+fn open_publish_file_draft(cx: &mut TestAppContext, width: f32, height: f32) -> (AnyWindowHandle, Entity<Explorer>) {
+    let (handle, view) = open(cx, false, width, height);
+    cx.update_window(handle, |_, window, cx| {
+        window.activate_window();
+        view.update(cx, |view, cx| {
+            view.status = ConnectionStatus::Disconnected;
+            cx.notify();
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("toggle-publish", cx);
+        window.click("publish-topic", cx);
+        window.input("home/command", cx);
+        window.click("publish-payload", cx);
+        window.input(PUBLISH_FILE_DRAFT, cx);
+        window.press("left", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    (handle, view)
+}
+
+fn respond_to_publish_file_prompt(cx: &mut TestAppContext, path: Option<&std::path::Path>) {
+    assert!(cx.did_prompt_for_paths());
+    cx.simulate_path_prompt_response(|options| {
+        assert!(options.files);
+        assert!(!options.directories);
+        assert!(!options.multiple);
+        path.map(|path| vec![path.to_path_buf()])
+    });
+    cx.run_until_parked();
+    assert!(!cx.did_prompt_for_paths());
+}
+
+#[track_caller]
+fn assert_publish_file(window: &mut Window, cx: &mut App, name: &str, bytes: usize, content_type: &str) {
+    window.render_frame(cx);
+    let file = window.within("publish-payload").find("publish-file");
+    assert!(
+        file.visible(),
+        "{name}: file {:?}, payload {:?}, feedback {:?}",
+        file.bounds(),
+        window.find("publish-payload").bounds(),
+        window.try_find("publish-feedback").map(|feedback| feedback.bounds())
+    );
+    assert_eq!(window.find("publish-file-name").label(), Some(name));
+    assert_eq!(window.find("publish-file-size").label(), Some(format!("{bytes} bytes").as_str()));
+    assert_eq!(window.find("publish-content-type").label(), Some(content_type));
+    assert!(window.find("publish-file-preview").visible());
+}
+
+#[gpui_kit::test]
+fn publish_file_cancel_and_read_errors_preserve_the_text_draft_and_previous_file(cx: &mut TestAppContext) {
+    let directory = tempfile::tempdir().unwrap();
+    let binary = directory.path().join("payload.unknown");
+    std::fs::write(&binary, [0, 0xff, 0x80, b'\n']).unwrap();
+    let missing = directory.path().join("missing.bin");
+    let oversized = directory.path().join("oversized.bin");
+    std::fs::File::create(&oversized).unwrap().set_len(16 * 1024 * 1024 + 1).unwrap();
+    let (handle, view) = open_publish_file_draft(cx, 1000., 760.);
+    let draft = cx.update(|cx| view.read(cx).publish_payload.clone());
+
+    for loaded in [false, true] {
+        if loaded {
+            cx.update_window(handle, |_, window, cx| window.click("load-publish-file", cx))
+                .unwrap();
+            respond_to_publish_file_prompt(cx, Some(&binary));
+        }
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("load-publish-file", cx);
+            assert!(view.read(cx).publish_file_task.is_some());
+            window.click("load-publish-file", cx);
+            if loaded {
+                window.click("remove-publish-file", cx);
+                assert!(view.read(cx).publish_file.is_some());
+            }
+            window.click("publish-message", cx);
+            window.click("publish-topic", cx);
+            window.press("ctrl-enter", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert!(!view.read(cx).publish_pending);
+            assert!(
+                view.read(cx).publish_feedback.is_none(),
+                "Ctrl+Enter must be suppressed during file selection"
+            );
+        });
+        respond_to_publish_file_prompt(cx, None);
+
+        for (path, error) in [
+            (&missing, "Could not read"),
+            (&oversized, "16 MiB MQTT packet limit"),
+            (&directory.path().to_path_buf(), "regular data file"),
+        ] {
+            cx.update_window(handle, |_, window, cx| window.click("load-publish-file", cx))
+                .unwrap();
+            respond_to_publish_file_prompt(cx, Some(path));
+            cx.update_window(handle, |_, window, cx| {
+                window.render_frame(cx);
+                assert!(window.find("publish-feedback").visible());
+                let state = view.read(cx);
+                let feedback = state.publish_feedback.as_ref().unwrap().as_ref().unwrap_err();
+                assert!(feedback.starts_with("Could not load payload file:"), "{feedback}");
+                assert!(feedback.contains(error), "{feedback}");
+                assert!(state.publish_file_task.is_none());
+                assert_eq!(state.publish_file.is_some(), loaded);
+                assert_eq!(state.publish_payload.entity_id(), draft.entity_id());
+                assert_eq!(draft.read(cx).value().as_str(), PUBLISH_FILE_DRAFT);
+                assert_eq!(
+                    draft.read(cx).selected_range(),
+                    PUBLISH_FILE_DRAFT.len() - 1..PUBLISH_FILE_DRAFT.len() - 1
+                );
+                if loaded {
+                    assert_publish_file(window, cx, "payload.unknown", 4, "application/octet-stream");
+                    assert!(window.try_find(("input", draft.entity_id())).is_none());
+                } else {
+                    assert!(window.try_find("publish-file").is_none());
+                    assert!(window.find(("input", draft.entity_id())).visible());
+                }
+            })
+            .unwrap();
+        }
+        // Canceling a replacement must retain the error and existing attachment too.
+        let feedback = cx.update(|cx| view.read(cx).publish_feedback.clone());
+        cx.update_window(handle, |_, window, cx| window.click("load-publish-file", cx))
+            .unwrap();
+        respond_to_publish_file_prompt(cx, None);
+        cx.update(|cx| {
+            assert_eq!(view.read(cx).publish_feedback, feedback);
+            assert_eq!(view.read(cx).publish_file.is_some(), loaded);
+            assert_eq!(draft.read(cx).value().as_str(), PUBLISH_FILE_DRAFT);
+        });
+    }
+}
+
+#[gpui_kit::test]
+fn publish_file_replace_collapse_and_remove_restore_the_editor_across_themes_and_zoom(cx: &mut TestAppContext) {
+    let directory = tempfile::tempdir().unwrap();
+    let binary = directory.path().join("binary.data");
+    std::fs::write(&binary, [0, 0xff, 0x80]).unwrap();
+    let image = directory.path().join("preview-é.SVG");
+    std::fs::write(&image, PUBLISH_FILE_SVG).unwrap();
+    for mode in [ThemeMode::Light, ThemeMode::Dark] {
+        for font_size in [16., 20.] {
+            crate::config::save_publish_open(false).unwrap();
+            let (handle, view) = open_publish_file_draft(cx, 760., 540.);
+            cx.update(|cx| {
+                Theme::change(mode, None, cx);
+                Theme::update(cx, |theme| theme.font_size = px(font_size));
+            });
+            let draft = cx.update(|cx| view.read(cx).publish_payload.clone());
+            for (path, name, bytes, content_type) in [
+                (&binary, "binary.data", 3, "application/octet-stream"),
+                (&image, "preview-é.SVG", PUBLISH_FILE_SVG.len(), "image/svg+xml"),
+            ] {
+                cx.update_window(handle, |_, window, cx| {
+                    window.render_frame(cx);
+                    window.click("load-publish-file", cx);
+                })
+                .unwrap();
+                respond_to_publish_file_prompt(cx, Some(path));
+                cx.update_window(handle, |_, window, cx| {
+                    assert_publish_file(window, cx, name, bytes, content_type);
+                    assert!(
+                        window.try_find(("input", draft.entity_id())).is_none(),
+                        "the Editor must be replaced, not merely covered"
+                    );
+                    window.click("publish-message", cx);
+                    assert!(
+                        view.read(cx).publish_feedback.is_none(),
+                        "the offline Publish button must ignore clicks"
+                    );
+                    assert!(!view.read(cx).publish_pending);
+                    let state = view.read(cx);
+                    assert!(state.publish_file.is_some());
+                    assert!(state.publish_file_task.is_none());
+                    assert_eq!(state.publish_payload.entity_id(), draft.entity_id());
+                    assert_eq!(draft.read(cx).value().as_str(), PUBLISH_FILE_DRAFT);
+                    assert_eq!(
+                        draft.read(cx).selected_range(),
+                        PUBLISH_FILE_DRAFT.len() - 1..PUBLISH_FILE_DRAFT.len() - 1
+                    );
+                    assert_eq!(window.find("publish-topic").focused(), Some(true));
+                    assert_publish_resize_layout(window, cx);
+                    let payload = window.find("publish-payload").bounds();
+                    let panel = window.find("publish-panel").bounds();
+                    for id in [
+                        "publish-file-name",
+                        "publish-file-size",
+                        "publish-file-preview",
+                        "remove-publish-file",
+                    ] {
+                        let element = window.find(id);
+                        let bounds = element.bounds();
+                        assert!(element.visible(), "{id}, {mode:?}, font {font_size}");
+                        assert!(
+                            bounds.left() >= payload.left() && bounds.right() <= payload.right(),
+                            "{id}: {bounds:?}, payload {payload:?}"
+                        );
+                        assert!(
+                            bounds.top() >= payload.top() && bounds.bottom() <= payload.bottom(),
+                            "{id}: {bounds:?}, payload {payload:?}"
+                        );
+                    }
+                    let load = window.find("load-publish-file").bounds();
+                    let publish = window.find("publish-message").bounds();
+                    assert!(load.left() >= panel.left() && load.bottom() <= panel.bottom());
+                    assert!(load.right() <= publish.left(), "file and publish actions must not overlap");
+                    assert_eq!(load.top(), publish.top());
+                    let retain = window.find("publish-retain").bounds();
+                    let qos = window.find("publish-qos").bounds();
+                    assert!(qos.right() < retain.left() && retain.right() < load.left());
+                    for bounds in [retain, qos] {
+                        assert!(
+                            (bounds.center().y - publish.center().y).abs() <= px(1.),
+                            "controls must share one row"
+                        );
+                    }
+                })
+                .unwrap();
+            }
+            cx.update_window(handle, |_, window, cx| {
+                window.click("toggle-publish", cx);
+                assert!(window.try_find("publish-file").is_none());
+                assert!(view.read(cx).publish_file.is_some());
+                window.click("toggle-publish", cx);
+                assert_publish_file(window, cx, "preview-é.SVG", PUBLISH_FILE_SVG.len(), "image/svg+xml");
+                window.click("remove-publish-file", cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.update_window(handle, |_, window, cx| {
+                window.render_frame(cx);
+                assert!(view.read(cx).publish_file.is_none());
+                assert!(window.try_find("publish-file").is_none());
+                assert!(window.find(("input", draft.entity_id())).visible());
+                assert_eq!(window.find(("input", draft.entity_id())).focused(), Some(true));
+                assert_eq!(window.find("publish-content-type").label(), Some("Text"));
+                assert_eq!(draft.read(cx).value().as_str(), PUBLISH_FILE_DRAFT);
+                window.input("!", cx);
+                assert_eq!(draft.read(cx).value().as_str(), "draft é\nkeep m!e");
+                window.press("secondary-z", cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.update(|cx| assert_eq!(draft.read(cx).value().as_str(), PUBLISH_FILE_DRAFT));
+        }
+    }
+}
+
+#[gpui_kit::test]
+fn publish_file_images_fit_without_upscaling_or_overlapping_controls(cx: &mut TestAppContext) {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("large.svg");
+    for mode in [ThemeMode::Light, ThemeMode::Dark] {
+        crate::config::save_publish_open(false).unwrap();
+        let (handle, _) = open_publish_file_draft(cx, 760., 540.);
+        cx.update(|cx| {
+            Theme::change(mode, None, cx);
+            Theme::update(cx, |theme| theme.font_size = px(20.));
+        });
+        for (width, height) in [(1024, 1024), (1536, 512), (512, 1536), (1, 1), (16, 8)] {
+            let svg = format!(
+                r#"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}"><rect width="{width}" height="{height}"/></svg>"#,
+            );
+            std::fs::write(&path, &svg).unwrap();
+            let image = std::sync::Arc::new(gpui_kit::Image::from_bytes(gpui_kit::ImageFormat::Svg, svg.into_bytes()));
+            cx.update_window(handle, |_, window, cx| {
+                window.render_frame(cx);
+                window.click("load-publish-file", cx);
+            })
+            .unwrap();
+            respond_to_publish_file_prompt(cx, Some(&path));
+            // Start the real image decoder before checking layout after it finishes.
+            cx.update_window(handle, |_, window, cx| window.render_frame(cx)).unwrap();
+            cx.run_until_parked();
+            for resize in [None, Some("ctrl-alt-up"), Some("ctrl-alt-down")] {
+                cx.update_window(handle, |_, window, cx| {
+                    if let Some(key) = resize {
+                        window.press(key, cx);
+                    }
+                    window.render_frame(cx);
+                    let preview = window.find("publish-file-preview").bounds();
+                    let element = window.find(("publish-file-image", image.id()));
+                    let bounds = element.bounds();
+                    assert!(element.visible());
+                    assert!(preview.size.width > px(0.) && preview.size.height > px(0.));
+                    assert!(
+                        bounds.left() >= preview.left() && bounds.right() <= preview.right(),
+                        "image {bounds:?}, preview {preview:?}"
+                    );
+                    assert!(
+                        bounds.top() >= preview.top() && bounds.bottom() <= preview.bottom(),
+                        "image {bounds:?}, preview {preview:?}"
+                    );
+                    let decoded = image.clone().get_render_image(window, cx).expect("SVG must decode successfully");
+                    let original = decoded.size(0).map(|dimension| px(u32::from(dimension) as f32));
+                    let fitted = gpui_kit::ObjectFit::ScaleDown.get_bounds(bounds, decoded.size(0));
+                    let scale = (preview.size.width / original.width)
+                        .min(preview.size.height / original.height)
+                        .min(1.);
+                    assert!((fitted.size.width - original.width * scale).abs() <= px(0.01));
+                    assert!((fitted.size.height - original.height * scale).abs() <= px(0.01));
+                    assert!(fitted.size.width <= original.width && fitted.size.height <= original.height);
+                    assert!(fitted.left() >= preview.left() && fitted.right() <= preview.right());
+                    assert!(fitted.top() >= preview.top() && fitted.bottom() <= preview.bottom());
+                    assert!((fitted.size.width / fitted.size.height - width as f32 / height as f32).abs() < 0.001);
+                    for id in ["publish-qos", "publish-retain", "load-publish-file", "publish-message"] {
+                        let control = window.find(id);
+                        assert!(control.visible(), "{id}");
+                        assert!(fitted.bottom() <= control.bounds().top(), "image must not cover {id}");
+                    }
+                })
+                .unwrap();
+                cx.run_until_parked();
+            }
+        }
+    }
+}
+
+#[gpui_kit::test]
+fn publish_file_edit_value_cancels_the_load_and_replaces_the_attachment_with_topic_text(cx: &mut TestAppContext) {
+    let directory = tempfile::tempdir().unwrap();
+    let image = directory.path().join("preview.svg");
+    std::fs::write(&image, PUBLISH_FILE_SVG).unwrap();
+    let (handle, view) = open_publish_file_draft(cx, 1000., 760.);
+    cx.update_window(handle, |_, window, cx| window.click("load-publish-file", cx))
+        .unwrap();
+    respond_to_publish_file_prompt(cx, Some(&image));
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            receive_payload(view, "home/a", "topic value", window, cx);
+            view.select_topic("home/a", window, cx);
+        });
+        window.render_frame(cx);
+        window.click("load-publish-file", cx);
+        assert!(view.read(cx).publish_file_task.is_some());
+    })
+    .unwrap();
+    assert!(cx.did_prompt_for_paths());
+    cx.simulate_path_prompt_response(|_| Some(vec![image]));
+    // The picker has replied, but its async task has not run; Edit value must win.
+    cx.update_window(handle, |_, window, cx| window.click("edit-value", cx)).unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        let state = view.read(cx);
+        assert!(state.publish_file_task.is_none());
+        assert!(state.publish_file.is_none());
+        assert!(window.try_find("publish-file").is_none());
+        assert_eq!(window.find("publish-topic").value(), Some("home/a"));
+        assert_publish_payload_detection(window, cx, &view, "topic value", None, "topic value".len());
+    })
+    .unwrap();
+}
+
 #[gpui_kit::test]
 fn publish_is_disabled_offline_and_shortcut_reports_error_without_losing_draft(cx: &mut TestAppContext) {
     let (handle, view) = open(cx, false, 900., 640.);
@@ -752,7 +1117,7 @@ fn publish_divider_drag_grows_and_shrinks_the_editor_and_reopening_preserves_siz
         })
         .unwrap();
     cx.run_until_parked();
-    for key in ["down", "down", "enter"] {
+    for key in ["home", "down", "enter"] {
         cx.update_window(handle, |_, window, cx| {
             window.render_frame(cx);
             window.press(key, cx);
@@ -1279,14 +1644,19 @@ fn publish_panel_keeps_topic_tree_and_controls_visible_at_minimum_size_across_th
                 for id in [
                     "publish-topic",
                     "publish-payload",
-                    "publish-qos",
                     "publish-retain",
+                    "publish-qos",
+                    "load-publish-file",
                     "publish-message",
                 ] {
                     let control = window.find(id);
                     assert!(control.visible(), "{id} is not visible");
                     assert!(control.bounds().left() >= panel.left());
-                    assert!(control.bounds().right() <= panel.right());
+                    assert!(
+                        control.bounds().right() <= panel.right(),
+                        "{id}: {:?}, panel {panel:?}, font {font_size}",
+                        control.bounds()
+                    );
                     assert!(control.bounds().bottom() <= panel.bottom());
                 }
                 let topic = window.find("publish-topic").bounds();
@@ -1294,6 +1664,25 @@ fn publish_panel_keeps_topic_tree_and_controls_visible_at_minimum_size_across_th
                 let action = window.find("publish-message").bounds();
                 assert_eq!(topic.left(), payload.left());
                 assert_eq!(topic.right(), action.right());
+                let retain = window.find("publish-retain").bounds();
+                let qos = window.find("publish-qos").bounds();
+                let load = window.find("load-publish-file").bounds();
+                assert!(
+                    qos.size.width >= window.rem_size() * 3.5,
+                    "QoS needs room for the selected digit and caret"
+                );
+                assert_eq!(window.find("publish-qos-field").bounds().left(), topic.left());
+                assert!(qos.right() < retain.left());
+                assert!(retain.right() < load.left());
+                assert!(load.right() < action.left());
+                for bounds in [retain, qos, load] {
+                    assert!(
+                        (bounds.center().y - action.center().y).abs() <= px(1.),
+                        "controls must share one row"
+                    );
+                }
+                assert_eq!(window.find("load-publish-file").label(), Some("Load payload from file"));
+                assert!(load.size.width <= load.size.height, "file action must remain icon-only");
                 assert!(
                     payload.size.height > window.rem_size() * 2.,
                     "payload {payload:?}, panel {panel:?}, rem {:?}",
@@ -4968,6 +5357,208 @@ fn publish_panel_queues_one_retained_qos_one_message_without_claiming_broker_ack
     })
     .unwrap();
 
+    check_duplicates.send(()).unwrap();
+    duplicate_check_completed.recv_timeout(Duration::from_secs(5)).unwrap();
+    view.update(cx, |view, _| view.connection = None);
+    broker.join().unwrap();
+}
+
+#[gpui_kit::test]
+fn publish_file_panel_sends_exact_binary_and_image_bytes_with_content_type_to_the_broker(cx: &mut TestAppContext) {
+    use std::{
+        io::{ErrorKind, Read, Write},
+        net::{TcpListener, TcpStream},
+        time::{Duration, Instant},
+    };
+
+    fn packet(stream: &mut TcpStream) -> (u8, Vec<u8>) {
+        let mut byte = [0];
+        stream.read_exact(&mut byte).unwrap();
+        let header = byte[0];
+        let mut length = 0;
+        for shift in [0, 7, 14, 21] {
+            stream.read_exact(&mut byte).unwrap();
+            length |= usize::from(byte[0] & 0x7f) << shift;
+            if byte[0] & 0x80 == 0 {
+                let mut body = vec![0; length];
+                stream.read_exact(&mut body).unwrap();
+                return (header, body);
+            }
+        }
+        panic!("invalid MQTT remaining length");
+    }
+
+    fn wait_for_state(cx: &mut TestAppContext, view: &Entity<Explorer>, condition: impl Fn(&Explorer) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            cx.run_until_parked();
+            if cx.update(|cx| {
+                let state = view.read(cx);
+                assert!(
+                    !matches!(state.status, ConnectionStatus::Failed(_)),
+                    "test broker connection failed"
+                );
+                condition(state)
+            }) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "UI must process the broker event");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    cx.executor().allow_parking();
+    let directory = tempfile::tempdir().unwrap();
+    let binary = directory.path().join("command.bin");
+    let binary_bytes = [0, 0xff, 0x80, b'\r', b'\n', 0, b'{', b'}'];
+    std::fs::write(&binary, binary_bytes).unwrap();
+    let image = directory.path().join("command.svg");
+    std::fs::write(&image, PUBLISH_FILE_SVG).unwrap();
+    let topic = "home/command/é";
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (sent, received) = std::sync::mpsc::channel();
+    let (check_duplicates, duplicate_check_requested) = std::sync::mpsc::channel();
+    let (checked, duplicate_check_completed) = std::sync::mpsc::channel();
+    let broker = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let (header, connect) = packet(&mut stream);
+        assert_eq!(header, 0x10);
+        assert_eq!(&connect[..7], b"\x00\x04MQTT\x05");
+        stream.write_all(&[0x20, 3, 0, 0, 0]).unwrap();
+        let (header, subscribe) = packet(&mut stream);
+        assert_eq!(header, 0x82);
+        assert_eq!(&subscribe[2..], b"\x00\x00\x01#\x00");
+        stream.write_all(&[0x90, 4, subscribe[0], subscribe[1], 0, 0]).unwrap();
+        for _ in 0..2 {
+            sent.send(packet(&mut stream)).unwrap();
+        }
+        // Queue completion is independent of PUBACK, just as for text publishing.
+        duplicate_check_requested.recv_timeout(Duration::from_secs(5)).unwrap();
+        stream.set_read_timeout(Some(Duration::from_millis(250))).unwrap();
+        let error = stream
+            .read(&mut [0])
+            .expect_err("busy clicks and shortcuts must not send duplicate files");
+        assert!(matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut));
+        checked.send(()).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        assert_eq!(stream.read(&mut [0]).unwrap(), 0);
+    });
+
+    let mut connection = crate::mqtt::connect(ConnectionConfig {
+        host: "127.0.0.1".into(),
+        port,
+        ..Default::default()
+    })
+    .unwrap();
+    let events = connection.take_events().unwrap();
+    let (handle, view) = open_publish_file_draft(cx, 1200., 760.);
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.connection = Some(connection);
+            view.status = ConnectionStatus::Connecting;
+            view.listen_for_events(events, window, cx);
+            cx.notify();
+        });
+    })
+    .unwrap();
+    wait_for_state(cx, &view, |view| view.status.is_connected());
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("publish-topic", cx);
+        window.press("secondary-a", cx);
+        window.input(topic, cx);
+        window.click("publish-retain", cx);
+        window.click("publish-qos", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    for key in ["home", "down", "enter"] {
+        cx.update_window(handle, |_, window, cx| window.press(key, cx)).unwrap();
+        cx.run_until_parked();
+    }
+    cx.update(|cx| assert_eq!(view.read(cx).publish_qos.read(cx).selected_value(), Some(&"1")));
+
+    for (path, bytes, content_type, shortcut) in [
+        (&binary, binary_bytes.as_slice(), "application/octet-stream", false),
+        (&image, PUBLISH_FILE_SVG, "image/svg+xml", true),
+    ] {
+        cx.update_window(handle, |_, window, cx| {
+            window.click("load-publish-file", cx);
+            window.click("publish-message", cx);
+            window.click("publish-topic", cx);
+            window.press("ctrl-enter", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert!(view.read(cx).publish_file_task.is_some());
+            assert!(
+                !view.read(cx).publish_pending,
+                "clicks and Ctrl+Enter must not publish while a file load is in progress"
+            );
+        });
+        respond_to_publish_file_prompt(cx, Some(path));
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find("publish-content-type").label(), Some(content_type));
+            assert!(view.read(cx).publish_file_task.is_none());
+            if shortcut {
+                window.click("publish-topic", cx);
+                window.press("ctrl-enter", cx);
+            } else {
+                window.click("publish-message", cx);
+            }
+        })
+        .unwrap();
+        if !shortcut {
+            cx.update_window(handle, |_, window, cx| {
+                assert!(view.read(cx).publish_pending);
+                window.render_frame(cx);
+                for id in ["publish-message", "load-publish-file", "remove-publish-file"] {
+                    window.click(id, cx);
+                }
+                window.click("publish-topic", cx);
+                window.press("ctrl-enter", cx);
+                assert!(view.read(cx).publish_pending);
+                assert!(view.read(cx).publish_file.is_some());
+            })
+            .unwrap();
+            assert!(!cx.did_prompt_for_paths());
+        }
+        // Keyboard actions are deferred; let the UI queue the command before waiting on the worker.
+        cx.run_until_parked();
+        let (header, body) = received.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(header, 0x33, "QoS 1 and retain must survive switching from text to file");
+        let topic_length = usize::from(u16::from_be_bytes([body[0], body[1]]));
+        assert_eq!(&body[2..2 + topic_length], topic.as_bytes());
+        let packet_id = u16::from_be_bytes([body[2 + topic_length], body[3 + topic_length]]);
+        assert_ne!(packet_id, 0);
+        let properties_start = 5 + topic_length;
+        let properties_length = usize::from(body[4 + topic_length]);
+        let mut properties = vec![0x03]; // MQTT 5 Content Type, without Payload Format Indicator.
+        properties.extend_from_slice(&(content_type.len() as u16).to_be_bytes());
+        properties.extend_from_slice(content_type.as_bytes());
+        assert_eq!(&body[properties_start..properties_start + properties_length], properties);
+        assert_eq!(&body[properties_start + properties_length..], bytes);
+        wait_for_state(cx, &view, |view| view.publish_feedback.is_some());
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let state = view.read(cx);
+            assert!(!state.publish_pending);
+            assert_eq!(
+                state.publish_feedback.as_ref().unwrap().as_deref(),
+                Ok("Queued for sending · delivery not confirmed")
+            );
+            assert!(state.publish_file.is_some());
+            assert_eq!(state.publish_payload.read(cx).value().as_str(), PUBLISH_FILE_DRAFT);
+            assert_eq!(state.publish_qos.read(cx).selected_value(), Some(&"1"));
+            assert_eq!(window.find("publish-retain").checked(), Some(true));
+            assert!(window.find("load-publish-file").visible());
+        })
+        .unwrap();
+    }
     check_duplicates.send(()).unwrap();
     duplicate_check_completed.recv_timeout(Duration::from_secs(5)).unwrap();
     view.update(cx, |view, _| view.connection = None);
