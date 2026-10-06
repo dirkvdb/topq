@@ -13,7 +13,8 @@ use anyhow::{Context, Result, anyhow};
 #[cfg(not(test))]
 use directories::{BaseDirs, ProjectDirs};
 use keyring::{Entry, Error as KeyringError};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, ser::SerializeStruct};
+use url::Url;
 
 /// An MQTT topic filter and its requested maximum delivery QoS.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -194,7 +195,7 @@ impl ConnectionConfig {
         }
     }
 
-    pub fn validate(&self) -> Result<(), ConnectionValidationError> {
+    fn validate_broker_endpoint(&self) -> Result<(), ConnectionValidationError> {
         if self.host.trim().is_empty() {
             return Err(ConnectionValidationError {
                 field: ConnectionField::Host,
@@ -219,6 +220,22 @@ impl ConnectionConfig {
                 message: "Enter a non-empty MQTT client ID up to 65535 bytes, without null characters.",
             });
         }
+        Ok(())
+    }
+
+    pub(crate) fn validate_broker_connection(&self) -> Result<(), ConnectionValidationError> {
+        self.validate_broker_endpoint()?;
+        if self.username.is_empty() && !self.password.is_empty() {
+            return Err(ConnectionValidationError {
+                field: ConnectionField::Username,
+                message: "Enter a username when using a password.",
+            });
+        }
+        Ok(())
+    }
+
+    pub fn validate(&self) -> Result<(), ConnectionValidationError> {
+        self.validate_broker_endpoint()?;
         if self.topics.is_empty() {
             return Err(ConnectionValidationError {
                 field: ConnectionField::Topics,
@@ -438,12 +455,113 @@ fn save_connections_to(path: &Path, saved: &SavedConnections, entry: &impl Fn(&C
     Ok(())
 }
 
-#[derive(Serialize, Deserialize)]
 struct SavedConnection {
-    #[serde(flatten)]
     config: ConnectionConfig,
-    #[serde(default)]
     password_in_keyring: bool,
+}
+
+impl Serialize for SavedConnection {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let config = &self.config;
+        let mut state = serializer.serialize_struct("SavedConnection", 6)?;
+        state.serialize_field("name", &config.name)?;
+        let connection = connection_uri(config).map_err(serde::ser::Error::custom)?;
+        state.serialize_field("connection", &connection)?;
+        state.serialize_field("client_id", &config.client_id)?;
+        state.serialize_field("topics", &config.topics)?;
+        state.serialize_field("validate_certificate", &config.validate_certificate)?;
+        state.serialize_field("password_in_keyring", &self.password_in_keyring)?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for SavedConnection {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct DeserializedSavedConnection {
+            #[serde(default)]
+            connection: Option<String>,
+            #[serde(flatten)]
+            config: ConnectionConfig,
+            #[serde(default)]
+            password_in_keyring: bool,
+        }
+
+        let mut saved = DeserializedSavedConnection::deserialize(deserializer)?;
+        if let Some(connection) = saved.connection {
+            let address = parse_connection_uri(&connection).map_err(serde::de::Error::custom)?;
+            saved.config.host = address.host;
+            saved.config.port = address.port;
+            saved.config.tls = address.tls;
+            saved.config.websocket = address.websocket;
+            saved.config.username = address.username;
+        }
+        Ok(Self {
+            config: saved.config,
+            password_in_keyring: saved.password_in_keyring,
+        })
+    }
+}
+
+struct ConnectionAddress {
+    host: String,
+    port: u16,
+    tls: bool,
+    websocket: bool,
+    username: String,
+}
+
+fn connection_uri(config: &ConnectionConfig) -> Result<String> {
+    let host = if config.host.contains(':') {
+        format!("[{}]", config.host)
+    } else {
+        config.host.clone()
+    };
+    let mut url =
+        Url::parse(&format!("{}{host}:{}", config.protocol(), config.port)).context("Could not format the broker connection URI.")?;
+    url.set_username(&config.username)
+        .map_err(|()| anyhow!("Could not encode the MQTT username in the broker connection URI."))?;
+    let uri = url.as_str();
+    Ok(uri.strip_suffix('/').unwrap_or(uri).to_owned())
+}
+
+fn parse_connection_uri(connection: &str) -> Result<ConnectionAddress> {
+    let url = Url::parse(connection).context("The saved broker connection URI is invalid.")?;
+    if url.password().is_some() || !matches!(url.path(), "" | "/") || url.query().is_some() || url.fragment().is_some() {
+        return Err(anyhow!(
+            "The broker connection URI must contain only a scheme, host, and optional port."
+        ));
+    }
+    let (tls, websocket, default_port) = match url.scheme() {
+        "mqtt" => (false, false, 1883),
+        "mqtts" => (true, false, 8883),
+        "ws" => (false, true, 80),
+        "wss" => (true, true, 443),
+        _ => return Err(anyhow!("The broker connection URI scheme must be mqtt, mqtts, ws, or wss.")),
+    };
+    let host = match url.host().context("The broker connection URI must include a host.")? {
+        url::Host::Domain(host) => host.to_owned(),
+        url::Host::Ipv4(host) => host.to_string(),
+        url::Host::Ipv6(host) => host.to_string(),
+    };
+    let port = url.port().unwrap_or(default_port);
+    let username = percent_encoding::percent_decode_str(url.username())
+        .decode_utf8()
+        .context("The broker connection URI username is not valid UTF-8.")?
+        .into_owned();
+    Ok(ConnectionAddress {
+        host,
+        port,
+        tls,
+        websocket,
+        username,
+    })
 }
 
 fn credential_account(config: &ConnectionConfig) -> String {
@@ -736,6 +854,56 @@ mod tests {
     }
 
     #[test]
+    fn saved_connection_uris_restore_transport_host_and_port() {
+        for (connection, expected_protocol, expected_host, expected_port) in [
+            ("mqtt://broker.example:1884", "mqtt://", "broker.example", 1884),
+            ("mqtts://broker.example:8883", "mqtts://", "broker.example", 8883),
+            ("ws://broker.example:8080", "ws://", "broker.example", 8080),
+            ("wss://[::1]:9443", "wss://", "::1", 9443),
+        ] {
+            let saved: SavedConnection = serde_json::from_str(&format!(r#"{{"connection":"{connection}"}}"#)).unwrap();
+            assert_eq!(saved.config.protocol(), expected_protocol);
+            assert_eq!(saved.config.host, expected_host);
+            assert_eq!(saved.config.port, expected_port);
+        }
+    }
+
+    #[test]
+    fn saved_connection_uris_restore_and_encode_usernames() {
+        let saved: SavedConnection = serde_json::from_str(r#"{"connection":"mqtts://alice%40home%3Aname@broker.example:8883"}"#).unwrap();
+        assert_eq!(saved.config.username, "alice@home:name");
+        assert_eq!(
+            connection_uri(&saved.config).unwrap(),
+            "mqtts://alice%40home%3Aname@broker.example:8883"
+        );
+    }
+
+    #[test]
+    fn saved_connection_uris_apply_scheme_default_ports() {
+        for (connection, expected_port) in [
+            ("mqtt://broker.example", 1883),
+            ("mqtts://broker.example", 8883),
+            ("ws://broker.example", 80),
+            ("wss://broker.example", 443),
+        ] {
+            let saved: SavedConnection = serde_json::from_str(&format!(r#"{{"connection":"{connection}"}}"#)).unwrap();
+            assert_eq!(saved.config.port, expected_port);
+        }
+    }
+
+    #[test]
+    fn saved_connection_uris_reject_passwords_paths_and_unknown_schemes() {
+        for connection in [
+            "mqtt://user:password@broker.example:1883",
+            "mqtt://broker.example:1883/path",
+            "ftp://broker.example:21",
+        ] {
+            let result = serde_json::from_str::<SavedConnection>(&format!(r#"{{"connection":"{connection}"}}"#));
+            assert!(result.is_err(), "accepted unexpected URI: {connection}");
+        }
+    }
+
+    #[test]
     fn legacy_configs_default_to_non_websocket_without_changing_tls() {
         for (json, expected) in [("{}", "mqtt://"), (r#"{"tls":false}"#, "mqtt://"), (r#"{"tls":true}"#, "mqtts://")] {
             let config: ConnectionConfig = serde_json::from_str(json).unwrap();
@@ -1013,8 +1181,14 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .all(|config| config["websocket"] == false)
+                .all(|config| config.get("host").is_none()
+                    && config.get("port").is_none()
+                    && config.get("tls").is_none()
+                    && config.get("websocket").is_none())
         );
+        assert_eq!(json["connections"][0]["connection"], "mqtt://mqtt-user@localhost:1883");
+        assert_eq!(json["connections"][1]["connection"], "mqtts://mqtt-user@localhost:1883");
+        assert!(json["connections"][0].get("username").is_none());
     }
 
     #[test]
@@ -1096,7 +1270,7 @@ mod tests {
         assert!(!loaded.connections[2].tls);
         assert_eq!(loaded.connections[2].password, websocket.password);
         let json: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(json["connections"][2]["websocket"], true);
+        assert_eq!(json["connections"][2]["connection"], "ws://mqtt-user@localhost:1883");
         assert!(
             json["connections"]
                 .as_array()

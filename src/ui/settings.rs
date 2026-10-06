@@ -1,9 +1,10 @@
 //! Settings pages and broker management for the explorer.
 
-use super::{ConnectionStatus, Explorer, connection_label};
+use super::{ConnectionStatus, ConnectionTestStatus, Explorer, connection_label};
 use crate::{
     appearance::{self, Appearance, AppearanceMode, ReduceMotion},
     config::{self, ConnectionConfig, ConnectionField, SavedConnections, TopicSubscription},
+    mqtt,
 };
 use gpui_kit::assets::IconName as AssetIconName;
 use gpui_kit::component::{
@@ -14,6 +15,7 @@ use gpui_kit::component::{
     input::{Input, InputGroup, InputState},
     label::Label,
     menu::{DropdownMenu, PopupMenuItem},
+    notification::Notification,
     select::Select,
     setting::{SettingGroup, SettingItem, SettingPage, Settings},
     tag::Tag,
@@ -196,6 +198,83 @@ impl Explorer {
         self.persist_form(true, window, cx);
     }
 
+    fn test_connection_from_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.field_error = None;
+        self.connection_test_revision = self.connection_test_revision.wrapping_add(1);
+        let revision = self.connection_test_revision;
+        let config = match self.connection_config_from_form(cx) {
+            Ok(config) => config,
+            Err((field, message)) => {
+                self.connection_test = ConnectionTestStatus::Failed;
+                self.invalid_field(field, message.clone(), window, cx);
+                window.push_notification(Notification::error(message).autohide(true), cx);
+                return;
+            }
+        };
+        if let Err(error) = config.validate_broker_connection() {
+            let message = error.to_string();
+            self.connection_test = ConnectionTestStatus::Failed;
+            self.invalid_field(error.field(), message.clone(), window, cx);
+            window.push_notification(Notification::error(message).autohide(true), cx);
+            return;
+        }
+        let receiver = match mqtt::test_connection(config) {
+            Ok(receiver) => receiver,
+            Err(error) => {
+                let message = format!("Could not start the broker test: {error:#}");
+                self.connection_test = ConnectionTestStatus::Failed;
+                window.push_notification(Notification::error(message).autohide(true), cx);
+                cx.notify();
+                return;
+            }
+        };
+        self.connection_test = ConnectionTestStatus::Testing;
+        cx.notify();
+        cx.spawn_in(window, async move |view, cx| {
+            let result = receiver.await.unwrap_or_else(|_| Err("The broker test ended unexpectedly.".into()));
+            let _ = view.update_in(cx, |view, window, cx| {
+                if view.connection_test_revision == revision {
+                    let notification = match result {
+                        Ok(()) => {
+                            view.connection_test = ConnectionTestStatus::Success;
+                            Notification::success("Connection successful.").autohide(true)
+                        }
+                        Err(error) => {
+                            view.connection_test = ConnectionTestStatus::Failed;
+                            Notification::error(error).autohide(true)
+                        }
+                    };
+                    window.push_notification(notification, cx);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn connection_config_from_form(&self, cx: &App) -> Result<ConnectionConfig, (ConnectionField, String)> {
+        let port = self
+            .port
+            .read(cx)
+            .value()
+            .trim()
+            .parse::<u16>()
+            .map_err(|_| (ConnectionField::Port, "Enter a port between 1 and 65535.".into()))?;
+        let protocol = self.protocol.read(cx).selected_value().copied();
+        Ok(ConnectionConfig {
+            name: self.name.read(cx).value().trim().to_owned(),
+            host: self.host.read(cx).value().trim().to_owned(),
+            port,
+            client_id: self.client_id.read(cx).value().trim().to_owned(),
+            topics: self.subscription_topics.clone(),
+            username: self.username.read(cx).value().to_string(),
+            password: self.password.read(cx).value().to_string(),
+            tls: matches!(protocol, Some("mqtts://" | "wss://")),
+            validate_certificate: self.validate_certificate,
+            websocket: matches!(protocol, Some("ws://" | "wss://")),
+        })
+    }
+
     fn save_from_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.persist_form(false, window, cx);
     }
@@ -223,13 +302,6 @@ impl Explorer {
             self.invalid_field(ConnectionField::Name, error.into(), window, cx);
             return;
         }
-        let port = match self.port.read(cx).value().trim().parse::<u16>() {
-            Ok(port) => port,
-            Err(_) => {
-                self.invalid_field(ConnectionField::Port, "Enter a port between 1 and 65535.".into(), window, cx);
-                return;
-            }
-        };
         let name = self.name.read(cx).value().trim().to_owned();
         if name.is_empty() {
             self.invalid_field(ConnectionField::Name, "Enter a connection name.".into(), window, cx);
@@ -239,18 +311,12 @@ impl Explorer {
             self.invalid_field(ConnectionField::Topics, "Add or cancel the topic before saving.".into(), window, cx);
             return;
         }
-        let protocol = self.protocol.read(cx).selected_value().copied();
-        let config = ConnectionConfig {
-            name,
-            host: self.host.read(cx).value().trim().to_owned(),
-            port,
-            client_id: self.client_id.read(cx).value().trim().to_owned(),
-            topics: self.subscription_topics.clone(),
-            username: self.username.read(cx).value().to_string(),
-            password: self.password.read(cx).value().to_string(),
-            tls: matches!(protocol, Some("mqtts://" | "wss://")),
-            validate_certificate: self.validate_certificate,
-            websocket: matches!(protocol, Some("ws://" | "wss://")),
+        let config = match self.connection_config_from_form(cx) {
+            Ok(config) => config,
+            Err((field, message)) => {
+                self.invalid_field(field, message, window, cx);
+                return;
+            }
         };
         if let Err(error) = config.validate() {
             self.invalid_field(error.field(), error.to_string(), window, cx);
@@ -314,6 +380,8 @@ impl Explorer {
         self.protocol
             .update(cx, |state, cx| state.set_selected_value(&config.protocol(), window, cx));
         self.field_error = None;
+        self.connection_test_revision = self.connection_test_revision.wrapping_add(1);
+        self.connection_test = ConnectionTestStatus::NotTested;
         self.error = None;
         self.name.update(cx, |input, cx| input.focus(window, cx));
         cx.notify();
@@ -604,6 +672,8 @@ impl Explorer {
                             move |checked, _, cx| {
                                 _ = view.update(cx, |view, cx| {
                                     view.validate_certificate = *checked;
+                                    view.connection_test_revision = view.connection_test_revision.wrapping_add(1);
+                                    view.connection_test = ConnectionTestStatus::NotTested;
                                     cx.notify();
                                 });
                             }
@@ -1032,6 +1102,9 @@ impl Explorer {
         let editing = self.editing;
         let connecting = self.status.is_connecting();
         let duplicate_name_error = self.duplicate_connection_name_error(cx);
+        let testing = matches!(&self.connection_test, ConnectionTestStatus::Testing);
+        let test_succeeded = matches!(&self.connection_test, ConnectionTestStatus::Success);
+        let test_failed = matches!(&self.connection_test, ConnectionTestStatus::Failed);
         let header_view = cx.weak_entity();
         let header = SettingItem::render(move |_, _, _| {
             div()
@@ -1054,7 +1127,27 @@ impl Explorer {
         .keywords(["connection", "server", "edit", "new"]);
         let actions_view = cx.weak_entity();
         let actions = SettingItem::render(move |_, _, _| {
-            div()
+            let test_button = Button::new("test-connection")
+                .small()
+                .label("Test")
+                .accessibility_label(if test_succeeded {
+                    "Test connection: successful"
+                } else if test_failed {
+                    "Test connection: failed"
+                } else {
+                    "Test connection"
+                })
+                .loading(testing)
+                .disabled(testing)
+                .when(test_succeeded, |button| button.success())
+                .when(test_failed, |button| button.danger())
+                .on_click({
+                    let view = actions_view.clone();
+                    move |_, window, cx| {
+                        _ = view.update(cx, |view, cx| view.test_connection_from_form(window, cx));
+                    }
+                });
+            let row = div()
                 .id("connection-form-actions")
                 .test_support()
                 .h_flex()
@@ -1063,14 +1156,7 @@ impl Explorer {
                 .flex_wrap()
                 .p_1()
                 .gap_2()
-                .when_some(editing, |row, index| {
-                    row.child(Button::new("remove-connection").small().label("Remove").on_click({
-                        let view = actions_view.clone();
-                        move |_, window, cx| {
-                            _ = view.update(cx, |view, cx| view.confirm_remove_connection(index, window, cx));
-                        }
-                    }))
-                })
+                .child(test_button)
                 .child(
                     Button::new("save-connection")
                         .small()
@@ -1096,9 +1182,10 @@ impl Explorer {
                                 _ = view.update(cx, |view, cx| view.connect_from_form(window, cx));
                             }
                         }),
-                )
+                );
+            row
         })
-        .keywords(["save", "connect", "remove"]);
+        .keywords(["test", "save", "connect"]);
         let mut group = SettingGroup::new().gap_1().item(header).items([
             self.setting_input("name", "Connection name", &self.name, Some(ConnectionField::Name), cx),
             self.broker_settings(cx),

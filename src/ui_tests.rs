@@ -7,7 +7,7 @@ use gpui_kit::{
     AnyWindowHandle, App, AppContext, Bounds, Entity, Focusable, Styled, TestAppContext, Window, WindowBounds, WindowOptions, px, size,
 };
 
-use super::{ConnectionStatus, Explorer};
+use super::{ConnectionStatus, ConnectionTestStatus, Explorer};
 use crate::{
     appearance::{Appearance, AppearanceMode, ReduceMotion},
     config::{ConnectionConfig, ConnectionField, TopicSubscription},
@@ -3547,42 +3547,35 @@ fn canceling_connection_deletion_preserves_the_connection_and_topics(cx: &mut Te
         window.click("settings", cx);
     })
     .unwrap();
-    for button in ["delete-connection:0", "remove-connection"] {
-        cx.update_window(handle, |_, window, cx| {
-            window.render_frame(cx);
-            if button == "remove-connection" {
-                window.click("edit-connection:0", cx);
-                window.render_frame(cx);
-                window.scroll("name", gpui_kit::ScrollDelta::Lines(gpui_kit::point(0., -100.)), cx);
-            }
-            window.click(button, cx);
-        })
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("delete-connection:0", cx);
+    })
+    .unwrap();
+    assert!(!cx.has_pending_prompt());
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.has_active_dialog(cx));
+        assert_eq!(window.within("dialog").find("cancel").label(), Some("Cancel"));
+        assert_eq!(window.within("dialog").find("ok").label(), Some("Delete"));
+    })
+    .unwrap();
+    cx.update(|cx| {
+        assert_eq!(view.read(cx).saved_connections.connections.len(), 1);
+        assert_eq!(view.read(cx).topics.topics, 2);
+    });
+    cx.update_window(handle, |_, window, cx| window.within("dialog").click("cancel", cx))
         .unwrap();
-        assert!(!cx.has_pending_prompt());
-        cx.update_window(handle, |_, window, cx| {
-            window.render_frame(cx);
-            assert!(window.has_active_dialog(cx));
-            assert_eq!(window.within("dialog").find("cancel").label(), Some("Cancel"));
-            assert_eq!(window.within("dialog").find("ok").label(), Some("Delete"));
-        })
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| assert!(!window.has_active_dialog(cx)))
         .unwrap();
-        cx.update(|cx| {
-            assert_eq!(view.read(cx).saved_connections.connections.len(), 1);
-            assert_eq!(view.read(cx).topics.topics, 2);
-        });
-        cx.update_window(handle, |_, window, cx| window.within("dialog").click("cancel", cx))
-            .unwrap();
-        cx.run_until_parked();
-        cx.update_window(handle, |_, window, cx| assert!(!window.has_active_dialog(cx)))
-            .unwrap();
-        cx.update(|cx| {
-            let view = view.read(cx);
-            assert_eq!(view.saved_connections.connections.len(), 1);
-            assert!(view.status.is_connected());
-            assert!(view.active_config.is_some());
-            assert_eq!(view.topics.topics, 2);
-        });
-    }
+    cx.update(|cx| {
+        let view = view.read(cx);
+        assert_eq!(view.saved_connections.connections.len(), 1);
+        assert!(view.status.is_connected());
+        assert!(view.active_config.is_some());
+        assert_eq!(view.topics.topics, 2);
+    });
 }
 
 #[gpui_kit::test]
@@ -4297,17 +4290,69 @@ fn connection_form_actions_are_below_the_fields_and_aligned_right(cx: &mut TestA
             window.render_frame(cx);
             window.scroll("name", gpui_kit::ScrollDelta::Lines(gpui_kit::point(0., -100.)), cx);
             let password = window.find("field:password").bounds();
+            let test = window.find("test-connection");
             let save = window.find("save-connection");
             let connect = window.find("connect");
+            assert!(test.visible());
             assert!(save.visible());
             assert!(connect.visible());
-            assert!(save.bounds().top() > password.bottom());
+            assert!(window.try_find("remove-connection").is_none());
+            assert!(test.bounds().top() > password.bottom());
+            assert_eq!(test.bounds().top(), save.bounds().top());
             assert_eq!(save.bounds().top(), connect.bounds().top());
+            assert!(test.bounds().right() < save.bounds().left());
             assert!(save.bounds().right() < connect.bounds().left());
             assert!((connect.bounds().right() - password.right()).abs() < px(1.));
         })
         .unwrap();
     }
+}
+
+#[gpui_kit::test]
+fn connection_test_button_replaces_remove_and_reports_results(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, true, 1200., 760.);
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.scroll("name", gpui_kit::ScrollDelta::Lines(gpui_kit::point(0., -100.)), cx);
+        window.render_frame(cx);
+        assert_eq!(window.find("test-connection").label(), Some("Test connection"));
+        assert!(window.try_find("remove-connection").is_none());
+    })
+    .unwrap();
+    cx.update(|cx| {
+        view.update(cx, |view, cx| {
+            view.connection_test = ConnectionTestStatus::Success;
+            cx.notify();
+        });
+    });
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("test-connection").label(), Some("Test connection: successful"));
+        assert!(window.try_find("connection-test-result").is_none());
+    })
+    .unwrap();
+    cx.update(|cx| {
+        view.update(cx, |view, cx| {
+            view.connection_test = ConnectionTestStatus::Failed;
+            cx.notify();
+        });
+    });
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("test-connection").label(), Some("Test connection: failed"));
+        assert!(window.try_find("connection-test-result").is_none());
+        window.click("host", cx);
+        window.press("secondary-a", cx);
+        window.input("other-broker", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("test-connection").label(), Some("Test connection"));
+        assert!(window.try_find("connection-test-result").is_none());
+    })
+    .unwrap();
 }
 
 #[gpui_kit::test]

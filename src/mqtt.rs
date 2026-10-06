@@ -4,7 +4,10 @@ use std::{
     cell::RefCell,
     collections::{HashSet, VecDeque},
     rc::Rc,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -22,7 +25,8 @@ use rumqttc::v5::{
     mqttbytes::{
         QoS,
         v5::{
-            ConnAckProperties, Filter, Packet, PubAckReason, PubCompReason, PubRecReason, PublishProperties, Subscribe, SubscribeReasonCode,
+            ConnAckProperties, ConnectReturnCode, Filter, Packet, PubAckReason, PubCompReason, PubRecReason, PublishProperties, Subscribe,
+            SubscribeReasonCode,
         },
     },
 };
@@ -326,6 +330,49 @@ pub fn connect(config: ConnectionConfig) -> Result<Connection> {
         stop: Some(stop),
         commands,
     })
+}
+
+fn test_client_id() -> String {
+    static NEXT_TEST_CLIENT_ID: AtomicU64 = AtomicU64::new(0);
+    let sequence = NEXT_TEST_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
+    format!("topq-test-{}-{sequence}", std::process::id())
+}
+
+/// Starts a short-lived MQTT handshake and resolves after the broker accepts or rejects it.
+pub fn test_connection(mut config: ConnectionConfig) -> Result<oneshot::Receiver<Result<(), String>>> {
+    config.validate_broker_connection()?;
+    config.client_id = test_client_id();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("Could not create the MQTT test runtime.")?;
+    let (result_sender, result_receiver) = oneshot::channel();
+
+    std::thread::Builder::new()
+        .name("mqtt-connection-test".into())
+        .spawn(move || {
+            let result = runtime.block_on(async move {
+                let options = mqtt_options(&config)?;
+                let (_client, mut event_loop) = AsyncClient::new(options, 1);
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        if let Event::Incoming(Packet::ConnAck(ack)) = event_loop.poll().await? {
+                            ensure!(
+                                ack.code == ConnectReturnCode::Success,
+                                "Broker rejected the connection: {:?}.",
+                                ack.code
+                            );
+                            return Ok(());
+                        }
+                    }
+                })
+                .await
+                .context("Timed out waiting for the broker to accept the connection.")?
+            });
+            let _ = result_sender.send(result.map_err(|error: anyhow::Error| format!("{error:#}")));
+        })
+        .context("Could not start the MQTT connection test thread.")?;
+    Ok(result_receiver)
 }
 
 #[derive(Debug)]
@@ -1467,6 +1514,59 @@ mod tests {
             _ => panic!("expected a publish with MQTT 5 properties"),
         }
         drop(connection);
+        broker.join().unwrap();
+    }
+
+    #[test]
+    fn connection_test_client_ids_are_unique() {
+        assert_ne!(test_client_id(), test_client_id());
+    }
+
+    #[test]
+    fn test_connection_succeeds_on_connack_without_subscribing() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let broker = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let (header, body) = read_packet(&mut stream);
+            assert_eq!(header, 0x10);
+            assert!(connect_client_id(&body).starts_with("topq-test-"));
+            stream.write_all(&wire_packet(0x20, &[0, 0, 0])).unwrap();
+            let mut next_packet = [0];
+            assert_eq!(stream.read(&mut next_packet).unwrap(), 0, "connection test must stop after CONNACK");
+        });
+        let runtime = runtime();
+        let result = test_connection(ConnectionConfig {
+            host: "127.0.0.1".into(),
+            port,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(runtime.block_on(result).unwrap(), Ok(()));
+        broker.join().unwrap();
+    }
+
+    #[test]
+    fn test_connection_reports_broker_rejections() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let broker = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let (header, body) = read_packet(&mut stream);
+            assert_eq!(header, 0x10);
+            connect_client_id(&body);
+            stream.write_all(&wire_packet(0x20, &[0, 0x87, 0])).unwrap();
+        });
+        let runtime = runtime();
+        let result = test_connection(ConnectionConfig {
+            host: "127.0.0.1".into(),
+            port,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(runtime.block_on(result).unwrap().is_err());
         broker.join().unwrap();
     }
 

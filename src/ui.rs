@@ -96,6 +96,13 @@ enum ConnectionStatus {
     Failed(String),
 }
 
+enum ConnectionTestStatus {
+    NotTested,
+    Testing,
+    Success,
+    Failed,
+}
+
 fn connection_label(config: &ConnectionConfig) -> String {
     if !config.name.trim().is_empty() {
         return config.name.clone();
@@ -200,6 +207,8 @@ pub struct Explorer {
     active_config: Option<ConnectionConfig>,
     connection: Option<Connection>,
     status: ConnectionStatus,
+    connection_test: ConnectionTestStatus,
+    connection_test_revision: u64,
     error: Option<String>,
     field_error: Option<(ConnectionField, String)>,
     saved_connections: SavedConnections,
@@ -368,8 +377,10 @@ impl Explorer {
                         input.update(cx, |input, cx| input.select_all(window, cx));
                     }
                     InputEvent::PressEnter { .. } if view.show_config && view.connection_form_open => view.connect_from_form(window, cx),
-                    InputEvent::Change if view.field_error.is_some() || input == &view.name => {
+                    InputEvent::Change => {
                         view.field_error = None;
+                        view.connection_test_revision = view.connection_test_revision.wrapping_add(1);
+                        view.connection_test = ConnectionTestStatus::NotTested;
                         cx.notify();
                     }
                     _ => {}
@@ -389,6 +400,8 @@ impl Explorer {
         }));
         subscriptions.push(cx.subscribe_in(&protocol, window, |view, _, event, window, cx| {
             let SelectEvent::Confirm(Some(protocol)) = event else { return };
+            view.connection_test_revision = view.connection_test_revision.wrapping_add(1);
+            view.connection_test = ConnectionTestStatus::NotTested;
             let port = view.port.read(cx).value();
             let default_port = match (*protocol, port.as_str()) {
                 ("mqtts://", "1883" | "9001" | "9002") => Some("8883"),
@@ -519,6 +532,8 @@ impl Explorer {
             active_config: None,
             connection: None,
             status: ConnectionStatus::Disconnected,
+            connection_test: ConnectionTestStatus::NotTested,
+            connection_test_revision: 0,
             error,
             field_error: None,
             editing: saved_connections.selected,

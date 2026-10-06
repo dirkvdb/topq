@@ -7492,6 +7492,7 @@ dependencies = [
  "hotpath",
  "keyring",
  "keyring-core",
+ "percent-encoding",
  "rumqttc",
  "rustls-native-certs",
  "serde",
@@ -7502,6 +7503,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tungstenite",
+ "url",
 ]
 
 [[package]]
