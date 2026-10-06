@@ -224,7 +224,11 @@ impl Explorer {
                             .xsmall()
                             .icon(AssetIconName::ChartLine)
                             .accessibility_label(format!("New chart for JSON field {field_name}"))
-                            .tooltip("Click for a new chart, or drag onto a chart")
+                            .tooltip(if self.monitoring.is_empty() {
+                                "Click for new chart"
+                            } else {
+                                "Click for a new chart, or drag onto a chart"
+                            })
                             .map(|mut button| {
                                 button
                                     .interactivity()
