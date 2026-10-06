@@ -8,7 +8,7 @@ use crate::{
 };
 use gpui_kit::assets::IconName as AssetIconName;
 use gpui_kit::component::{
-    ActiveTheme, AxisExt, Disableable, Icon, IconName, Sizable, StyledExt, ThemeMode, ThemeRegistry, WindowExt,
+    ActiveTheme, AxisExt, Disableable, FocusTrapElement, Icon, IconName, Sizable, StyledExt, ThemeMode, ThemeRegistry, WindowExt,
     button::{Button, ButtonVariant, ButtonVariants},
     checkbox::Checkbox,
     collapsible::Collapsible,
@@ -17,7 +17,7 @@ use gpui_kit::component::{
     menu::{DropdownMenu, PopupMenuItem},
     notification::Notification,
     select::Select,
-    setting::{SettingGroup, SettingItem, SettingPage, Settings},
+    setting::{SelectIndex, SettingGroup, SettingItem, SettingPage, Settings},
     tag::Tag,
     tooltip::Tooltip,
 };
@@ -121,6 +121,7 @@ impl Explorer {
     pub(super) fn open_connection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.show_config {
             self.settings_generation += 1;
+            self.settings_page_ix = 0;
             self.restore_focus = window.focused(cx);
             if let Some(config) = self
                 .editing
@@ -136,8 +137,17 @@ impl Explorer {
         if self.connection_form_open {
             self.new_connection(window, cx);
         } else {
-            self.focus.focus(window, cx);
+            self.settings_focus.focus(window, cx);
         }
+        cx.notify();
+    }
+
+    fn select_settings_page(&mut self, page_ix: usize, cx: &mut Context<Self>) {
+        if self.settings_page_ix == page_ix {
+            return;
+        }
+        self.settings_page_ix = page_ix;
+        self.settings_generation += 1;
         cx.notify();
     }
 
@@ -155,7 +165,7 @@ impl Explorer {
         self.topic_editor_restore_focus = None;
         self.field_error = None;
         self.error = None;
-        self.focus.focus(window, cx);
+        self.settings_focus.focus(window, cx);
         cx.notify();
     }
 
@@ -1421,10 +1431,13 @@ impl Explorer {
     pub(super) fn settings_dialog(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mut search_header = div().hidden();
         let search_header_style = search_header.style().clone();
+        let mut hidden_sidebar = div().hidden();
+        let sidebar_style = hidden_sidebar.style().clone();
+        let connections_view = cx.weak_entity();
+        let appearance_view = cx.weak_entity();
+        let settings_page_ix = self.settings_page_ix;
 
         div()
-            .id("settings-dialog")
-            .test_support()
             .absolute()
             .inset_0()
             .flex()
@@ -1466,12 +1479,64 @@ impl Explorer {
                     )
                     .child(self.error_alerts(cx))
                     .child(
-                        div().flex_1().min_h_0().child(
-                            Settings::new(SharedString::from(format!("settings-pages:{}", self.settings_generation)))
-                                .pages([self.connections_page(cx), self.appearance_page(cx)])
-                                .header_style(&search_header_style),
-                        ),
+                        div()
+                            .h_flex()
+                            .items_stretch()
+                            .flex_1()
+                            .min_h_0()
+                            .child(
+                                div()
+                                    .id("settings-sections")
+                                    .test_support()
+                                    .v_flex()
+                                    .w_48()
+                                    .flex_none()
+                                    .gap_1()
+                                    .border_r_1()
+                                    .border_color(cx.theme().border)
+                                    .p_2()
+                                    .child(
+                                        Button::new("settings-section-connections")
+                                            .small()
+                                            .w_full()
+                                            .justify_start()
+                                            .ghost()
+                                            .when(settings_page_ix == 0, |button| button.secondary())
+                                            .label("Connections")
+                                            .on_click(move |_, _, cx| {
+                                                _ = connections_view.update(cx, |view, cx| view.select_settings_page(0, cx));
+                                            }),
+                                    )
+                                    .child(
+                                        Button::new("settings-section-appearance")
+                                            .small()
+                                            .w_full()
+                                            .justify_start()
+                                            .ghost()
+                                            .when(settings_page_ix == 1, |button| button.secondary())
+                                            .label("Appearance")
+                                            .on_click(move |_, _, cx| {
+                                                _ = appearance_view.update(cx, |view, cx| view.select_settings_page(1, cx));
+                                            }),
+                                    ),
+                            )
+                            .child(
+                                div().flex_1().min_w_0().min_h_0().child(
+                                    Settings::new(SharedString::from(format!("settings-pages:{}", self.settings_generation)))
+                                        .pages([self.connections_page(cx), self.appearance_page(cx)])
+                                        .default_selected_index(SelectIndex {
+                                            page_ix: settings_page_ix,
+                                            group_ix: None,
+                                        })
+                                        .sidebar_width(px(0.))
+                                        .sidebar_size_range(px(0.)..px(0.))
+                                        .sidebar_style(&sidebar_style)
+                                        .header_style(&search_header_style),
+                                ),
+                            ),
                     ),
             )
+            .focus_trap("settings-dialog", &self.settings_focus)
+            .test_support()
     }
 }

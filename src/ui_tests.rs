@@ -2954,6 +2954,43 @@ fn settings_block_dragging_the_underlying_pane_divider(cx: &mut TestAppContext) 
 }
 
 #[gpui_kit::test]
+fn settings_tab_navigation_stays_within_the_settings_surface(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, false, 760., 540.);
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("settings", cx);
+        window.render_frame(cx);
+        assert!(view.read(cx).settings_focus.contains_focused(window, cx));
+
+        window.press("tab", cx);
+        window.render_frame(cx);
+        assert_eq!(window.find("close-settings").focused(), Some(true));
+        window.press("tab", cx);
+        window.render_frame(cx);
+        assert_eq!(window.find("settings-section-connections").focused(), Some(true));
+        window.press("tab", cx);
+        window.render_frame(cx);
+        assert_eq!(window.find("settings-section-appearance").focused(), Some(true));
+        window.press("enter", cx);
+        window.render_frame(cx);
+        assert!(window.find("appearance-mode").visible());
+        assert!(window.try_find("connections-overview").is_none());
+
+        window.press("shift-tab", cx);
+        window.render_frame(cx);
+        assert_eq!(window.find("settings-section-connections").focused(), Some(true));
+        window.press("enter", cx);
+        window.render_frame(cx);
+        assert!(window.find("connections-overview").visible());
+        assert!(window.try_find("appearance-mode").is_none());
+        assert!(view.read(cx).settings_focus.contains_focused(window, cx));
+
+        window.click("close-settings", cx);
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
 fn appearance_selectors_stay_compact_and_aligned(cx: &mut TestAppContext) {
     for theme in [ThemeMode::Light, ThemeMode::Dark] {
         for (width, font_size) in [(760., 16.), (760., 20.), (1200., 16.), (1200., 20.)] {
@@ -2964,7 +3001,7 @@ fn appearance_selectors_stay_compact_and_aligned(cx: &mut TestAppContext) {
             });
             cx.update_window(handle, |_, window, cx| {
                 window.render_frame(cx);
-                window.click("0-1", cx);
+                window.click("settings-section-appearance", cx);
             })
             .unwrap();
             cx.run_until_parked();
@@ -3032,7 +3069,7 @@ fn reduce_motion_menu_supports_pointer_keyboard_and_saved_preferences(cx: &mut T
     cx.update_window(handle, |_, window, cx| {
         window.activate_window();
         window.render_frame(cx);
-        window.click("0-1", cx);
+        window.click("settings-section-appearance", cx);
     })
     .unwrap();
     cx.run_until_parked();
@@ -3116,7 +3153,7 @@ fn appearance_menus_support_keyboard_selection_dismissal_and_saved_preferences(c
     cx.update_window(handle, |_, window, cx| {
         crate::appearance::select_mode(AppearanceMode::Dark, window, cx).unwrap();
         window.render_frame(cx);
-        window.click("0-1", cx);
+        window.click("settings-section-appearance", cx);
     })
     .unwrap();
     cx.run_until_parked();
@@ -3326,7 +3363,7 @@ fn title_bar_picker_lists_saved_servers_and_settings_hold_theme(cx: &mut TestApp
         assert!(window.try_find("appearance-mode").is_none());
         assert_eq!(view.read(cx).saved_connections.connections.len(), 2);
         assert_eq!(view.read(cx).saved_connections.selected, Some(0));
-        window.click("0-1", cx);
+        window.click("settings-section-appearance", cx);
     })
     .unwrap();
     cx.run_until_parked();
@@ -5356,7 +5393,7 @@ fn escape_closes_settings_from_the_overview_appearance_and_connection_controls(c
             previous_focus = window.focused(cx);
             window.click("settings", cx);
             match target {
-                Some("appearance") => window.click("0-1", cx),
+                Some("appearance") => window.click("settings-section-appearance", cx),
                 Some(id) => {
                     window.click("edit-connection:0", cx);
                     window.click(id, cx);
@@ -5774,7 +5811,7 @@ fn reduce_motion_setting_stops_active_and_future_topic_and_payload_animations(cx
         assert!(view.read(cx).payload_highlight.is_active());
         window.render_frame(cx);
         window.click("settings", cx);
-        window.click("0-1", cx);
+        window.click("settings-section-appearance", cx);
     })
     .unwrap();
     cx.run_until_parked();
