@@ -10,7 +10,7 @@ use gpui_kit::{
 use super::{ConnectionStatus, ConnectionTestStatus, Explorer};
 use crate::{
     appearance::{Appearance, AppearanceMode, ReduceMotion},
-    config::{ConnectionConfig, ConnectionField, TopicSubscription},
+    config::{self, ConnectionConfig, ConnectionField, SavedConnections, TopicSubscription},
     topics::Message,
 };
 
@@ -2847,6 +2847,224 @@ fn connection_failures_use_alerts_and_the_status_bar_is_removed(cx: &mut TestApp
 }
 
 #[gpui_kit::test]
+fn missing_password_warning_follows_the_selected_connection(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, false, 900., 640.);
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("connection-password-warning").is_none());
+        view.update(cx, |view, cx| {
+            view.saved_connections.connections[0].username = "mqtt-user".into();
+            cx.notify();
+        });
+        window.render_frame(cx);
+        let warning = window.find("connection-password-warning");
+        assert!(warning.visible());
+        assert_eq!(
+            warning.label(),
+            Some("No password has been configured yet for the current connection.")
+        );
+
+        view.update(cx, |view, cx| {
+            view.saved_connections.selected = None;
+            cx.notify();
+        });
+        window.render_frame(cx);
+        assert!(window.try_find("connection-password-warning").is_none());
+
+        view.update(cx, |view, cx| {
+            view.saved_connections.selected = Some(0);
+            view.saved_connections.connections[0].password = "saved-secret".into();
+            cx.notify();
+        });
+        window.render_frame(cx);
+        assert!(window.try_find("connection-password-warning").is_none());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn warning_settings_action_opens_the_selected_connection_password(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, false, 900., 640.);
+    view.update(cx, |view, cx| {
+        view.saved_connections.connections[0].username = "mqtt-user".into();
+        cx.notify();
+    });
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        let action = window.find("configure-connection-password");
+        assert!(action.visible());
+        assert_eq!(action.label(), Some("Edit connection"));
+        let alert = window.find("connection-password-warning").bounds();
+        let button = action.bounds();
+        assert!(button.left() >= alert.left() && button.right() <= alert.right());
+        assert!(button.top() >= alert.top() && button.bottom() <= alert.bottom());
+        window.click("configure-connection-password", cx);
+        window.render_frame(cx);
+        assert!(window.find("settings-dialog").visible());
+        assert_eq!(view.read(cx).editing, Some(0));
+        assert!(view.read(cx).connection_form_open);
+        assert_eq!(window.find("password").focused(), Some(true));
+        assert!(view.read(cx).password.read(cx).value().is_empty());
+        assert!(window.try_find("connection-password-warning").is_none());
+        window.click("close-settings", cx);
+        window.render_frame(cx);
+        assert!(window.try_find("connection-password-warning").is_none());
+
+        let config = view.read(cx).saved_connections.connections[0].clone();
+        view.update(cx, |view, cx| view.start_connection(config, window, cx));
+        window.render_frame(cx);
+        assert!(window.find("connection-password-warning").visible());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn clearing_the_selected_password_shows_the_warning_only_after_closing_settings(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, false, 1200., 760.);
+    view.update(cx, |view, cx| {
+        let config = &mut view.saved_connections.connections[0];
+        config.username = "mqtt-user".into();
+        config.password = "old-secret".into();
+        view.active_config = Some(config.clone());
+        cx.notify();
+    });
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("settings", cx);
+        window.click("edit-connection:0", cx);
+        window.click("password", cx);
+        window.press("secondary-a", cx);
+        window.press("backspace", cx);
+        assert!(view.read(cx).password.read(cx).value().is_empty());
+        window.scroll("name", gpui_kit::ScrollDelta::Lines(gpui_kit::point(0., -100.)), cx);
+        window.click("save-connection", cx);
+        window.render_frame(cx);
+        let explorer = view.read(cx);
+        assert!(explorer.saved_connections.connections[0].password.is_empty());
+        assert!(explorer.active_config.is_none());
+        assert!(matches!(explorer.status, ConnectionStatus::Disconnected));
+        assert!(explorer.topics.nodes.is_empty());
+        assert!(window.find("settings-dialog").visible());
+        assert!(window.try_find("connection-password-warning").is_none());
+
+        window.click("close-settings", cx);
+        window.render_frame(cx);
+        assert!(window.try_find("settings-dialog").is_none());
+        assert!(window.find("connection-password-warning").visible());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn startup_with_missing_password_does_not_start_a_connection(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        crate::appearance::register_bundled(cx).unwrap();
+        super::init(cx);
+        config::save_connections(&SavedConnections {
+            connections: vec![ConnectionConfig {
+                name: "Home".into(),
+                username: "mqtt-user".into(),
+                ..Default::default()
+            }],
+            selected: Some(0),
+        })
+        .unwrap();
+    });
+    let (handle, view) = cx.update(|cx| {
+        gpui_kit::open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds::new(Default::default(), size(px(900.), px(640.))))),
+                ..gpui_kit::component::TitleBar::window_options()
+            },
+            cx,
+            |window, cx| cx.new(|cx| Explorer::new(window, cx)),
+        )
+        .unwrap()
+    });
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        let explorer = view.read(cx);
+        assert!(explorer.connection.is_none());
+        assert!(explorer.event_task.is_none());
+        assert!(matches!(explorer.status, ConnectionStatus::Disconnected));
+        assert_eq!(explorer.saved_connections.selected, Some(0));
+        assert!(window.find("connection-password-warning").visible());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn switching_to_a_connection_without_a_password_stops_the_current_connection(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, false, 1200., 760.);
+    view.update(cx, |view, cx| {
+        view.saved_connections.connections.push(ConnectionConfig {
+            name: "Workshop".into(),
+            host: "second.example".into(),
+            username: "reader".into(),
+            ..Default::default()
+        });
+        cx.notify();
+    });
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("settings", cx);
+        window.click("select-connection:1", cx);
+        window.render_frame(cx);
+        let explorer = view.read(cx);
+        assert_eq!(explorer.saved_connections.selected, Some(1));
+        assert!(explorer.active_config.is_none());
+        assert!(explorer.connection.is_none());
+        assert!(explorer.event_task.is_none());
+        assert!(matches!(explorer.status, ConnectionStatus::Disconnected));
+        assert!(explorer.topics.nodes.is_empty());
+        assert!(window.find("connection-password-warning").visible());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn save_and_connect_without_a_password_saves_but_does_not_connect(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, true, 1200., 760.);
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("name", cx);
+        window.input("Home", cx);
+        window.click("username", cx);
+        window.input("mqtt-user", cx);
+        window.scroll("name", gpui_kit::ScrollDelta::Lines(gpui_kit::point(0., -100.)), cx);
+        window.click("connect", cx);
+        window.render_frame(cx);
+        let explorer = view.read(cx);
+        assert_eq!(explorer.saved_connections.selected, Some(0));
+        assert!(explorer.connection.is_none());
+        assert!(explorer.event_task.is_none());
+        assert!(matches!(explorer.status, ConnectionStatus::Disconnected));
+        assert!(window.find("connection-password-warning").visible());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn testing_with_a_username_but_no_password_does_not_start_a_broker_test(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, true, 1200., 760.);
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("username", cx);
+        window.input("mqtt-user", cx);
+        window.scroll("name", gpui_kit::ScrollDelta::Lines(gpui_kit::point(0., -100.)), cx);
+        window.click("test-connection", cx);
+        window.render_frame(cx);
+        let explorer = view.read(cx);
+        assert!(matches!(explorer.connection_test, ConnectionTestStatus::Failed));
+        assert!(explorer.connection.is_none());
+        assert!(explorer.event_task.is_none());
+        assert_eq!(window.find("password").focused(), Some(true));
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
 fn application_errors_are_shown_in_alerts(cx: &mut TestAppContext) {
     let (handle, view) = open(cx, false, 900., 640.);
     view.update(cx, |view, cx| {
@@ -3571,6 +3789,62 @@ fn connection_cards_open_a_full_width_form_and_return_to_the_overview(cx: &mut T
         assert_eq!(window.find("name").value(), Some(""));
         assert_eq!(window.find("host").value(), Some("localhost"));
         assert!(window.find("client-id").value().unwrap().starts_with("topq-"));
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn saving_changes_to_the_current_connection_disconnects_and_clears_its_topics(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, false, 1200., 760.);
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("settings", cx);
+        window.click("edit-connection:0", cx);
+        assert!(view.read(cx).status.is_connected());
+        assert_eq!(view.read(cx).topics.topics, 2);
+        window.click("host", cx);
+        window.press("secondary-a", cx);
+        window.input("other-broker", cx);
+        window.scroll("name", gpui_kit::ScrollDelta::Lines(gpui_kit::point(0., -100.)), cx);
+        window.click("save-connection", cx);
+        let explorer = view.read(cx);
+        assert_eq!(explorer.saved_connections.connections[0].host, "other-broker");
+        assert!(explorer.active_config.is_none());
+        assert!(explorer.connection.is_none());
+        assert!(explorer.event_task.is_none());
+        assert!(matches!(explorer.status, ConnectionStatus::Disconnected));
+        assert!(explorer.topics.nodes.is_empty());
+        assert!(window.find("settings-dialog").visible());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn saving_changes_to_an_inactive_connection_preserves_the_current_session(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, false, 1200., 760.);
+    view.update(cx, |view, cx| {
+        view.saved_connections.connections.push(ConnectionConfig {
+            name: "Workshop".into(),
+            host: "workshop.example".into(),
+            ..Default::default()
+        });
+        cx.notify();
+    });
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("settings", cx);
+        window.click("edit-connection:1", cx);
+        window.click("host", cx);
+        window.press("secondary-a", cx);
+        window.input("other-broker", cx);
+        window.scroll("name", gpui_kit::ScrollDelta::Lines(gpui_kit::point(0., -100.)), cx);
+        window.click("save-connection", cx);
+        let explorer = view.read(cx);
+        assert_eq!(explorer.saved_connections.connections[1].host, "other-broker");
+        assert_eq!(explorer.saved_connections.selected, Some(0));
+        assert_eq!(explorer.active_config.as_ref().unwrap().name, "Home");
+        assert!(explorer.status.is_connected());
+        assert_eq!(explorer.topics.topics, 2);
     })
     .unwrap();
 }

@@ -228,6 +228,16 @@ impl Explorer {
             window.push_notification(Notification::error(message).autohide(true), cx);
             return;
         }
+        if config.missing_password() {
+            self.connection_test = ConnectionTestStatus::Failed;
+            self.password.update(cx, |input, cx| input.focus(window, cx));
+            window.push_notification(
+                Notification::error("Add a password before testing this connection.").autohide(true),
+                cx,
+            );
+            cx.notify();
+            return;
+        }
         let receiver = match mqtt::test_connection(config) {
             Ok(receiver) => receiver,
             Err(error) => {
@@ -332,6 +342,13 @@ impl Explorer {
             self.invalid_field(error.field(), error.to_string(), window, cx);
             return;
         }
+        let disconnect_after_save = !connect
+            && self.active_config.is_some()
+            && self.editing == self.saved_connections.selected
+            && self
+                .editing
+                .and_then(|index| self.saved_connections.connections.get(index))
+                .is_some_and(|previous| previous != &config);
         let mut connections = SavedConnections {
             connections: self.saved_connections.connections.clone(),
             selected: self.saved_connections.selected,
@@ -363,6 +380,13 @@ impl Explorer {
         if connect {
             self.start_connection(config, window, cx);
         } else {
+            if disconnect_after_save {
+                self.event_task = None;
+                self.connection = None;
+                self.active_config = None;
+                self.status = ConnectionStatus::Disconnected;
+                self.clear_topics(window, cx);
+            }
             cx.notify();
         }
     }
@@ -462,7 +486,7 @@ impl Explorer {
         self.set_form(&ConnectionConfig::default(), window, cx);
     }
 
-    fn edit_connection(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn edit_connection(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let config = self.saved_connections.connections.get(index).cloned();
         if let Some(config) = config {
             self.connection_form_open = true;
@@ -526,6 +550,7 @@ impl Explorer {
             return;
         }
         if self.saved_connections.selected == Some(index) {
+            self.dismissed_missing_password_warning = false;
             self.event_task = None;
             self.connection = None;
             self.active_config = None;
@@ -1477,7 +1502,7 @@ impl Explorer {
                                     .on_click(cx.listener(|view, _, window, cx| view.cancel_connection(window, cx))),
                             ),
                     )
-                    .child(self.error_alerts(cx))
+                    .child(self.error_alerts(false, cx))
                     .child(
                         div()
                             .h_flex()

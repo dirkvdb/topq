@@ -204,6 +204,7 @@ pub struct Explorer {
     username: Entity<InputState>,
     password: Entity<InputState>,
     show_config: bool,
+    dismissed_missing_password_warning: bool,
     active_config: Option<ConnectionConfig>,
     connection: Option<Connection>,
     status: ConnectionStatus,
@@ -531,6 +532,7 @@ impl Explorer {
             restore_topics_width: width.is_some() || width_fraction.is_some(),
 
             show_config: saved_config.is_none(),
+            dismissed_missing_password_warning: false,
             active_config: None,
             connection: None,
             status: ConnectionStatus::Disconnected,
@@ -564,12 +566,22 @@ impl Explorer {
     }
 
     fn start_connection(&mut self, config: ConnectionConfig, window: &mut Window, cx: &mut Context<Self>) {
+        self.dismissed_missing_password_warning = false;
         self.event_task = None;
         self.connection = None;
         self.publish_pending = false;
         self.publish_feedback = None;
         self.error = None;
         self.field_error = None;
+        if config.missing_password() {
+            self.active_config = None;
+            self.status = ConnectionStatus::Disconnected;
+            self.show_config = false;
+            self.clear_topics(window, cx);
+            self.focus_topics(window, cx);
+            cx.notify();
+            return;
+        }
         match mqtt::connect(config.clone()) {
             Ok(mut connection) => {
                 if let Some(events) = connection.take_events() {
@@ -1062,14 +1074,60 @@ impl Explorer {
             )
     }
 
-    fn error_alerts(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn error_alerts(&self, show_password_warning: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let error = self.error.clone();
+        let missing_password_message = "No password has been configured yet for the current connection.";
+        let missing_password = self
+            .saved_connections
+            .selected
+            .and_then(|index| self.saved_connections.connections.get(index))
+            .is_some_and(ConnectionConfig::missing_password);
         let connection_error = match &self.status {
             ConnectionStatus::Failed(message) => Some(message.clone()),
             ConnectionStatus::Disconnected | ConnectionStatus::Connecting | ConnectionStatus::Connected => None,
         };
 
         let mut alerts = div().id("error-alerts").test_support().v_flex().flex_none().gap_2();
+        if show_password_warning && missing_password && !self.dismissed_missing_password_warning {
+            alerts = alerts.child(
+                div()
+                    .id("connection-password-warning")
+                    .test_support()
+                    .role(Role::Alert)
+                    .aria_label(missing_password_message)
+                    .h_flex()
+                    .items_start()
+                    .gap_2()
+                    .max_w(rems(24.))
+                    .px_3()
+                    .py_2()
+                    .rounded(cx.theme().radius)
+                    .border_1()
+                    .border_color(cx.theme().warning)
+                    .bg(cx.theme().background)
+                    .child(Icon::new(IconName::TriangleAlert).small().text_color(cx.theme().warning))
+                    .child(
+                        div().v_flex().flex_1().min_w_0().gap_2().child(missing_password_message).child(
+                            div().h_flex().justify_end().child(
+                                Button::new("configure-connection-password")
+                                    .small()
+                                    .ghost()
+                                    .icon(IconName::Settings)
+                                    .label("Edit connection")
+                                    .on_click(cx.listener(|view, _, window, cx| {
+                                        view.dismissed_missing_password_warning = true;
+                                        view.open_connection(window, cx);
+                                        view.restore_focus = None;
+                                        if let Some(index) = view.saved_connections.selected {
+                                            view.edit_connection(index, window, cx);
+                                            view.password.update(cx, |input, cx| input.focus(window, cx));
+                                        }
+                                    })),
+                            ),
+                        ),
+                    ),
+            );
+        }
         if let Some(message) = error {
             alerts = alerts.child(
                 div().id("application-error").test_support().child(
@@ -1612,7 +1670,14 @@ impl Explorer {
                 ),
             )
             .when(!self.show_config, |root| {
-                root.child(div().absolute().top(TITLE_BAR_HEIGHT).right_0().p_2().child(self.error_alerts(cx)))
+                root.child(
+                    div()
+                        .absolute()
+                        .top(TITLE_BAR_HEIGHT)
+                        .right_0()
+                        .p_2()
+                        .child(self.error_alerts(true, cx)),
+                )
             })
     }
 }

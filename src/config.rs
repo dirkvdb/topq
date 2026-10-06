@@ -49,7 +49,7 @@ impl TopicSubscription {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, from = "DeserializedConnectionConfig")]
 #[non_exhaustive]
 pub struct ConnectionConfig {
@@ -185,6 +185,10 @@ fn default_client_id() -> String {
 }
 
 impl ConnectionConfig {
+    pub(crate) fn missing_password(&self) -> bool {
+        !self.username.is_empty() && self.password.is_empty()
+    }
+
     /// Returns the broker protocol prefix for the transport and TLS settings.
     pub fn protocol(&self) -> &'static str {
         match (self.websocket, self.tls) {
@@ -274,12 +278,12 @@ std::thread_local! {
 
 #[cfg(test)]
 pub fn config_path() -> Result<PathBuf> {
-    Ok(TEST_CONFIG_DIR.with(|dir| dir.path().join("mqtt-ui").join("connections.json")))
+    Ok(TEST_CONFIG_DIR.with(|dir| dir.path().join("topq").join("connections.json")))
 }
 
 #[cfg(not(test))]
 pub fn config_path() -> Result<PathBuf> {
-    let dirs = ProjectDirs::from("", "", "mqtt-ui").context("Could not locate your application configuration directory.")?;
+    let dirs = ProjectDirs::from("", "", "topq").context("Could not locate your application configuration directory.")?;
     Ok(dirs.config_dir().join("connections.json"))
 }
 
@@ -326,10 +330,13 @@ fn load_connections_from(path: &Path, entry: &impl Fn(&ConnectionConfig) -> Resu
         if !accounts.insert(credential_account(&config)) {
             return Err(anyhow!("Duplicate saved MQTT connection account."));
         }
-        if saved.password_in_keyring {
-            config.password = entry(&config)?.get_password()
-                .map_err(credential_error)
-                .context("Could not retrieve the MQTT password. Unlock your system credential store or enter the password again in Connection settings.")?;
+        if !config.username.is_empty() {
+            config.password = match entry(&config)?.get_password() {
+                Ok(password) => password,
+                Err(KeyringError::NoEntry) => String::new(),
+                Err(error) => return Err(credential_error(error))
+                    .context("Could not retrieve the MQTT password. Unlock your system credential store or enter the password again in Connection settings."),
+            };
         }
         connections.push(config);
     }
@@ -407,7 +414,7 @@ fn save_connections_to(path: &Path, saved: &SavedConnections, entry: &impl Fn(&C
         }
     }
     for old in &previous.connections {
-        if old.password_in_keyring && !retained_secrets.contains(&credential_account(&old.config)) {
+        if !old.config.username.is_empty() && !retained_secrets.contains(&credential_account(&old.config)) {
             changes.push(CredentialChange {
                 config: &old.config,
                 previous: None,
@@ -428,10 +435,7 @@ fn save_connections_to(path: &Path, saved: &SavedConnections, entry: &impl Fn(&C
         connections: saved
             .connections
             .iter()
-            .map(|config| SavedConnection {
-                config: config.clone(),
-                password_in_keyring: !config.password.is_empty(),
-            })
+            .map(|config| SavedConnection { config: config.clone() })
             .collect(),
         selected: saved.selected,
     };
@@ -457,7 +461,6 @@ fn save_connections_to(path: &Path, saved: &SavedConnections, entry: &impl Fn(&C
 
 struct SavedConnection {
     config: ConnectionConfig,
-    password_in_keyring: bool,
 }
 
 impl Serialize for SavedConnection {
@@ -466,14 +469,13 @@ impl Serialize for SavedConnection {
         S: serde::Serializer,
     {
         let config = &self.config;
-        let mut state = serializer.serialize_struct("SavedConnection", 6)?;
+        let mut state = serializer.serialize_struct("SavedConnection", 5)?;
         state.serialize_field("name", &config.name)?;
         let connection = connection_uri(config).map_err(serde::ser::Error::custom)?;
         state.serialize_field("connection", &connection)?;
         state.serialize_field("client_id", &config.client_id)?;
         state.serialize_field("topics", &config.topics)?;
         state.serialize_field("validate_certificate", &config.validate_certificate)?;
-        state.serialize_field("password_in_keyring", &self.password_in_keyring)?;
         state.end()
     }
 }
@@ -489,8 +491,6 @@ impl<'de> Deserialize<'de> for SavedConnection {
             connection: Option<String>,
             #[serde(flatten)]
             config: ConnectionConfig,
-            #[serde(default)]
-            password_in_keyring: bool,
         }
 
         let mut saved = DeserializedSavedConnection::deserialize(deserializer)?;
@@ -502,10 +502,7 @@ impl<'de> Deserialize<'de> for SavedConnection {
             saved.config.websocket = address.websocket;
             saved.config.username = address.username;
         }
-        Ok(Self {
-            config: saved.config,
-            password_in_keyring: saved.password_in_keyring,
-        })
+        Ok(Self { config: saved.config })
     }
 }
 
@@ -591,14 +588,14 @@ fn password_entry(config: &ConnectionConfig) -> Result<Entry> {
 
     TEST_CREDENTIAL_STORE.with(|store| {
         Ok(Entry {
-            inner: store.build("mqtt-ui", &credential_account(config), None)?,
+            inner: store.build("topq", &credential_account(config), None)?,
         })
     })
 }
 
 #[cfg(not(test))]
 fn password_entry(config: &ConnectionConfig) -> Result<Entry> {
-    Entry::new("mqtt-ui", &credential_account(config))
+    Entry::new("topq", &credential_account(config))
         .map_err(credential_error)
         .context("Could not open the system credential store.")
 }
@@ -778,7 +775,7 @@ mod tests {
         let store = mock::Store::new().unwrap();
         move |config| {
             Ok(Entry {
-                inner: store.build("mqtt-ui", &credential_account(config), None)?,
+                inner: store.build("topq", &credential_account(config), None)?,
             })
         }
     }
@@ -1189,6 +1186,7 @@ mod tests {
         assert_eq!(json["connections"][0]["connection"], "mqtt://mqtt-user@localhost:1883");
         assert_eq!(json["connections"][1]["connection"], "mqtts://mqtt-user@localhost:1883");
         assert!(json["connections"][0].get("username").is_none());
+        assert!(json["connections"][0].get("password_in_keyring").is_none());
     }
 
     #[test]
@@ -1313,7 +1311,7 @@ mod tests {
     fn application_persistence_uses_temporary_configuration_and_mock_credentials() {
         let path = config_path().unwrap();
         TEST_CONFIG_DIR.with(|dir| {
-            assert_eq!(path, dir.path().join("mqtt-ui").join("connections.json"));
+            assert_eq!(path, dir.path().join("topq").join("connections.json"));
             assert!(path.with_file_name("appearance.json").starts_with(dir.path()));
         });
         let config = authenticated_config();
@@ -1713,7 +1711,9 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .all(|item| item.get("password").is_none() && item.get("base_topic").is_none())
+                .all(|item| item.get("password").is_none()
+                    && item.get("password_in_keyring").is_none()
+                    && item.get("base_topic").is_none())
         );
         assert!(!std::str::from_utf8(&bytes).unwrap().contains(&first.password));
         assert!(!std::str::from_utf8(&bytes).unwrap().contains(&second.password));
@@ -1890,22 +1890,92 @@ mod tests {
     }
 
     #[test]
-    fn missing_password_in_multi_store_is_an_error() {
+    fn missing_password_does_not_prevent_loading_saved_connections() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("connection.json");
         let entries = mock_entries();
-        let config = authenticated_config();
+        let missing = authenticated_config();
+        let available = ConnectionConfig {
+            host: "another-broker".into(),
+            ..missing.clone()
+        };
         save_connections_to(
             &path,
             &SavedConnections {
-                connections: vec![config.clone()],
+                connections: vec![missing.clone(), available.clone()],
                 selected: Some(0),
             },
             &entries,
         )
         .unwrap();
-        entries(&config).unwrap().delete_credential().unwrap();
-        assert!(format!("{:#}", load_connections_from(&path, &entries).err().unwrap()).contains("saved MQTT password was not found"));
+        entries(&missing).unwrap().delete_credential().unwrap();
+        let loaded = load_connections_from(&path, &entries).unwrap();
+        assert!(loaded.connections[0].password.is_empty());
+        assert_eq!(loaded.connections[1].password, available.password);
+        assert_eq!(loaded.selected, Some(0));
+    }
+
+    #[test]
+    fn a_username_without_a_stored_password_loads_without_a_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("connection.json");
+        fs::write(
+            &path,
+            r#"{"connections":[{"connection":"mqtt://mqtt-user@localhost:1883"}],"selected":0}"#,
+        )
+        .unwrap();
+        let loaded = load_connections_from(&path, &mock_entries()).unwrap();
+        assert!(loaded.connections[0].password.is_empty());
+    }
+
+    #[test]
+    fn anonymous_connection_does_not_need_a_credential_store_to_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("connection.json");
+        fs::write(&path, r#"{"connections":[{"connection":"mqtt://localhost:1883"}],"selected":0}"#).unwrap();
+        let entries = |_: &ConnectionConfig| -> Result<Entry> { panic!("anonymous connections must not access the keychain") };
+        let loaded = load_connections_from(&path, &entries).unwrap();
+        assert!(loaded.connections[0].password.is_empty());
+    }
+
+    #[test]
+    fn legacy_password_flag_does_not_control_keychain_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("connection.json");
+        let entries = mock_entries();
+        let config = authenticated_config();
+        entries(&config).unwrap().set_password(&config.password).unwrap();
+        fs::write(
+            &path,
+            r#"{"connections":[{"connection":"mqtt://mqtt-user@localhost:1883","password_in_keyring":false}],"selected":0}"#,
+        )
+        .unwrap();
+        let loaded = load_connections_from(&path, &entries).unwrap();
+        assert_eq!(loaded.connections[0].password, config.password);
+        save_connections_to(&path, &SavedConnections::default(), &entries).unwrap();
+        assert!(matches!(entries(&config).unwrap().get_password(), Err(KeyringError::NoEntry)));
+    }
+
+    #[test]
+    fn keychain_failure_other_than_missing_entry_still_prevents_loading() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("connection.json");
+        let entries = mock_entries();
+        let config = authenticated_config();
+        fs::write(
+            &path,
+            r#"{"connections":[{"connection":"mqtt://mqtt-user@localhost:1883"}],"selected":0}"#,
+        )
+        .unwrap();
+        entries(&config)
+            .unwrap()
+            .inner
+            .as_any()
+            .downcast_ref::<mock::Cred>()
+            .unwrap()
+            .set_error(KeyringError::NoStorageAccess(std::io::Error::other("locked").into()));
+        let error = load_connections_from(&path, &entries).err().unwrap();
+        assert!(format!("{error:#}").contains("Could not retrieve the MQTT password"));
     }
 
     #[test]

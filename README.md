@@ -15,7 +15,7 @@ An MQTT 5 topic explorer built with Rust and [GPUI Kit](https://gpui-kit.com).
 
 ## Configuration
 
-Create the files below before starting TopQ. On Linux, the configuration directory is `$XDG_CONFIG_HOME/mqtt-ui`, or `~/.config/mqtt-ui` when unset. The directory name is `mqtt-ui`, not `topq`.
+Create the files below before starting TopQ. On Linux, the configuration directory is `$XDG_CONFIG_HOME/topq`, or `~/.config/topq` when unset.
 
 TopQ reads these files at startup and writes changes made in the application back to them. Declaratively managed, read-only files can be loaded, but saving changes to them will fail.
 
@@ -34,8 +34,7 @@ TopQ reads these files at startup and writes changes made in the application bac
         { "topic": "home/#", "qos": 1 },
         { "topic": "$SYS/#", "qos": 0 }
       ],
-      "validate_certificate": true,
-      "password_in_keyring": false
+      "validate_certificate": true
     }
   ],
   "selected": 0
@@ -60,7 +59,7 @@ WebSocket connections use the fixed path `/mqtt`; custom paths are not configura
 
 `validate_certificate` defaults to `true`: TLS uses the system's trusted certificates and verifies the broker hostname. Setting it to `false` disables certificate and hostname verification; encryption remains, but the broker is not authenticated. It has no effect without TLS.
 
-Passwords are stored only in the system credential store and must not be included in the URI. A JSON `password` field is ignored. Leave `password_in_keyring` omitted or `false` for a connection without a stored password; enter and save passwords through Connection settings. Set it to `true` only when the matching credential already exists. Saving or restoring passwords requires an available, unlocked credential store; there is no plaintext fallback.
+Passwords are stored only in the system credential store and must not be included in the URI. A JSON `password` field is ignored. If a connection has a username, TopQ looks up its password in the credential store. When none is found for the selected connection, TopQ shows a warning and does not attempt to connect; enter and save a password through Connection settings. Anonymous connections (without a username) do not need a password. Other credential-store failures still prevent loading connections. Saving or restoring passwords requires an available, unlocked credential store; there is no plaintext fallback.
 
 Credentials are scoped by host, port, transport, and username. Saved connections must have unique combinations of those values, even if their names or client IDs differ.
 

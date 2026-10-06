@@ -301,6 +301,7 @@ impl Drop for Connection {
 /// Starts a worker for a validated connection, returning setup failures to the caller.
 pub fn connect(config: ConnectionConfig) -> Result<Connection> {
     config.validate()?;
+    ensure!(!config.missing_password(), "No password is configured for this connection.");
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -341,6 +342,7 @@ fn test_client_id() -> String {
 /// Starts a short-lived MQTT handshake and resolves after the broker accepts or rejects it.
 pub fn test_connection(mut config: ConnectionConfig) -> Result<oneshot::Receiver<Result<(), String>>> {
     config.validate_broker_connection()?;
+    ensure!(!config.missing_password(), "No password is configured for this connection.");
     config.client_id = test_client_id();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1330,6 +1332,22 @@ mod tests {
             };
             assert!(matches!(mqtt_options(&config).unwrap().transport(), Transport::Ws));
         }
+    }
+
+    #[test]
+    fn missing_password_prevents_starting_authenticated_connections_and_tests() {
+        let config = ConnectionConfig {
+            username: "mqtt-user".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            connect(config.clone()).err().unwrap().to_string(),
+            "No password is configured for this connection."
+        );
+        assert_eq!(
+            test_connection(config).err().unwrap().to_string(),
+            "No password is configured for this connection."
+        );
     }
 
     #[test]
