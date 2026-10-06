@@ -14,14 +14,14 @@ use serde::{Deserialize, Serialize};
 use crate::config;
 
 const DEFAULT_LIGHT_THEME: &str = "Ayu Light";
-const DEFAULT_DARK_THEME: &str = "Charcoal Grove";
+const DEFAULT_DARK_THEME: &str = "Ayu Dark";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum AppearanceMode {
+    #[default]
     System,
     Light,
-    #[default]
     Dark,
 }
 
@@ -88,7 +88,7 @@ pub(crate) struct Appearance {
 impl Default for Appearance {
     fn default() -> Self {
         Self {
-            mode: AppearanceMode::Dark,
+            mode: AppearanceMode::System,
             light_theme: DEFAULT_LIGHT_THEME.to_owned(),
             dark_theme: DEFAULT_DARK_THEME.to_owned(),
             reduce_motion: ReduceMotion::System,
@@ -411,9 +411,10 @@ mod tests {
     #[test]
     fn defaults_and_mode_labels_have_stable_serialization() {
         let preferences = Appearance::default();
+        assert_eq!(AppearanceMode::default(), AppearanceMode::System);
         assert_eq!(
             serde_json::to_value(preferences).unwrap(),
-            serde_json::json!({"mode": "dark", "light_theme": "Ayu Light", "dark_theme": "Charcoal Grove", "reduce_motion": "system"})
+            serde_json::json!({"mode": "system", "light_theme": "Ayu Light", "dark_theme": "Ayu Dark", "reduce_motion": "system"})
         );
         for (mode, label, serialized) in [
             (AppearanceMode::System, "System", "system"),
@@ -504,7 +505,7 @@ mod tests {
                 assert_eq!(reloaded.path.as_deref(), Some(path.as_path()));
                 cx.set_global(reloaded);
                 assert_eq!(Appearance::reduce_motion(cx), reduce_motion);
-                assert_eq!(Appearance::mode(cx), AppearanceMode::Dark);
+                assert_eq!(Appearance::mode(cx), AppearanceMode::System);
                 assert_eq!(Appearance::selected_theme(ThemeMode::Light, cx), DEFAULT_LIGHT_THEME);
                 assert_eq!(Appearance::selected_theme(ThemeMode::Dark, cx), DEFAULT_DARK_THEME);
             }
@@ -576,19 +577,22 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn missing_or_empty_settings_use_dark_charcoal_grove(cx: &mut TestAppContext) {
+    fn missing_or_empty_settings_use_system_appearance(cx: &mut TestAppContext) {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("appearance.json");
         cx.update(|cx| {
             setup(cx, &path);
-            assert_eq!(Appearance::mode(cx), AppearanceMode::Dark);
+            assert_eq!(Appearance::mode(cx), AppearanceMode::System);
             assert_eq!(Appearance::selected_theme(ThemeMode::Light, cx), DEFAULT_LIGHT_THEME);
             assert_eq!(Appearance::selected_theme(ThemeMode::Dark, cx), DEFAULT_DARK_THEME);
-            assert_eq!(Theme::global(cx).theme_name().as_str(), DEFAULT_DARK_THEME);
-            assert_eq!(Theme::global(cx).highlight_theme.name, DEFAULT_DARK_THEME);
+            let mode = ThemeMode::from(cx.window_appearance());
+            let name = Appearance::selected_theme(mode, cx);
+            assert_eq!(Theme::global(cx).mode, mode);
+            assert_eq!(Theme::global(cx).theme_name().as_str(), name);
+            assert_eq!(Theme::global(cx).highlight_theme.name, name);
             fs::write(&path, "{}").unwrap();
             let preferences = load(&path, cx).unwrap();
-            assert_eq!(preferences.mode, AppearanceMode::Dark);
+            assert_eq!(preferences.mode, AppearanceMode::System);
             assert_eq!(preferences.path.as_deref(), Some(path.as_path()));
         });
     }
@@ -616,7 +620,7 @@ mod tests {
                 assert_eq!(preferences.path.as_deref(), Some(path.as_path()));
             }
             fs::write(&path, r#"{"theme":"Removed"}"#).unwrap();
-            assert_eq!(load(&path, cx).unwrap().mode, AppearanceMode::Dark);
+            assert_eq!(load(&path, cx).unwrap().mode, AppearanceMode::System);
         });
     }
 
@@ -674,6 +678,7 @@ mod tests {
     fn inactive_choices_persist_without_switching_mode_palette_or_metrics(cx: &mut TestAppContext) {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("appearance.json");
+        fs::write(&path, r#"{"mode":"dark"}"#).unwrap();
         cx.update(|cx| setup(cx, &path));
         let handle = cx.add_window(|_, _| TestView);
         cx.update_window(handle.into(), |_, window, cx| {
@@ -847,6 +852,7 @@ mod tests {
     fn invalid_selections_do_not_mutate_preferences_theme_or_disk(cx: &mut TestAppContext) {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("appearance.json");
+        fs::write(&path, r#"{"mode":"dark"}"#).unwrap();
         cx.update(|cx| {
             setup(cx, &path);
             save(cx).unwrap();
@@ -911,7 +917,7 @@ mod tests {
                 assert_eq!(recovered.path.as_deref(), Some(path.as_path()));
                 cx.set_global(recovered);
                 save(cx).unwrap();
-                assert_eq!(load(&path, cx).unwrap().mode, AppearanceMode::Dark);
+                assert_eq!(load(&path, cx).unwrap().mode, AppearanceMode::System);
             }
             let unreadable = directory.path().join("is-a-directory");
             fs::create_dir(&unreadable).unwrap();

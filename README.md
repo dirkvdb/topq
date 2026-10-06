@@ -6,27 +6,87 @@ An MQTT 5 topic explorer built with Rust and [GPUI Kit](https://gpui-kit.com).
 
 ## Features
 
-- Multiple saved TCP, TLS, WebSocket, and secure WebSocket broker connections with automatic reconnect.
-- Live topic tree and latest per-topic payload, shown as formatted JSON, text, or hex, with message metadata and MQTT 5 content type when supplied by the publisher. Additional MQTT 5 properties (payload format, expiry interval, response topic, correlation data, user properties, and subscription identifiers) are preserved in the message model for future UI use.
-- Preview toggle switches between rendered and raw payloads. 
+- Connection management to quickly connect to your favorite brokers, with optional TLS and WebSocket support.
+- Live topic tree
+- Payload pane to inspect the message payloads
 - Deletion of retained messages for a selected topic and its known subtopics.
 - Publish messages.
 
-Each connection has one or more **Topics** subscriptions, each with its own QoS (0, 1, or 2). New connections default to `#` at QoS 0. Enter MQTT topic filters such as `home/#`, `home/+/temperature`, or `$SYS/#` in the connection settings; duplicate filters are not allowed. The default `#` excludes `$`-prefixed topics such as `$SYS`. All configured filters are subscribed together on every reconnect, and the connection is marked connected only after the broker accepts every subscription. The delete button publishes an empty payload with QoS 0 and retain enabled to each known topic in the selected branch, removing retained messages on the broker. Confirmation is tied to the current connection session; interrupted batches are not retried after reconnect. QoS 0 has no delivery acknowledgement, so deletion cannot be guaranteed. Subscribed clients remove topics and prune empty parent levels when they receive the broker's empty publish. Incoming empty payloads are treated as removals: MQTT 5 cannot reliably distinguish a forwarded retained-message deletion from an ordinary empty publish. This does not stop live publishers, which can recreate retained messages; the live tree continues to show received updates. Connections require an MQTT 5-capable broker; there is no MQTT 3.1.1 fallback. Incoming topic aliases are disabled. There is no message history or custom TLS certificate support.
-
 ## Configuration
 
-The connection editor supports `mqtt://` (port `1883`), `mqtts://` (port `8883`), `ws://` (port `9001`), and `wss://` (port `9002`). Selecting a protocol updates recognized default ports while preserving custom ports. WebSocket connections use the `/mqtt` path. **Validate certificate** is enabled for `mqtts://` and `wss://` and defaults to checked, using the system trust store to verify the broker certificate and hostname. Disable it only for trusted brokers.
+Create the files below before starting TopQ. On Linux, the configuration directory is `$XDG_CONFIG_HOME/mqtt-ui`, or `~/.config/mqtt-ui` when unset. The directory name is `mqtt-ui`, not `topq`.
 
-Connections and preferences are stored in the platform's `mqtt-ui` configuration directory (`connections.json`, `appearance.json`, and `layout.json`). Existing `connection.json` files are not migrated. Within `connections.json`, legacy `base_topic` settings are automatically loaded as a single subscription at QoS 2, preserving their previous behavior. Connections without either `topics` or `base_topic` default to `#` at QoS 0. Subsequent saves write only the new `topics` array, for example `"topics": [{"topic": "home/#", "qos": 0}, {"topic": "$SYS/#", "qos": 1}]`.
+TopQ reads these files at startup and writes changes made in the application back to them. Declaratively managed, read-only files can be loaded, but saving changes to them will fail.
 
-Appearance settings provide **Mode** (`System`, `Light`, or `Dark`) and independent **Light theme** and **Dark theme** choices. System mode follows OS appearance changes using the selected theme for each mode. Changes are applied and saved immediately; choosing an inactive theme leaves the current appearance unchanged. Defaults are Dark mode, Ayu Light, and Charcoal Grove. Legacy `appearance.json` theme choices are preserved when loaded; subsequent saves use `mode`, `light_theme`, and `dark_theme`.
+### Connections
 
-Passwords are stored in the system credential store, never in the JSON files. Saving or restoring a password requires an available, unlocked credential store; there is no plaintext fallback.
+`connections.json`:
+
+```json
+{
+  "connections": [
+    {
+      "name": "Home broker",
+      "host": "broker.example.com",
+      "port": 8883,
+      "client_id": "topq-workstation",
+      "topics": [
+        { "topic": "home/#", "qos": 1 },
+        { "topic": "$SYS/#", "qos": 0 }
+      ],
+      "username": "",
+      "tls": true,
+      "validate_certificate": true,
+      "websocket": false,
+      "password_in_keyring": false
+    }
+  ],
+  "selected": 0
+}
+```
+
+- `selected` is the zero-based index of the connection to connect to at startup. Use `null` or omit it to start without connecting. An out-of-range index falls back to the first connection.
+- `host` is a hostname or IP address, without a URL scheme, port, or path.
+- `client_id` identifies the MQTT client. Use a different ID for each concurrently connected client on the same broker to avoid disconnecting each other. If omitted, TopQ generates an ID on load.
+- `topics` must contain at least one unique MQTT filter. `+` matches one topic level; a final `#` matches any number of levels. `#` does not include topics starting with `$`; subscribe to `$SYS/#` separately for broker statistics. `qos` is the requested maximum delivery QoS: `0` (at most once), `1` (at least once), or `2` (exactly once). If `topics` is omitted, it defaults to `[{"topic":"#","qos":0}]`.
+- `tls` and `websocket` select the transport. Set `port` explicitly; omitting it always uses `1883`, even with TLS or WebSocket enabled.
+
+| Transport | `tls` | `websocket` | Connection editor's default port |
+| --- | --- | --- | --- |
+| MQTT (`mqtt://`) | `false` | `false` | `1883` |
+| MQTT over TLS (`mqtts://`) | `true` | `false` | `8883` |
+| MQTT over WebSocket (`ws://`) | `false` | `true` | `9001` |
+| MQTT over secure WebSocket (`wss://`) | `true` | `true` | `9002` |
+
+WebSocket connections use the fixed path `/mqtt`; custom paths are not configurable.
+
+`validate_certificate` defaults to `true`: TLS uses the system's trusted certificates and verifies the broker hostname. Setting it to `false` disables certificate and hostname verification; encryption remains, but the broker is not authenticated. It has no effect without TLS.
+
+Passwords are stored only in the system credential store. A JSON `password` field is ignored. Leave `password_in_keyring` omitted or `false` for a connection without a stored password; enter and save passwords through Connection settings. Set it to `true` only when the matching credential already exists. Saving or restoring passwords requires an available, unlocked credential store; there is no plaintext fallback.
+
+Credentials are scoped by host, port, transport, and username. Saved connections must have unique combinations of those values, even if their names or client IDs differ.
+
+### Appearance
+
+`appearance.json`:
+
+```json
+{
+  "mode": "system",
+  "light_theme": "Ayu Light",
+  "dark_theme": "Ayu Dark",
+  "reduce_motion": "system"
+}
+```
+
+- `mode`: `system`, `light`, or `dark`. `system` (default) follows the OS appearance.
+- `light_theme` and `dark_theme`: exact theme names for each mode, not filenames. Defaults are `Ayu Light` and `Ayu Dark`. Missing themes or themes for the wrong mode fall back to the defaults.
+- `reduce_motion`: `system` (default) follows the OS preference, `on` reduces motion, and `off` overrides the OS preference to allow motion.
+
+Place custom theme JSON files in the configuration directory's `themes/` subdirectory. See the [GPUI Kit theme documentation](https://gpui-kit.com/component/theme) for the theme format.
+
 
 ## Development
-
-Tests use thread-local temporary configuration and state directories plus an in-memory credential store. Test builds never resolve the real application configuration paths or open the system credential store, including when UI tests save connections or appearance preferences.
 
 Activate the devenv virtual environment, then run:
 

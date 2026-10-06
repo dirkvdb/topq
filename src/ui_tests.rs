@@ -2468,7 +2468,7 @@ fn appearance_menus_support_keyboard_selection_dismissal_and_saved_preferences(c
             window.render_frame(cx);
             assert_eq!(window.find("appearance-mode").label(), Some("Mode: Dark"));
             assert_eq!(window.find("light-theme").label(), Some("Light theme: Ayu Light"));
-            assert_eq!(window.find("dark-theme").label(), Some("Dark theme: Charcoal Grove"));
+            assert_eq!(window.find("dark-theme").label(), Some("Dark theme: Ayu Dark"));
             let focus = window.focused(cx);
             window.click("light-theme", cx);
             focus
@@ -2517,7 +2517,7 @@ fn appearance_menus_support_keyboard_selection_dismissal_and_saved_preferences(c
     cx.update_window(handle, |_, window, cx| {
         window.render_frame(cx);
         assert_eq!(Appearance::mode(cx), AppearanceMode::Dark);
-        assert_eq!(cx.theme().theme_name().as_str(), "Charcoal Grove");
+        assert_eq!(cx.theme().theme_name().as_str(), "Ayu Dark");
         assert_eq!(window.find("light-theme").label(), Some("Light theme: Gruvbox Light"));
         window.click("appearance-mode", cx);
     })
