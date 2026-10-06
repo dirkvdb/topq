@@ -4113,6 +4113,52 @@ fn edit_value_prefills_publish_draft_and_focuses_the_payload_end(cx: &mut TestAp
 }
 
 #[gpui_kit::test]
+fn edit_value_leaves_the_payload_empty_for_images_and_binary_values(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, false, 900., 640.);
+    cx.update_window(handle, |_, window, _| window.activate_window()).unwrap();
+    for (payload, content_type, format) in [
+        (&[0xff, 0x00][..], None, "Binary · hex"),
+        (&[0x89, b'P', b'N', b'G'][..], Some("image/png"), "Image"),
+        (PUBLISH_FILE_SVG, Some("image/svg+xml"), "Image"),
+        (b"unsupported image".as_slice(), Some("image/vnd.example.custom"), "Image"),
+    ] {
+        cx.update_window(handle, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                let mut update = message("home/a");
+                update.payload = Bytes::copy_from_slice(payload);
+                update.properties = crate::topics::MessageProperties::from_publish(content_type.map(|content_type| {
+                    rumqttc::v5::mqttbytes::v5::PublishProperties {
+                        content_type: Some(content_type.to_owned()),
+                        ..Default::default()
+                    }
+                }));
+                view.topics.receive(update, std::time::Instant::now());
+                view.select_topic("home/a", window, cx);
+                view.publish_payload
+                    .update(cx, |editor, cx| editor.set_value("old draft", window, cx));
+                cx.notify();
+            });
+            window.render_frame(cx);
+            assert_eq!(view.read(cx).payload_format, format);
+            window.click("edit-value", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("publish-form").visible());
+            assert_eq!(window.find("publish-topic").value(), Some("home/a"));
+            assert_publish_payload_detection(window, cx, &view, "", None, 0);
+            assert_eq!(
+                view.read(cx).topics.nodes["home/a"].value.as_ref().unwrap().payload.as_ref(),
+                payload
+            );
+        })
+        .unwrap();
+    }
+}
+
+#[gpui_kit::test]
 fn edit_value_supports_keyboard_activation_and_is_absent_without_a_topic_value(cx: &mut TestAppContext) {
     let (handle, view) = open(cx, false, 900., 640.);
     cx.update_window(handle, |_, window, cx| {

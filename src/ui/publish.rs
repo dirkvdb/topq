@@ -175,7 +175,11 @@ impl Explorer {
         let Some(value) = self.topics.nodes.get(&topic).and_then(|node| node.value.as_ref()) else {
             return;
         };
-        let payload = value.display_payload();
+        let payload = if matches!(self.payload_format, "Text" | "JSON") {
+            value.display_payload()
+        } else {
+            String::new()
+        };
         self.publish_file_task = None;
         self.clear_publish_file(cx);
         self.set_publish_open(true, cx);
