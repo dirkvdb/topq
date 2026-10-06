@@ -687,7 +687,7 @@ impl Explorer {
     }
 
     fn schedule_animation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.animation_scheduled || !self.payload_highlight.is_active() {
+        if self.animation_scheduled || Appearance::motion_reduced(cx) || !self.payload_highlight.is_active() {
             return;
         }
         self.animation_scheduled = true;

@@ -8,7 +8,7 @@ use gpui_kit::{
 
 use super::{ConnectionStatus, Explorer};
 use crate::{
-    appearance::{Appearance, AppearanceMode},
+    appearance::{Appearance, AppearanceMode, ReduceMotion},
     config::{ConnectionConfig, ConnectionField, TopicSubscription},
     topics::Message,
 };
@@ -2348,9 +2348,105 @@ fn appearance_selectors_stay_compact_and_aligned(cx: &mut TestAppContext) {
                     }
                     previous_bottom = Some(description.bottom().max(selector.bottom()));
                 }
+                window.scroll("appearance-mode", gpui_kit::ScrollDelta::Lines(gpui_kit::point(0., -20.)), cx);
+                let motion = window.find("reduce-motion");
+                let label = window.find("reduce-motion-label").bounds();
+                let description = window.find("reduce-motion-description").bounds();
+                assert!(
+                    motion.visible(),
+                    "the motion setting must be reachable at minimum size and larger text"
+                );
+                assert!(motion.bounds().left() >= settings.left() && motion.bounds().right() <= settings.right());
+                assert!(motion.bounds().top() >= settings.top() && motion.bounds().bottom() <= settings.bottom());
+                assert_eq!(description.left(), label.left());
+                assert!(description.bottom() <= settings.bottom());
             })
             .unwrap();
         }
+    }
+}
+
+#[gpui_kit::test]
+fn reduce_motion_menu_supports_pointer_keyboard_and_saved_preferences(cx: &mut TestAppContext) {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("appearance.json");
+    let (handle, _) = open(cx, true, 1200., 900.);
+    cx.update(|cx| cx.set_global(crate::appearance::load(&path, cx).unwrap()));
+    cx.update_window(handle, |_, window, cx| {
+        window.activate_window();
+        window.render_frame(cx);
+        window.click("0-1", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let previous_focus = cx
+        .update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find("reduce-motion").label(), Some("Reduce motion: System"));
+            let focus = window.focused(cx);
+            window.click("reduce-motion", cx);
+            focus
+        })
+        .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        let menu = window.within("popup-menu");
+        for (index, label) in ["System", "On", "Off"].into_iter().enumerate() {
+            assert_eq!(menu.find(index).label(), Some(label));
+        }
+        window.press("escape", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("popup-menu").is_none());
+        assert_eq!(window.focused(cx), previous_focus);
+    })
+    .unwrap();
+    for (index, setting, saved) in [
+        (1, ReduceMotion::On, "on"),
+        (2, ReduceMotion::Off, "off"),
+        (0, ReduceMotion::System, "system"),
+    ] {
+        cx.update_window(handle, |_, window, cx| window.click("reduce-motion", cx)).unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            if setting == ReduceMotion::On {
+                window.within("popup-menu").click(index, cx);
+            } else {
+                for _ in 0..3 {
+                    window.press("down", cx);
+                    if window.within("popup-menu").find(index).selected() == Some(true) {
+                        break;
+                    }
+                }
+                assert_eq!(window.within("popup-menu").find(index).selected(), Some(true));
+                window.press("enter", cx);
+            }
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(
+                window.find("reduce-motion").label(),
+                Some(format!("Reduce motion: {}", setting.label()).as_str())
+            );
+            assert_eq!(Appearance::reduce_motion(cx), setting);
+            assert!(window.try_find("popup-menu").is_none());
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path).unwrap()).unwrap()["reduce_motion"],
+                saved
+            );
+        })
+        .unwrap();
+        cx.update(|cx| {
+            cx.set_global(crate::appearance::load(&path, cx).unwrap());
+            assert_eq!(Appearance::reduce_motion(cx), setting);
+        });
     }
 }
 
@@ -4958,6 +5054,103 @@ fn shorter_payload_clamps_scroll_and_plaintext_updates_keep_the_viewport(cx: &mu
         view.update(cx, |view, cx| receive_payload(view, "home/a", "short", window, cx));
         window.render_frame(cx);
         assert_eq!(view.read(cx).payload.read(cx).scroll_offset().y, px(0.));
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn reduce_motion_setting_stops_active_and_future_topic_and_payload_animations(cx: &mut TestAppContext) {
+    use crate::mqtt::BrokerEvent;
+
+    let (handle, view) = open(cx, false, 1200., 900.);
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            receive_payload(view, "home/a", r#"{"reading":1}"#, window, cx);
+            view.select_topic("home/a", window, cx);
+            receive_payload(view, "home/a", r#"{"reading":2}"#, window, cx);
+        });
+        assert!(view.read(cx).payload_highlight.is_active());
+        window.render_frame(cx);
+        window.click("settings", cx);
+        window.click("0-1", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("reduce-motion", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.within("popup-menu").click(1, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        assert_eq!(Appearance::reduce_motion(cx), ReduceMotion::On);
+        assert!(!view.read(cx).payload_highlight.is_active());
+        assert!(view.read(cx).payload_highlight.ranges(cx).is_empty());
+        window.click("close-settings", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            let mut update = message("home/a");
+            update.payload = Bytes::from_static(br#"{"reading":3}"#);
+            view.apply_broker_events([BrokerEvent::Message(update)], window, cx);
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    // Drain already-queued frames and the editor's one-shot scroll restoration.
+    for _ in 0..3 {
+        cx.update_window(handle, |_, window, cx| window.simulate_next_frame(cx)).unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| window.draw(cx).clear(cx)).unwrap();
+        cx.run_until_parked();
+    }
+    cx.update_window(handle, |_, window, cx| {
+        assert_eq!(
+            window.simulate_next_frame(cx),
+            0,
+            "disabled highlights must not keep rendering frames"
+        );
+        let explorer = view.read(cx);
+        assert_eq!(explorer.selected.as_deref(), Some("home/a"));
+        assert_eq!(explorer.payload.read(cx).value().as_str(), "{\n  \"reading\": 3\n}");
+        assert!(explorer.payload_highlight.ranges(cx).is_empty());
+        let rows = explorer.topic_rows.borrow();
+        for path in ["home", "home/a"] {
+            let mut row = rows.get(path).unwrap().read(cx).item(explorer, cx);
+            assert_eq!(row.style().text.color, Some(cx.theme().foreground));
+        }
+    })
+    .unwrap();
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            cx.set_reduce_motion(true);
+            crate::appearance::set_reduce_motion(ReduceMotion::Off, cx).unwrap();
+            receive_payload(view, "home/a", r#"{"reading":4}"#, window, cx);
+        });
+        window.render_frame(cx);
+        assert!(
+            view.read(cx).payload_highlight.is_active(),
+            "turning the setting off restores change animations"
+        );
+        {
+            let explorer = view.read(cx);
+            let rows = explorer.topic_rows.borrow();
+            let mut row = rows.get("home/a").unwrap().read(cx).item(explorer, cx);
+            assert_ne!(
+                row.style().text.color,
+                Some(cx.theme().foreground),
+                "Off must allow topic flashes even when the OS reduces motion"
+            );
+        }
+        assert!(window.simulate_next_frame(cx) > 0);
     })
     .unwrap();
 }

@@ -2,7 +2,7 @@
 
 use super::{ConnectionStatus, Explorer, connection_label};
 use crate::{
-    appearance::{self, Appearance, AppearanceMode},
+    appearance::{self, Appearance, AppearanceMode, ReduceMotion},
     config::{self, ConnectionConfig, ConnectionField, SavedConnections, TopicSubscription},
 };
 use gpui_kit::assets::IconName as AssetIconName;
@@ -1161,6 +1161,24 @@ impl Explorer {
                 .keywords([title, "theme", "appearance", "color"]),
             );
         }
+        let view = cx.weak_entity();
+        group = group.item(
+            SettingItem::render(move |options, _, cx| {
+                Self::appearance_setting(
+                    "reduce-motion",
+                    "Reduce motion",
+                    match Appearance::reduce_motion(cx) {
+                        ReduceMotion::System => "Follow your system’s reduced-motion preference.",
+                        ReduceMotion::On => "Disable topic and payload change animations to reduce rendering load.",
+                        ReduceMotion::Off => "Animate topic and payload changes, regardless of the system preference.",
+                    },
+                    Self::reduce_motion_menu(view.clone(), cx),
+                    options.layout().is_vertical(),
+                    cx,
+                )
+            })
+            .keywords(["motion", "animation", "performance", "appearance"]),
+        );
         if let Some(error) = self.error.clone() {
             group = group.footer(move |_, cx| {
                 div()
@@ -1239,6 +1257,29 @@ impl Explorer {
             })
     }
 
+    fn reduce_motion_menu(view: WeakEntity<Self>, cx: &App) -> impl IntoElement + use<> {
+        let label = Appearance::reduce_motion(cx).label();
+        Button::new("reduce-motion")
+            .w_full()
+            .outline()
+            .label(label)
+            .accessibility_label(format!("Reduce motion: {label}"))
+            .dropdown_caret(true)
+            .dropdown_menu(move |mut menu, _, cx| {
+                for reduce_motion in [ReduceMotion::System, ReduceMotion::On, ReduceMotion::Off] {
+                    let view = view.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(reduce_motion.label())
+                            .checked(Appearance::reduce_motion(cx) == reduce_motion)
+                            .on_click(move |_, window, cx| {
+                                _ = view.update(cx, |view, cx| view.set_reduce_motion(reduce_motion, window, cx));
+                            }),
+                    );
+                }
+                menu
+            })
+    }
+
     fn theme_menu(view: WeakEntity<Self>, mode: ThemeMode, cx: &App) -> impl IntoElement + use<> {
         let label = Appearance::selected_theme(mode, cx).to_owned();
         Button::new(if mode.is_dark() { "dark-theme" } else { "light-theme" })
@@ -1272,6 +1313,14 @@ impl Explorer {
         if let Err(error) = appearance::select_mode(mode, window, cx) {
             self.error = Some(format!("{error:#}"));
         }
+        cx.notify();
+    }
+
+    fn set_reduce_motion(&mut self, reduce_motion: ReduceMotion, window: &mut Window, cx: &mut Context<Self>) {
+        if let Err(error) = appearance::set_reduce_motion(reduce_motion, cx) {
+            self.error = Some(format!("{error:#}"));
+        }
+        self.refresh_animation(window, cx);
         cx.notify();
     }
 

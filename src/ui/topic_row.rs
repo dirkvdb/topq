@@ -9,6 +9,7 @@ use gpui_kit::{
 };
 
 use super::{Explorer, TreeEntry, topic_summary};
+use crate::appearance::Appearance;
 
 /// Only shallow entry metadata is retained, never a clone of the tree subtree.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -104,7 +105,7 @@ impl TopicRow {
 
     pub(super) fn item(&self, explorer: &Explorer, cx: &App) -> ListItem {
         let node = explorer.topics.nodes.get(self.path.as_str());
-        let highlight = if cx.reduce_motion() {
+        let highlight = if Appearance::motion_reduced(cx) {
             0.
         } else {
             node.map_or(0., |node| node.flash_amount(Instant::now()))
@@ -168,7 +169,7 @@ impl Render for TopicRow {
             return div().into_any_element();
         };
         let explorer = explorer.read(cx);
-        if !cx.reduce_motion()
+        if !Appearance::motion_reduced(cx)
             && explorer
                 .topics
                 .nodes

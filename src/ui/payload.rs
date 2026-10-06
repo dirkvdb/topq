@@ -6,7 +6,10 @@ use gpui_kit::component::input::{Editor, RangeDecoration, RangeDecorationCollect
 use gpui_kit::{AnyElement, Image, ImageFormat, ObjectFit, StyledImage, TestSupportExt, div, img, prelude::*, relative};
 
 use super::{ActiveTheme, App, Context, Explorer, StyledExt, Window, payload_diff};
-use crate::topics::{FLASH_DURATION, flash_amount};
+use crate::{
+    appearance::Appearance,
+    topics::{FLASH_DURATION, flash_amount},
+};
 
 pub(super) struct PayloadHighlight {
     collection: RangeDecorationCollection,
@@ -29,7 +32,7 @@ impl PayloadHighlight {
     }
 
     fn set(&mut self, ranges: Vec<Range<usize>>, now: Instant, cx: &mut App) {
-        if ranges.is_empty() || cx.reduce_motion() {
+        if ranges.is_empty() || Appearance::motion_reduced(cx) {
             self.clear(cx);
             return;
         }
@@ -48,7 +51,7 @@ impl PayloadHighlight {
     #[hotpath::measure(impl_type = "PayloadHighlight")]
     pub(super) fn refresh(&mut self, now: Instant, cx: &mut App) {
         let Some((started, _)) = self.pulse else { return };
-        if cx.reduce_motion() || now.saturating_duration_since(started) >= FLASH_DURATION {
+        if Appearance::motion_reduced(cx) || now.saturating_duration_since(started) >= FLASH_DURATION {
             self.clear(cx);
             return;
         }
@@ -175,7 +178,7 @@ impl Explorer {
         let same_topic = self.payload_topic == self.selected;
         let previous = self.payload.read(cx).value();
         let changed = previous.as_str() != text;
-        let ranges = if same_topic && changed && self.payload_format == "JSON" && format == "JSON" && !cx.reduce_motion() {
+        let ranges = if same_topic && changed && self.payload_format == "JSON" && format == "JSON" && !Appearance::motion_reduced(cx) {
             payload_diff::changed_ranges(previous.as_str(), &text)
         } else {
             Vec::new()
@@ -207,7 +210,7 @@ impl Explorer {
                 editor.set_scroll_offset(offset, cx);
             });
             self.payload_highlight.set(ranges, Instant::now(), cx);
-        } else if format == "Image" || cx.reduce_motion() {
+        } else if format == "Image" || Appearance::motion_reduced(cx) {
             self.payload_highlight.clear(cx);
         }
         self.schedule_received_age(window, cx);

@@ -35,12 +35,52 @@ impl AppearanceMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ReduceMotion {
+    #[default]
+    System,
+    On,
+    Off,
+}
+
+impl ReduceMotion {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::System => "System",
+            Self::On => "On",
+            Self::Off => "Off",
+        }
+    }
+}
+
+fn deserialize_reduce_motion<'de, D>(deserializer: D) -> Result<ReduceMotion, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Setting {
+        State(ReduceMotion),
+        Legacy(bool),
+    }
+
+    Ok(match Setting::deserialize(deserializer)? {
+        Setting::State(state) => state,
+        Setting::Legacy(true) => ReduceMotion::On,
+        // The old false setting still honored the system preference.
+        Setting::Legacy(false) => ReduceMotion::System,
+    })
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct Appearance {
     mode: AppearanceMode,
     light_theme: String,
     dark_theme: String,
+    #[serde(default, deserialize_with = "deserialize_reduce_motion")]
+    reduce_motion: ReduceMotion,
     #[serde(skip)]
     path: Option<PathBuf>,
 }
@@ -51,6 +91,7 @@ impl Default for Appearance {
             mode: AppearanceMode::Dark,
             light_theme: DEFAULT_LIGHT_THEME.to_owned(),
             dark_theme: DEFAULT_DARK_THEME.to_owned(),
+            reduce_motion: ReduceMotion::System,
             path: None,
         }
     }
@@ -65,6 +106,18 @@ impl Appearance {
 
     pub(crate) fn selected_theme(mode: ThemeMode, cx: &App) -> &str {
         cx.global::<Self>().theme(mode)
+    }
+
+    pub(crate) fn reduce_motion(cx: &App) -> ReduceMotion {
+        cx.global::<Self>().reduce_motion
+    }
+
+    pub(crate) fn motion_reduced(cx: &App) -> bool {
+        match Self::reduce_motion(cx) {
+            ReduceMotion::System => cx.reduce_motion(),
+            ReduceMotion::On => true,
+            ReduceMotion::Off => false,
+        }
     }
 
     fn theme(&self, mode: ThemeMode) -> &str {
@@ -301,6 +354,11 @@ pub(crate) fn select_theme(mode: ThemeMode, name: SharedString, window: &mut Win
     save(cx).context("Theme changed, but the preference could not be saved.")
 }
 
+pub(crate) fn set_reduce_motion(reduce_motion: ReduceMotion, cx: &mut App) -> Result<()> {
+    cx.global_mut::<Appearance>().reduce_motion = reduce_motion;
+    save(cx).context("Reduce motion changed, but the preference could not be saved.")
+}
+
 fn save(cx: &mut App) -> Result<()> {
     let path = match &cx.global::<Appearance>().path {
         Some(path) => path.clone(),
@@ -355,7 +413,7 @@ mod tests {
         let preferences = Appearance::default();
         assert_eq!(
             serde_json::to_value(preferences).unwrap(),
-            serde_json::json!({"mode": "dark", "light_theme": "Ayu Light", "dark_theme": "Charcoal Grove"})
+            serde_json::json!({"mode": "dark", "light_theme": "Ayu Light", "dark_theme": "Charcoal Grove", "reduce_motion": "system"})
         );
         for (mode, label, serialized) in [
             (AppearanceMode::System, "System", "system"),
@@ -366,6 +424,155 @@ mod tests {
             assert_eq!(serde_json::to_value(mode).unwrap(), serialized);
             assert_eq!(serde_json::from_value::<AppearanceMode>(serialized.into()).unwrap(), mode);
         }
+    }
+
+    #[test]
+    fn reduce_motion_labels_have_stable_serialization() {
+        assert_eq!(ReduceMotion::default(), ReduceMotion::System);
+        for (state, label, serialized) in [
+            (ReduceMotion::System, "System", "system"),
+            (ReduceMotion::On, "On", "on"),
+            (ReduceMotion::Off, "Off", "off"),
+        ] {
+            assert_eq!(state.label(), label);
+            assert_eq!(serde_json::to_value(state).unwrap(), serialized);
+            assert_eq!(serde_json::from_value::<ReduceMotion>(serialized.into()).unwrap(), state);
+        }
+    }
+
+    #[test]
+    fn reduce_motion_rejects_invalid_values() {
+        for value in [
+            serde_json::json!("invalid"),
+            serde_json::json!("On"),
+            serde_json::json!("true"),
+            serde_json::json!("false"),
+            serde_json::json!(null),
+            serde_json::json!(0),
+            serde_json::json!(1),
+            serde_json::json!([]),
+            serde_json::json!({}),
+        ] {
+            assert!(
+                serde_json::from_value::<Appearance>(serde_json::json!({"reduce_motion": value})).is_err(),
+                "Invalid reduce_motion: {value}"
+            );
+        }
+    }
+
+    #[gpui_kit::test]
+    fn reduce_motion_defaults_to_system_for_older_settings(cx: &mut TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("appearance.json");
+        cx.update(|cx| {
+            setup(cx, &path);
+            assert_eq!(Appearance::reduce_motion(cx), ReduceMotion::System);
+            assert_eq!(Appearance::default().reduce_motion, ReduceMotion::System);
+            for content in [
+                "{}",
+                r#"{"mode":"light","light_theme":"Ayu Light","dark_theme":"Ayu Dark"}"#,
+                r#"{"theme":"Ayu Dark"}"#,
+                r#"{"theme":null}"#,
+            ] {
+                fs::write(&path, content).unwrap();
+                cx.set_global(load(&path, cx).unwrap());
+                assert_eq!(
+                    Appearance::reduce_motion(cx),
+                    ReduceMotion::System,
+                    "Settings without reduce_motion: {content}"
+                );
+            }
+        });
+    }
+
+    #[gpui_kit::test]
+    fn reduce_motion_persists_all_three_states(cx: &mut TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("appearance.json");
+        cx.update(|cx| {
+            setup(cx, &path);
+            for (reduce_motion, serialized) in [
+                (ReduceMotion::System, "system"),
+                (ReduceMotion::On, "on"),
+                (ReduceMotion::Off, "off"),
+            ] {
+                set_reduce_motion(reduce_motion, cx).unwrap();
+                assert_eq!(Appearance::reduce_motion(cx), reduce_motion);
+                let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                assert_eq!(saved["reduce_motion"], serialized);
+                let reloaded = load(&path, cx).unwrap();
+                assert_eq!(reloaded.path.as_deref(), Some(path.as_path()));
+                cx.set_global(reloaded);
+                assert_eq!(Appearance::reduce_motion(cx), reduce_motion);
+                assert_eq!(Appearance::mode(cx), AppearanceMode::Dark);
+                assert_eq!(Appearance::selected_theme(ThemeMode::Light, cx), DEFAULT_LIGHT_THEME);
+                assert_eq!(Appearance::selected_theme(ThemeMode::Dark, cx), DEFAULT_DARK_THEME);
+            }
+        });
+    }
+
+    #[gpui_kit::test]
+    fn reduce_motion_migrates_legacy_bools_to_strings(cx: &mut TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("appearance.json");
+        cx.update(|cx| {
+            setup(cx, &path);
+            for (legacy, expected, serialized) in [(true, ReduceMotion::On, "on"), (false, ReduceMotion::System, "system")] {
+                fs::write(&path, serde_json::to_vec(&serde_json::json!({"reduce_motion": legacy})).unwrap()).unwrap();
+                cx.set_global(load(&path, cx).unwrap());
+                assert_eq!(Appearance::reduce_motion(cx), expected);
+                for system in [false, true] {
+                    cx.set_reduce_motion(system);
+                    assert_eq!(Appearance::motion_reduced(cx), legacy || system);
+                }
+                save(cx).unwrap();
+                let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                assert_eq!(saved["reduce_motion"], serialized);
+                assert_eq!(load(&path, cx).unwrap().reduce_motion, expected);
+            }
+        });
+    }
+
+    #[gpui_kit::test]
+    fn motion_reduced_resolves_saved_and_system_preferences(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            for (saved, system, expected) in [
+                (ReduceMotion::System, false, false),
+                (ReduceMotion::System, true, true),
+                (ReduceMotion::On, false, true),
+                (ReduceMotion::On, true, true),
+                (ReduceMotion::Off, false, false),
+                (ReduceMotion::Off, true, false),
+            ] {
+                cx.set_global(Appearance {
+                    reduce_motion: saved,
+                    ..Appearance::default()
+                });
+                cx.set_reduce_motion(system);
+                assert_eq!(Appearance::reduce_motion(cx), saved);
+                assert_eq!(Appearance::motion_reduced(cx), expected);
+                assert_eq!(cx.reduce_motion(), system);
+            }
+        });
+    }
+
+    #[gpui_kit::test]
+    fn reduce_motion_save_errors_do_not_revert_the_setting(cx: &mut TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("appearance.json");
+        cx.update(|cx| {
+            setup(cx, &path);
+            fs::create_dir(&path).unwrap();
+            cx.set_reduce_motion(true);
+            for (reduce_motion, expected) in [(ReduceMotion::On, true), (ReduceMotion::Off, false), (ReduceMotion::System, true)] {
+                let error = set_reduce_motion(reduce_motion, cx).unwrap_err();
+                assert_eq!(error.to_string(), "Reduce motion changed, but the preference could not be saved.");
+                assert_eq!(Appearance::reduce_motion(cx), reduce_motion);
+                assert_eq!(Appearance::motion_reduced(cx), expected);
+                assert!(cx.reduce_motion());
+                assert_eq!(cx.global::<Appearance>().path.as_deref(), Some(path.as_path()));
+            }
+        });
     }
 
     #[gpui_kit::test]
@@ -491,7 +698,8 @@ mod tests {
             assert_eq!(preferences.light_theme, "Gruvbox Light");
             assert_eq!(preferences.dark_theme, "Tokyo Night");
             let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-            assert_eq!(saved.as_object().unwrap().len(), 3);
+            assert_eq!(saved.as_object().unwrap().len(), 4);
+            assert_eq!(saved["reduce_motion"], "system");
             select_mode(AppearanceMode::Dark, window, cx).unwrap();
             assert_eq!(Theme::global(cx).theme_name().as_str(), "Tokyo Night");
             select_theme(ThemeMode::Dark, "Matrix".into(), window, cx).unwrap();
