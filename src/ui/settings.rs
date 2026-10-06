@@ -555,7 +555,7 @@ impl Explorer {
         let selected = self.saved_connections.selected;
         let connected = self.status.is_connected();
         let connecting = self.status.is_connecting();
-        let servers: Vec<_> = self
+        let mut servers: Vec<_> = self
             .saved_connections
             .connections
             .iter()
@@ -565,6 +565,7 @@ impl Explorer {
                 (index, connection_label(config), details)
             })
             .collect();
+        servers.sort_by_cached_key(|(_, name, _)| name.to_lowercase());
         let mut keywords: Vec<_> = servers
             .iter()
             .flat_map(|(_, name, details)| [name.clone(), details.clone()])

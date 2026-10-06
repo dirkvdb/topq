@@ -2597,6 +2597,101 @@ fn title_bar_picker_lists_saved_servers_and_settings_hold_theme(cx: &mut TestApp
 }
 
 #[gpui_kit::test]
+fn title_bar_picker_sorts_servers_alphabetically_without_changing_selection(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, false, 1200., 760.);
+    view.update(cx, |view, cx| {
+        for name in ["Zulu", "alpha", "ALPHA", ""] {
+            view.saved_connections.connections.push(ConnectionConfig {
+                name: name.into(),
+                host: "beta.example".into(),
+                port: 1883,
+                ..Default::default()
+            });
+        }
+        cx.notify();
+    });
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("connection-picker", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("connection-picker").label(), Some("Home"));
+        let menu = window.within("popup-menu");
+        let mut previous_bottom = px(0.);
+        for (index, label) in ["alpha", "ALPHA", "beta.example:1883", "Home", "Zulu"].into_iter().enumerate() {
+            let item = menu.find(index);
+            assert_eq!(item.label(), Some(label));
+            assert!(item.bounds().top() >= previous_bottom);
+            previous_bottom = item.bounds().bottom();
+        }
+        assert_eq!(view.read(cx).saved_connections.selected, Some(0));
+        let saved_names: Vec<_> = view
+            .read(cx)
+            .saved_connections
+            .connections
+            .iter()
+            .map(|config| config.name.as_str())
+            .collect();
+        assert_eq!(saved_names, ["Home", "Zulu", "alpha", "ALPHA", ""]);
+        window.press("escape", cx);
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn settings_connections_sort_alphabetically_and_edit_the_correct_saved_connection(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, false, 1200., 760.);
+    view.update(cx, |view, cx| {
+        for name in ["Zulu", "alpha", "ALPHA", ""] {
+            view.saved_connections.connections.push(ConnectionConfig {
+                name: name.into(),
+                host: "beta.example".into(),
+                port: 1883,
+                ..Default::default()
+            });
+        }
+        cx.notify();
+    });
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("settings", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        let mut previous_bottom = px(0.);
+        for index in [2, 3, 4, 0, 1] {
+            let card = window.find(format!("connection-card:{index}"));
+            assert!(card.visible());
+            assert!(
+                card.bounds().top() >= previous_bottom,
+                "connection {index} is out of alphabetical order"
+            );
+            previous_bottom = card.bounds().bottom();
+        }
+        assert_eq!(view.read(cx).saved_connections.selected, Some(0));
+        let saved_names: Vec<_> = view
+            .read(cx)
+            .saved_connections
+            .connections
+            .iter()
+            .map(|config| config.name.as_str())
+            .collect();
+        assert_eq!(saved_names, ["Home", "Zulu", "alpha", "ALPHA", ""]);
+        window.click("edit-connection:2", cx);
+        window.render_frame(cx);
+        assert_eq!(window.find("name").value(), Some("alpha"));
+        assert_eq!(window.find("host").value(), Some("beta.example"));
+        assert_eq!(view.read(cx).editing, Some(2));
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
 fn connection_card_labels_align_with_the_icon_square(cx: &mut TestAppContext) {
     for font_size in [14., 20.] {
         for width in [760., 1200.] {

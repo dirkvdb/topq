@@ -958,7 +958,7 @@ impl Explorer {
                 let mut menu = menu.min_w(rems(15.).to_pixels(window.rem_size()));
                 let Some(view) = view.upgrade() else { return menu };
                 let selected = view.read(cx).saved_connections.selected;
-                let connections: Vec<_> = view
+                let mut connections: Vec<_> = view
                     .read(cx)
                     .saved_connections
                     .connections
@@ -966,6 +966,7 @@ impl Explorer {
                     .enumerate()
                     .map(|(index, config)| (index, connection_label(config)))
                     .collect();
+                connections.sort_by_cached_key(|(_, label)| label.to_lowercase());
                 if connections.is_empty() {
                     menu = menu.label("No saved connections");
                 }
