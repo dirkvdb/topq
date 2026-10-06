@@ -224,6 +224,14 @@ fn inline_monitor_click_duplicates_grouped_and_standalone_fields_without_changin
                 assert_eq!(members.len(), 1);
                 assert_eq!(members[0], super::monitor::FieldKey::new("home/a", "/b"));
                 let id = id.element_id();
+                let legend = window
+                    .within(id.clone())
+                    .find((gpui_kit::ElementId::Name("monitor:6:home/a/b".into()), "legend"));
+                assert_eq!(legend.label(), Some("b"));
+                assert!(
+                    (legend.bounds().center().y - window.find((id.clone(), "smooth")).bounds().center().y).abs() <= px(1.),
+                    "legend and chart controls should share a row"
+                );
                 assert!(window.find(id.clone()).visible());
                 assert!(window.try_find((id.clone(), "latest")).is_none());
                 assert_eq!(window.find((id.clone(), "toggle-chart")).label(), Some("Show area chart"));

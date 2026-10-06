@@ -15,6 +15,7 @@ use gpui_kit::component::{
         tooltip::{CrossLine, Dot, Tooltip},
     },
     scroll::ScrollableElement,
+    tooltip::Tooltip as ComponentTooltip,
 };
 use gpui_kit::{
     AnyElement, App, Bounds, Context, ElementId, Hsla, IntoElement, Pixels, Point, Render, TestSupportExt, TextAlign, Window, div, point,
@@ -833,106 +834,104 @@ impl Monitoring {
                     .child(
                         div()
                             .h_flex()
+                            .items_center()
                             .gap_2()
                             .min_w_0()
-                            .child(div().flex_1().min_w_0().text_sm().truncate().child(label.clone()))
                             .child(
-                                div().h_flex().flex_none().justify_end().child(
-                                    div()
-                                        .h_flex()
-                                        .flex_none()
-                                        .gap_1()
-                                        .child(
-                                            Button::new((id.clone(), "toggle-chart"))
-                                                .ghost()
-                                                .small()
-                                                .icon(switch_icon)
-                                                .accessibility_label(switch_label)
-                                                .tooltip(switch_label)
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    this.toggle_monitor_chart(chart_id, cx);
-                                                })),
-                                        )
-                                        .child(
-                                            Toggle::new((id.clone(), "smooth"))
-                                                .small()
-                                                .icon(gpui_kit::assets::IconName::ChartSpline)
-                                                .checked(options.smooth)
-                                                .tooltip(if options.smooth {
-                                                    "Disable line smoothing"
-                                                } else {
-                                                    "Enable line smoothing"
-                                                })
-                                                .on_click(cx.listener(move |this, smooth, _, cx| {
-                                                    this.set_monitor_smoothing(chart_id, *smooth, cx);
-                                                })),
-                                        )
-                                        .child(
-                                            Button::new((id.clone(), "add-field"))
-                                                .ghost()
-                                                .small()
-                                                .icon(gpui_kit::assets::IconName::Plus)
-                                                .accessibility_label("Add field to chart…")
-                                                .tooltip("Add field to chart…")
-                                                .dropdown_menu(move |mut menu, _, cx| {
-                                                    let Some(view) = owner.upgrade() else { return menu };
-                                                    let explorer = view.read(cx);
-                                                    let Some(source_topic) = explorer.selected.as_deref() else {
-                                                        return menu;
-                                                    };
-                                                    for field in &explorer.numeric_fields {
-                                                        let field = FieldKey::new(source_topic, field.pointer());
-                                                        if !explorer.monitoring.accepts(chart_id, &field) {
-                                                            continue;
-                                                        }
-                                                        let owner = owner.clone();
-                                                        menu = menu.item(PopupMenuItem::new(field.label()).on_click(move |_, _, cx| {
-                                                            let _ =
-                                                                owner.update(cx, |this, cx| this.add_monitor_field(chart_id, &field, cx));
-                                                        }));
+                                div()
+                                    .h_flex()
+                                    .flex_1()
+                                    .flex_wrap()
+                                    .gap_3()
+                                    .min_w_0()
+                                    .children(members.iter().map(|member| {
+                                        let text = member.field_name();
+                                        let full_topic = member.label();
+                                        let color = self
+                                            .series(member)
+                                            .map_or(cx.theme().muted_foreground, |series| colors[series.color_ix % colors.len()]);
+                                        div()
+                                            .id((member.id(), "legend"))
+                                            .test_support()
+                                            .aria_label(text.clone())
+                                            .tooltip(move |window, cx| ComponentTooltip::new(full_topic.clone()).build(window, cx))
+                                            .h_flex()
+                                            .gap_1p5()
+                                            .text_sm()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(div().size_2().flex_none().rounded(cx.theme().radius_full()).bg(color))
+                                            .child(text)
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .h_flex()
+                                    .flex_none()
+                                    .gap_1()
+                                    .child(
+                                        Button::new((id.clone(), "toggle-chart"))
+                                            .ghost()
+                                            .small()
+                                            .icon(switch_icon)
+                                            .accessibility_label(switch_label)
+                                            .tooltip(switch_label)
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.toggle_monitor_chart(chart_id, cx);
+                                            })),
+                                    )
+                                    .child(
+                                        Toggle::new((id.clone(), "smooth"))
+                                            .small()
+                                            .icon(gpui_kit::assets::IconName::ChartSpline)
+                                            .checked(options.smooth)
+                                            .tooltip(if options.smooth {
+                                                "Disable line smoothing"
+                                            } else {
+                                                "Enable line smoothing"
+                                            })
+                                            .on_click(cx.listener(move |this, smooth, _, cx| {
+                                                this.set_monitor_smoothing(chart_id, *smooth, cx);
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new((id.clone(), "add-field"))
+                                            .ghost()
+                                            .small()
+                                            .icon(gpui_kit::assets::IconName::Plus)
+                                            .accessibility_label("Add field to chart…")
+                                            .tooltip("Add field to chart…")
+                                            .dropdown_menu(move |mut menu, _, cx| {
+                                                let Some(view) = owner.upgrade() else { return menu };
+                                                let explorer = view.read(cx);
+                                                let Some(source_topic) = explorer.selected.as_deref() else {
+                                                    return menu;
+                                                };
+                                                for field in &explorer.numeric_fields {
+                                                    let field = FieldKey::new(source_topic, field.pointer());
+                                                    if !explorer.monitoring.accepts(chart_id, &field) {
+                                                        continue;
                                                     }
-                                                    menu
-                                                }),
-                                        )
-                                        .child(
-                                            Button::new((id.clone(), "stop"))
-                                                .ghost()
-                                                .small()
-                                                .icon(IconName::Close)
-                                                .accessibility_label(format!("Close chart {label}"))
-                                                .tooltip("Close chart")
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    this.stop_monitoring(chart_id, cx);
-                                                })),
-                                        ),
-                                ),
+                                                    let owner = owner.clone();
+                                                    menu = menu.item(PopupMenuItem::new(field.label()).on_click(move |_, _, cx| {
+                                                        let _ = owner.update(cx, |this, cx| this.add_monitor_field(chart_id, &field, cx));
+                                                    }));
+                                                }
+                                                menu
+                                            }),
+                                    )
+                                    .child(
+                                        Button::new((id.clone(), "stop"))
+                                            .ghost()
+                                            .small()
+                                            .icon(IconName::Close)
+                                            .accessibility_label(format!("Close chart {label}"))
+                                            .tooltip("Close chart")
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.stop_monitoring(chart_id, cx);
+                                            })),
+                                    ),
                             ),
                     )
-                    .when(members.len() > 1, |container| {
-                        container.child(
-                            div()
-                                .h_flex()
-                                .flex_wrap()
-                                .justify_end()
-                                .gap_3()
-                                .children(members.iter().map(|member| {
-                                    let text = member.field_name();
-                                    let color = self
-                                        .series(member)
-                                        .map_or(cx.theme().muted_foreground, |series| colors[series.color_ix % colors.len()]);
-                                    div()
-                                        .id((member.id(), "legend"))
-                                        .test_support()
-                                        .aria_label(text.clone())
-                                        .h_flex()
-                                        .gap_1p5()
-                                        .text_sm()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(div().size_2().flex_none().rounded(cx.theme().radius_full()).bg(color))
-                                        .child(text)
-                                })),
-                        )
-                    })
                     .child(div().id((id.clone(), "plot")).test_support().w_full().h(rems(12.0)).child(chart)),
             );
         }
