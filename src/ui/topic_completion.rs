@@ -175,6 +175,7 @@ mod tests {
                     qos: 0,
                     retained: false,
                     received_at: Local::now(),
+                    properties: Default::default(),
                 },
                 Instant::now(),
             );

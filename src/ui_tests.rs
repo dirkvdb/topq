@@ -1330,6 +1330,7 @@ fn message(topic: &str) -> Message {
         qos: 0,
         retained: true,
         received_at: Local::now(),
+        properties: Default::default(),
     }
 }
 
@@ -4108,11 +4109,16 @@ fn topic_deletion_requires_confirmation_and_broker_updates_remove_it_in_both_cli
         let handshake = || {
             let (mut stream, _) = listener.accept().unwrap();
             stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            assert_eq!(packet(&mut stream).0, 0x10);
-            stream.write_all(&[0x20, 2, 0, 0]).unwrap();
+            let (header, connect) = packet(&mut stream);
+            assert_eq!(header, 0x10);
+            assert_eq!(&connect[..7], b"\x00\x04MQTT\x05", "must connect using MQTT 5");
+            stream.write_all(&[0x20, 3, 0, 0, 0]).unwrap();
             let (header, subscribe) = packet(&mut stream);
             assert_eq!(header, 0x82);
-            stream.write_all(&[0x90, 3, subscribe[0], subscribe[1], 2]).unwrap();
+            assert_ne!(u16::from_be_bytes([subscribe[0], subscribe[1]]), 0);
+            assert_eq!(subscribe[2], 0, "SUBSCRIBE properties must be empty");
+            assert_eq!(&subscribe[3..], b"\x00\x01#\x00");
+            stream.write_all(&[0x90, 4, subscribe[0], subscribe[1], 0, 0]).unwrap();
             stream
         };
         let mut stream = handshake();
@@ -4122,8 +4128,9 @@ fn topic_deletion_requires_confirmation_and_broker_updates_remove_it_in_both_cli
             let (header, body) = packet(&mut stream);
             assert_eq!(header, 0x31, "must publish with QoS 0 and retain set");
             let length = usize::from(u16::from_be_bytes([body[0], body[1]]));
-            assert_eq!(body.len(), length + 2, "deletion payload must be empty");
-            topics.push(String::from_utf8(body[2..].to_vec()).unwrap());
+            assert_eq!(body[2 + length], 0, "PUBLISH properties must be empty");
+            assert_eq!(body.len(), length + 3, "deletion payload must be empty");
+            topics.push(String::from_utf8(body[2..2 + length].to_vec()).unwrap());
             // Existing subscriptions receive the empty publish with retain unset.
             for subscriber in [&mut stream, &mut observer] {
                 subscriber.write_all(&[0x30, body.len() as u8]).unwrap();
@@ -4132,7 +4139,7 @@ fn topic_deletion_requires_confirmation_and_broker_updates_remove_it_in_both_cli
         }
         sent.send(topics).unwrap();
         recreation_requested.recv_timeout(Duration::from_secs(5)).unwrap();
-        let body = b"\x00\x06home/alive";
+        let body = b"\x00\x06home/a\x00live";
         for subscriber in [&mut stream, &mut observer] {
             subscriber.write_all(&[0x30, body.len() as u8]).unwrap();
             subscriber.write_all(body).unwrap();
@@ -4831,11 +4838,16 @@ fn publish_panel_queues_one_retained_qos_one_message_without_claiming_broker_ack
     let broker = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        assert_eq!(packet(&mut stream).0, 0x10);
-        stream.write_all(&[0x20, 2, 0, 0]).unwrap();
+        let (header, connect) = packet(&mut stream);
+        assert_eq!(header, 0x10);
+        assert_eq!(&connect[..7], b"\x00\x04MQTT\x05", "must connect using MQTT 5");
+        stream.write_all(&[0x20, 3, 0, 0, 0]).unwrap();
         let (header, subscribe) = packet(&mut stream);
         assert_eq!(header, 0x82);
-        stream.write_all(&[0x90, 3, subscribe[0], subscribe[1], 0]).unwrap();
+        assert_ne!(u16::from_be_bytes([subscribe[0], subscribe[1]]), 0);
+        assert_eq!(subscribe[2], 0, "SUBSCRIBE properties must be empty");
+        assert_eq!(&subscribe[3..], b"\x00\x01#\x00");
+        stream.write_all(&[0x90, 4, subscribe[0], subscribe[1], 0, 0]).unwrap();
         sent.send(packet(&mut stream)).unwrap();
 
         // Withhold PUBACK: queue feedback must not depend on broker acknowledgement.
@@ -4925,7 +4937,8 @@ fn publish_panel_queues_one_retained_qos_one_message_without_claiming_broker_ack
     assert_eq!(&body[2..2 + topic_length], topic.as_bytes());
     let packet_id = u16::from_be_bytes([body[2 + topic_length], body[3 + topic_length]]);
     assert_ne!(packet_id, 0, "QoS 1 requires a nonzero packet identifier");
-    assert_eq!(&body[4 + topic_length..], payload.as_bytes());
+    assert_eq!(body[4 + topic_length], 0, "PUBLISH properties must be empty");
+    assert_eq!(&body[5 + topic_length..], payload.as_bytes());
 
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {

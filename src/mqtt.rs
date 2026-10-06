@@ -12,10 +12,20 @@ use anyhow::{Context, Result, ensure};
 use chrono::Local;
 
 use rumqttc::tokio_rustls::rustls::{ClientConfig, RootCertStore, crypto::aws_lc_rs};
-use rumqttc::{AsyncClient, Event, MqttOptions, Outgoing, Packet, QoS, SubscribeFilter, SubscribeReasonCode, Transport};
+use rumqttc::v5::{
+    AsyncClient, Event, MqttOptions,
+    mqttbytes::{
+        QoS,
+        v5::{ConnAckProperties, Filter, Packet, PubAckReason, PubCompReason, PubRecReason, Subscribe, SubscribeReasonCode},
+    },
+};
+use rumqttc::{Outgoing, Transport};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::{config::ConnectionConfig, topics::Message};
+use crate::{
+    config::ConnectionConfig,
+    topics::{Message, MessageProperties},
+};
 
 pub enum BrokerEvent {
     Connecting,
@@ -59,6 +69,50 @@ impl From<Qos> for QoS {
 }
 
 const COMMAND_CAPACITY: usize = 16;
+const MAX_PACKET_SIZE: u32 = 16 * 1024 * 1024;
+
+#[derive(Clone, Copy)]
+struct PublishCapabilities {
+    max_qos: u8,
+    retain_available: bool,
+    max_packet_size: u32,
+}
+
+impl PublishCapabilities {
+    fn from_connack(properties: Option<&ConnAckProperties>) -> Self {
+        Self {
+            max_qos: properties.and_then(|properties| properties.max_qos).unwrap_or(2),
+            retain_available: properties.and_then(|properties| properties.retain_available) != Some(0),
+            max_packet_size: properties
+                .and_then(|properties| properties.max_packet_size)
+                .unwrap_or(MAX_PACKET_SIZE)
+                .min(MAX_PACKET_SIZE),
+        }
+    }
+
+    fn validate_publish(&self, topic: &str, payload_len: usize, qos: QoS, retain: bool) -> Result<()> {
+        ensure!(
+            qos as u8 <= self.max_qos,
+            "Broker supports a maximum publish QoS of {}.",
+            self.max_qos
+        );
+        ensure!(!retain || self.retain_available, "Broker does not support retained publishes.");
+        ensure_publish_packet_size(topic, payload_len, qos, self.max_packet_size)
+    }
+
+    fn validate_command(&self, command: &Command) -> Result<()> {
+        match command {
+            Command::Publish(command) => self.validate_publish(&command.topic, command.payload.len(), command.qos, command.retain),
+            Command::DeleteTopics(command) => {
+                // Check the whole batch before clearing anything on the broker.
+                for topic in &command.topics {
+                    self.validate_publish(topic, 0, QoS::AtMostOnce, true)?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
 
 struct DeleteTopicsData {
     topics: Vec<String>,
@@ -114,6 +168,22 @@ fn ensure_valid_topic(topic: &str) -> Result<()> {
     Ok(())
 }
 
+fn ensure_publish_packet_size(topic: &str, payload_len: usize, qos: QoS, max_packet_size: u32) -> Result<()> {
+    // Topic length, topic, optional packet ID, property length (zero), payload.
+    let remaining_length = 2 + topic.len() + usize::from(qos != QoS::AtMostOnce) * 2 + 1 + payload_len;
+    let mut length_bytes = 1;
+    let mut length = remaining_length;
+    while length >= 128 {
+        length_bytes += 1;
+        length /= 128;
+    }
+    ensure!(
+        1 + length_bytes + remaining_length <= max_packet_size as usize,
+        "MQTT publish packet exceeds the maximum packet size of {max_packet_size} bytes."
+    );
+    Ok(())
+}
+
 impl Connection {
     /// Transfers sole ownership of the broker event receiver to the caller.
     /// Returns `None` after the receiver has been taken once. Taking the receiver
@@ -129,6 +199,7 @@ impl Connection {
     /// can produce an error even after `PublishQueued`.
     pub fn publish(&self, topic: String, payload: Vec<u8>, qos: Qos, retain: bool) -> Result<()> {
         ensure_valid_topic(&topic)?;
+        ensure_publish_packet_size(&topic, payload.len(), qos.into(), MAX_PACKET_SIZE)?;
 
         self.commands
             .try_send(Command::Publish(PublishCommandData {
@@ -223,10 +294,16 @@ fn mqtt_options(config: &ConnectionConfig) -> Result<MqttOptions> {
     } else {
         config.host.clone()
     };
+
     let mut options = MqttOptions::new(&config.client_id, host, config.port);
     options.set_keep_alive(Duration::from_secs(30));
-    options.set_clean_session(true);
-    options.set_max_packet_size(16 * 1024 * 1024, 16 * 1024 * 1024);
+    options.set_clean_start(true);
+    options.set_connection_timeout(10);
+    options.set_outgoing_inflight_upper_limit(100);
+    options.set_max_packet_size(Some(MAX_PACKET_SIZE));
+    // rumqttc 0.25 emits publishes before resolving aliases. Do not negotiate
+    // aliases until those events reliably contain the resolved topic name.
+    options.set_topic_alias_max(Some(0));
     if !config.username.is_empty() {
         options.set_credentials(&config.username, &config.password);
     }
@@ -254,7 +331,13 @@ async fn publish_clear_retained(client: AsyncClient, topics: Vec<String>, queued
     Ok(())
 }
 
-async fn queue_command(client: AsyncClient, command: Command, queued: Rc<RefCell<VecDeque<OperationKind>>>) -> Result<()> {
+async fn queue_command(
+    client: AsyncClient,
+    command: Command,
+    queued: Rc<RefCell<VecDeque<OperationKind>>>,
+    capabilities: PublishCapabilities,
+) -> Result<()> {
+    capabilities.validate_command(&command)?;
     match command {
         Command::DeleteTopics(command) => publish_clear_retained(client, command.topics, queued).await,
         Command::Publish(command) => {
@@ -276,11 +359,66 @@ fn disconnected_error(kind: OperationKind) -> BrokerEvent {
     kind.error(message.into())
 }
 
+fn validate_incoming_event(event: Event) -> Result<Event> {
+    match &event {
+        Event::Incoming(Packet::Publish(publish)) => {
+            ensure!(
+                publish.properties.as_ref().and_then(|properties| properties.topic_alias).is_none(),
+                "Broker sent a topic alias although the negotiated alias maximum is zero."
+            );
+            let topic = std::str::from_utf8(&publish.topic).context("Broker sent a non-UTF-8 MQTT topic.")?;
+            ensure_valid_topic(topic).context("Broker sent an invalid MQTT topic.")?;
+        }
+        // rumqttc normally turns DISCONNECT into StateError::ServerDisconnect.
+        // Handle a delivered packet too, rather than leaving the session connected.
+        Event::Incoming(Packet::Disconnect(disconnect)) => {
+            anyhow::bail!(
+                "Broker disconnected: {:?}{}",
+                disconnect.reason_code,
+                disconnect
+                    .properties
+                    .as_ref()
+                    .and_then(|properties| properties.reason_string.as_deref())
+                    .map(|reason| format!(" · {reason}"))
+                    .unwrap_or_default()
+            );
+        }
+        _ => {}
+    }
+    Ok(event)
+}
+
+fn publish_rejection(packet: &Packet) -> Option<(u16, String)> {
+    let (pkid, acknowledgement, reason, detail) = match packet {
+        Packet::PubAck(ack) if !matches!(ack.reason, PubAckReason::Success | PubAckReason::NoMatchingSubscribers) => (
+            ack.pkid,
+            "PUBACK",
+            format!("{:?}", ack.reason),
+            ack.properties.as_ref().and_then(|properties| properties.reason_string.as_deref()),
+        ),
+        Packet::PubRec(ack) if !matches!(ack.reason, PubRecReason::Success | PubRecReason::NoMatchingSubscribers) => (
+            ack.pkid,
+            "PUBREC",
+            format!("{:?}", ack.reason),
+            ack.properties.as_ref().and_then(|properties| properties.reason_string.as_deref()),
+        ),
+        Packet::PubComp(ack) if ack.reason != PubCompReason::Success => (
+            ack.pkid,
+            "PUBCOMP",
+            format!("{:?}", ack.reason),
+            ack.properties.as_ref().and_then(|properties| properties.reason_string.as_deref()),
+        ),
+        _ => return None,
+    };
+    let detail = detail.map(|reason| format!(" · {reason}")).unwrap_or_default();
+    Some((pkid, format!("Broker rejected publish ({acknowledgement}: {reason}){detail}.")))
+}
+
 async fn run(config: ConnectionConfig, sender: &mpsc::Sender<BrokerEvent>, mut commands: mpsc::Receiver<Command>) -> Result<()> {
     let options = mqtt_options(&config)?;
     let mut session = SessionState::Disconnected;
+    let mut capabilities = PublishCapabilities::from_connack(None);
     let (mut client, mut event_loop) = AsyncClient::new(options.clone(), 16);
-    event_loop.network_options.set_connection_timeout(10);
     let mut operation = None;
     // Only the worker and its active future share this FIFO. Keeping origins
     // separately avoids mistaking an empty retained user publish for a deletion.
@@ -306,7 +444,7 @@ async fn run(config: ConnectionConfig, sender: &mpsc::Sender<BrokerEvent>, mut c
                                 return Ok(());
                             }
                         } else {
-                            operation = Some((kind, Box::pin(queue_command(client.clone(), command, Rc::clone(&queued)))));
+                            operation = Some((kind, Box::pin(queue_command(client.clone(), command, Rc::clone(&queued), capabilities))));
                         }
                     }
                     result = async {
@@ -329,8 +467,31 @@ async fn run(config: ConnectionConfig, sender: &mpsc::Sender<BrokerEvent>, mut c
                 }
             }
         };
+        let mut result = result.map_err(anyhow::Error::from).and_then(validate_incoming_event);
+        if let Ok(Event::Incoming(packet)) = &result
+            && let Some((pkid, error)) = publish_rejection(packet)
+        {
+            if inflight_publishes.remove(&pkid) && sender.send(BrokerEvent::PublishError(error)).await.is_err() {
+                return Ok(());
+            }
+            // rumqttc 0.25 does not release its inflight slot on a negative
+            // QoS 2 acknowledgement, or resolve a QoS 1 packet-ID collision.
+            // Reset these sessions to avoid stalled requests.
+            if matches!(packet, Packet::PubRec(_) | Packet::PubComp(_))
+                || event_loop.state.collision.as_ref().is_some_and(|publish| publish.pkid == pkid)
+            {
+                result = Err(anyhow::anyhow!("MQTT publish rejected; resetting the session."));
+            }
+        }
         let event = match result {
-            Ok(Event::Incoming(Packet::ConnAck(_))) => {
+            Ok(Event::Incoming(Packet::ConnAck(ack))) => {
+                capabilities = PublishCapabilities::from_connack(ack.properties.as_ref());
+                if ack.properties.as_ref().and_then(|properties| properties.server_keep_alive) == Some(0) {
+                    // rumqttc's private timer is already due and cannot be disabled.
+                    // Optional PINGREQs are valid even with keepalive zero; restore
+                    // our interval so the next timer reset cannot create a busy loop.
+                    event_loop.options.set_keep_alive(options.keep_alive());
+                }
                 pending_subscription = None;
                 let filters = config.topics.iter().map(|subscription| {
                     let qos = match subscription.qos {
@@ -338,11 +499,19 @@ async fn run(config: ConnectionConfig, sender: &mpsc::Sender<BrokerEvent>, mut c
                         1 => QoS::AtLeastOnce,
                         _ => QoS::ExactlyOnce, // connect validates the QoS range before starting the worker.
                     };
-                    SubscribeFilter::new(subscription.topic.clone(), qos)
+                    Filter::new(subscription.topic.clone(), qos)
                 });
                 // One request avoids filling the bounded queue while poll is paused,
                 // even when there are more filters than the request queue's capacity.
-                client.subscribe_many(filters).await.context("Could not subscribe to topics.")?;
+                let subscribe = Subscribe::new_many(filters, None);
+                ensure!(
+                    subscribe.size() <= MAX_PACKET_SIZE as usize,
+                    "MQTT subscription packet must not exceed 16 MiB."
+                );
+                client
+                    .subscribe_many(subscribe.filters)
+                    .await
+                    .context("Could not subscribe to topics.")?;
                 continue;
             }
             Ok(Event::Outgoing(Outgoing::Subscribe(pkid))) => {
@@ -354,9 +523,18 @@ async fn run(config: ConnectionConfig, sender: &mpsc::Sender<BrokerEvent>, mut c
                     continue;
                 }
                 pending_subscription = None;
-                if ack.return_codes.iter().any(|code| matches!(code, SubscribeReasonCode::Failure)) {
+                if ack.return_codes.iter().any(|code| !matches!(code, SubscribeReasonCode::Success(_))) {
                     tracing::warn!(broker = %config.host, "Broker refused one or more topic subscriptions");
-                    BrokerEvent::Status("Broker refused one or more topic subscriptions. Check access permissions.".into())
+                    let detail = ack
+                        .properties
+                        .as_ref()
+                        .and_then(|properties| properties.reason_string.as_deref())
+                        .map(|reason| format!(" · {reason}"))
+                        .unwrap_or_default();
+                    BrokerEvent::Status(format!(
+                        "Broker refused one or more topic subscriptions: {:?}{detail}. Check access permissions and broker capabilities.",
+                        ack.return_codes
+                    ))
                 } else if ack.return_codes.len() != config.topics.len() {
                     BrokerEvent::Status("Broker did not acknowledge all topic subscriptions.".into())
                 } else {
@@ -379,17 +557,21 @@ async fn run(config: ConnectionConfig, sender: &mpsc::Sender<BrokerEvent>, mut c
                 continue;
             }
             Ok(Event::Incoming(Packet::Publish(publish))) => BrokerEvent::Message(Message {
-                topic: publish.topic,
+                topic: std::str::from_utf8(&publish.topic)
+                    .context("Broker sent a non-UTF-8 MQTT topic.")?
+                    .to_owned(),
                 payload: publish.payload,
                 qos: publish.qos as u8,
                 retained: publish.retain,
                 received_at: Local::now(),
+                properties: MessageProperties::from_publish(publish.properties),
             }),
             Ok(_) => continue,
             Err(error) => {
                 tracing::error!(broker = %config.host, port = config.port, error = %error, "MQTT connection failed; retrying");
                 pending_subscription = None;
                 session = SessionState::Disconnected;
+                capabilities = PublishCapabilities::from_connack(None);
                 while let Ok(command) = commands.try_recv() {
                     if sender.send(disconnected_error(command.kind())).await.is_err() {
                         return Ok(());
@@ -407,7 +589,6 @@ async fn run(config: ConnectionConfig, sender: &mpsc::Sender<BrokerEvent>, mut c
                 // publishes, QoS 2 releases, collisions, and buffered events.
                 // No user operation may carry over into a new broker session.
                 (client, event_loop) = AsyncClient::new(options.clone(), 16);
-                event_loop.network_options.set_connection_timeout(10);
                 let interrupted_publish =
                     interrupted == Some(OperationKind::Publish) || pending_publishes || !inflight_publishes.is_empty();
                 inflight_publishes.clear();
@@ -487,10 +668,92 @@ mod tests {
         (header[0], body)
     }
 
+    fn variable_integer(bytes: &[u8]) -> (usize, usize) {
+        let mut value = 0;
+        for (index, byte) in bytes.iter().copied().enumerate().take(4) {
+            value |= usize::from(byte & 0x7f) << (7 * index);
+            if byte & 0x80 == 0 {
+                return (value, index + 1);
+            }
+        }
+        panic!("invalid MQTT variable integer");
+    }
+
+    fn write_variable_integer(packet: &mut Vec<u8>, mut length: usize) {
+        loop {
+            let mut byte = (length % 128) as u8;
+            length /= 128;
+            if length != 0 {
+                byte |= 0x80;
+            }
+            packet.push(byte);
+            if length == 0 {
+                break;
+            }
+        }
+    }
+
+    fn wire_packet(header: u8, body: &[u8]) -> Vec<u8> {
+        let mut packet = vec![header];
+        write_variable_integer(&mut packet, body.len());
+        packet.extend_from_slice(body);
+        packet
+    }
+
+    fn write_string(bytes: &mut Vec<u8>, value: &str) {
+        bytes.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        bytes.extend_from_slice(value.as_bytes());
+    }
+
+    fn metadata_publish() -> Vec<u8> {
+        let mut properties = vec![0x01, 1, 0x02, 0, 0, 0, 60, 0x03];
+        write_string(&mut properties, "application/json");
+        properties.push(0x08);
+        write_string(&mut properties, "reply/é");
+        properties.extend_from_slice(&[0x09, 0, 3, 0, 0xff, 42]);
+        for value in ["first".repeat(30), "second".into()] {
+            properties.push(0x26);
+            write_string(&mut properties, "source");
+            write_string(&mut properties, &value);
+        }
+        properties.extend_from_slice(&[0x0b, 7, 0x0b, 0xc1, 2]); // subscription IDs 7, 321
+        assert!(properties.len() > 127, "exercise multi-byte property lengths");
+        let mut body = Vec::new();
+        write_string(&mut body, "test/é");
+        body.extend_from_slice(&[0, 42]); // QoS 1 packet ID
+        write_variable_integer(&mut body, properties.len());
+        body.extend_from_slice(&properties);
+        body.extend_from_slice(b"{\"value\":42}");
+        wire_packet(0x33, &body) // retained QoS 1
+    }
+
+    fn assert_metadata_message(message: &Message) {
+        assert_eq!(message.topic, "test/é");
+        assert_eq!(message.payload.as_ref(), b"{\"value\":42}");
+        assert_eq!(message.qos, 1);
+        assert!(message.retained);
+        let properties = &message.properties;
+        assert_eq!(properties.content_type(), Some("application/json"));
+        assert_eq!(properties.payload_format_indicator(), Some(1));
+        assert_eq!(properties.message_expiry_interval(), Some(60));
+        assert_eq!(properties.response_topic(), Some("reply/é"));
+        assert_eq!(properties.correlation_data(), Some([0, 0xff, 42].as_slice()));
+        assert_eq!(
+            properties.user_properties(),
+            &[("source".into(), "first".repeat(30)), ("source".into(), "second".into())]
+        );
+        assert_eq!(properties.subscription_identifiers(), &[7, 321]);
+    }
+
     fn connect_client_id(body: &[u8]) -> &str {
-        assert_eq!(&body[..7], b"\0\x04MQTT\x04");
-        let length = usize::from(u16::from_be_bytes([body[10], body[11]]));
-        std::str::from_utf8(&body[12..12 + length]).unwrap()
+        assert_eq!(&body[..7], b"\0\x04MQTT\x05");
+        assert_eq!(body[7] & 0x02, 0x02, "CONNECT must request a clean start");
+        assert_eq!(&body[8..10], &[0, 30]);
+        let (properties_len, length_bytes) = variable_integer(&body[10..]);
+        let offset = 10 + length_bytes + properties_len;
+        assert_eq!(&body[10 + length_bytes..offset], &[0x27, 1, 0, 0, 0, 0x22, 0, 0]);
+        let length = usize::from(u16::from_be_bytes([body[offset], body[offset + 1]]));
+        std::str::from_utf8(&body[offset + 2..offset + 2 + length]).unwrap()
     }
 
     fn handshake(listener: &TcpListener, granted: u8) -> TcpStream {
@@ -498,11 +761,29 @@ mod tests {
     }
 
     fn handshake_with_subscriptions(listener: &TcpListener, topics: &[TopicSubscription], granted: &[u8]) -> TcpStream {
+        handshake_with_properties(listener, topics, granted, &[])
+    }
+
+    fn handshake_with_properties(listener: &TcpListener, topics: &[TopicSubscription], granted: &[u8], properties: &[u8]) -> TcpStream {
         let (mut stream, _) = listener.accept().unwrap();
         stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        assert_eq!(read_packet(&mut stream).0, 0x10); // CONNECT
-        stream.write_all(&[0x20, 2, 0, 0]).unwrap(); // CONNACK
         let (header, body) = read_packet(&mut stream);
+        assert_eq!(header, 0x10); // CONNECT
+        connect_client_id(&body);
+        let mut connack = vec![0, 0];
+        write_variable_integer(&mut connack, properties.len());
+        connack.extend_from_slice(properties);
+        stream.write_all(&wire_packet(0x20, &connack)).unwrap();
+        let mut pings = 0;
+        let (header, body) = loop {
+            let packet = read_packet(&mut stream);
+            if packet.0 != 0xc0 {
+                break packet;
+            }
+            pings += 1;
+            assert!(pings <= 1, "server keepalive zero must not cause repeated immediate pings");
+            stream.write_all(&[0xd0, 0]).unwrap();
+        };
         assert_eq!(header, 0x82); // SUBSCRIBE, never PUBLISH
         let mut expected = Vec::new();
         for subscription in topics {
@@ -510,10 +791,11 @@ mod tests {
             expected.extend_from_slice(subscription.topic.as_bytes());
             expected.push(subscription.qos);
         }
-        assert_eq!(&body[2..], expected.as_slice(), "all filters and their QoS must be in one packet");
-        let mut ack = vec![0x90, (2 + granted.len()) as u8, body[0], body[1]];
+        assert_eq!(body[2], 0, "SUBSCRIBE properties must be empty");
+        assert_eq!(&body[3..], expected.as_slice(), "all filters and their QoS must be in one packet");
+        let mut ack = vec![body[0], body[1], 0]; // SUBACK packet ID, empty properties
         ack.extend_from_slice(granted);
-        stream.write_all(&ack).unwrap();
+        stream.write_all(&wire_packet(0x90, &ack)).unwrap();
         stream
     }
 
@@ -548,6 +830,235 @@ mod tests {
 
     fn runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+    }
+
+    fn publish_command(qos: QoS, retain: bool, payload_len: usize) -> Command {
+        Command::Publish(PublishCommandData {
+            topic: "test/value".into(),
+            payload: vec![b'x'; payload_len],
+            qos,
+            retain,
+        })
+    }
+
+    fn assert_capability_rejections(properties: Vec<u8>, allowed_qos: Qos, rejected: Vec<(Command, &str)>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (started, received) = std::sync::mpsc::channel();
+        let (finish, finished) = std::sync::mpsc::channel();
+        let broker = std::thread::spawn(move || {
+            let mut stream = handshake_with_properties(&listener, &[TopicSubscription::default()], &[0], &properties);
+            let (header, body) = read_packet(&mut stream);
+            let qos = QoS::from(allowed_qos);
+            assert_eq!(header, 0x30 | ((qos as u8) << 1));
+            assert_eq!(&body[2..12], b"test/value");
+            assert_eq!(&body[body.len() - 3..], b"abc");
+            started.send(()).unwrap();
+            finished.recv_timeout(Duration::from_secs(5)).unwrap();
+            if qos == QoS::AtLeastOnce {
+                stream.write_all(&[0x40, 2, body[12], body[13]]).unwrap();
+            }
+            // No rejected publish or partial deletion batch may reach this socket.
+            assert_eq!(read_packet(&mut stream), (0x30, b"\0\x0atest/value\x0012345".to_vec()));
+            stream.write_all(b"\x30\x17\0\x10test/ack-barrier\0done").unwrap();
+            assert_eq!(stream.read(&mut [0]).unwrap(), 0);
+        });
+        let runtime = runtime();
+        let mut connection = connect(ConnectionConfig {
+            host: "127.0.0.1".into(),
+            port,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(matches!(next_event(&runtime, &mut connection), BrokerEvent::Connected));
+        connection
+            .publish("test/value".into(), b"abc".to_vec(), allowed_qos, false)
+            .unwrap();
+        assert!(matches!(next_event(&runtime, &mut connection), BrokerEvent::PublishQueued));
+        received.recv_timeout(Duration::from_secs(5)).unwrap();
+        for (command, expected) in rejected {
+            let kind = command.kind();
+            assert!(connection.commands.try_send(command).is_ok());
+            match (kind, next_event(&runtime, &mut connection)) {
+                (OperationKind::Publish, BrokerEvent::PublishError(error))
+                | (OperationKind::DeleteTopics, BrokerEvent::OperationError(error)) => assert!(error.contains(expected), "{error}"),
+                _ => panic!("unsupported command must report only its own operation error"),
+            }
+        }
+        // The existing inflight publish and subsequent commands must remain usable.
+        connection
+            .publish("test/value".into(), b"12345".to_vec(), Qos::AtMostOnce, false)
+            .unwrap();
+        assert!(matches!(next_event(&runtime, &mut connection), BrokerEvent::PublishQueued));
+        finish.send(()).unwrap();
+        assert!(matches!(next_event(&runtime, &mut connection), BrokerEvent::Message(_)));
+        drop(connection);
+        broker.join().unwrap();
+    }
+
+    #[test]
+    fn connack_maximum_qos_rejects_unsupported_publishes_without_cancelling_other_commands() {
+        for maximum in [0, 1] {
+            let rejected = [QoS::AtLeastOnce, QoS::ExactlyOnce]
+                .into_iter()
+                .filter(|qos| *qos as u8 > maximum)
+                .map(|qos| (publish_command(qos, false, 0), "maximum publish QoS"))
+                .collect();
+            let allowed = if maximum == 0 { Qos::AtMostOnce } else { Qos::AtLeastOnce };
+            assert_capability_rejections(vec![0x24, maximum], allowed, rejected);
+        }
+    }
+
+    #[test]
+    fn connack_retain_unavailable_rejects_retained_publishes_and_deletions_without_disconnect() {
+        assert_capability_rejections(
+            vec![0x25, 0],
+            Qos::AtLeastOnce,
+            vec![
+                (publish_command(QoS::AtMostOnce, true, 0), "retained publishes"),
+                (publish_command(QoS::AtLeastOnce, true, 0), "retained publishes"),
+                (
+                    Command::DeleteTopics(DeleteTopicsData {
+                        topics: vec!["test/value".into()],
+                    }),
+                    "retained publishes",
+                ),
+            ],
+        );
+    }
+
+    #[test]
+    fn connack_packet_limit_checks_full_publish_size_and_entire_deletion_batch_without_disconnect() {
+        assert_capability_rejections(
+            vec![0x27, 0, 0, 0, 20],
+            Qos::AtLeastOnce,
+            vec![
+                (publish_command(QoS::AtMostOnce, false, 6), "maximum packet size of 20 bytes"),
+                (publish_command(QoS::AtLeastOnce, false, 4), "maximum packet size of 20 bytes"),
+                (
+                    Command::DeleteTopics(DeleteTopicsData {
+                        topics: vec!["ok".into(), "a".repeat(16)],
+                    }),
+                    "maximum packet size of 20 bytes",
+                ),
+            ],
+        );
+    }
+
+    #[test]
+    fn connack_capabilities_use_protocol_defaults_and_cap_broker_packet_limit_locally() {
+        let defaults = PublishCapabilities::from_connack(None);
+        assert_eq!(defaults.max_qos, 2);
+        assert!(defaults.retain_available);
+        assert_eq!(defaults.max_packet_size, MAX_PACKET_SIZE);
+        let mut wire = vec![0x20, 8, 0, 0, 5, 0x27];
+        wire.extend_from_slice(&(MAX_PACKET_SIZE + 1).to_be_bytes());
+        let Packet::ConnAck(ack) = Packet::read(&mut bytes::BytesMut::from(wire.as_slice()), None).unwrap() else {
+            panic!("expected CONNACK");
+        };
+        let capabilities = PublishCapabilities::from_connack(ack.properties.as_ref());
+        assert_eq!(capabilities.max_packet_size, MAX_PACKET_SIZE);
+        assert!(
+            capabilities
+                .validate_publish("test/value", MAX_PACKET_SIZE as usize, QoS::AtMostOnce, false)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn reconnect_replaces_negotiated_publish_capabilities_with_new_connack_defaults() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (disconnect, disconnected) = std::sync::mpsc::channel();
+        let (finish, finished) = std::sync::mpsc::channel();
+        let broker = std::thread::spawn(move || {
+            let stream = handshake_with_properties(
+                &listener,
+                &[TopicSubscription::default()],
+                &[0],
+                &[0x24, 0, 0x25, 0, 0x27, 0, 0, 0, 20],
+            );
+            disconnected.recv_timeout(Duration::from_secs(5)).unwrap();
+            drop(stream);
+            let mut stream = handshake(&listener, 0);
+            let (header, body) = read_packet(&mut stream);
+            assert_eq!(header, 0x33); // QoS 1, retained, exceeds the previous 20-byte limit.
+            assert_eq!(&body[2..12], b"test/value");
+            assert_eq!(&body[15..], &[b'x'; 20]);
+            finished.recv_timeout(Duration::from_secs(5)).unwrap();
+            stream.write_all(&[0x40, 2, body[12], body[13]]).unwrap();
+            stream.write_all(b"\x30\x17\0\x10test/ack-barrier\0done").unwrap();
+            assert_eq!(stream.read(&mut [0]).unwrap(), 0);
+        });
+        let runtime = runtime();
+        let mut connection = connect(ConnectionConfig {
+            host: "127.0.0.1".into(),
+            port,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(matches!(next_event(&runtime, &mut connection), BrokerEvent::Connected));
+        disconnect.send(()).unwrap();
+        next_matching_event(&runtime, &mut connection, |event| matches!(event, BrokerEvent::Connected));
+        connection
+            .publish("test/value".into(), vec![b'x'; 20], Qos::AtLeastOnce, true)
+            .unwrap();
+        assert!(matches!(next_event(&runtime, &mut connection), BrokerEvent::PublishQueued));
+        finish.send(()).unwrap();
+        assert!(matches!(next_event(&runtime, &mut connection), BrokerEvent::Message(_)));
+        drop(connection);
+        broker.join().unwrap();
+    }
+
+    #[test]
+    fn server_keepalive_zero_keeps_optional_pings_bounded_and_session_usable() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (ready, received) = std::sync::mpsc::channel();
+        let (finish, finished) = std::sync::mpsc::channel();
+        let broker = std::thread::spawn(move || {
+            let mut stream = handshake_with_properties(&listener, &[TopicSubscription::default()], &[0], &[0x13, 0, 0]);
+            stream.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+            let mut pings = 0;
+            loop {
+                let mut header = [0];
+                match stream.read_exact(&mut header) {
+                    Ok(()) => {
+                        assert_eq!(header[0], 0xc0);
+                        stream.read_exact(&mut header).unwrap();
+                        assert_eq!(header[0], 0);
+                        pings += 1;
+                        assert!(pings <= 1, "zero keepalive must not cause a rapid ping loop");
+                        stream.write_all(&[0xd0, 0]).unwrap();
+                    }
+                    Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => break,
+                    Err(error) => panic!("zero keepalive unexpectedly disconnected: {error}"),
+                }
+            }
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            ready.send(()).unwrap();
+            assert_eq!(read_packet(&mut stream), (0x30, b"\0\x0atest/value\0data".to_vec()));
+            finished.recv_timeout(Duration::from_secs(5)).unwrap();
+            stream.write_all(b"\x30\x17\0\x10test/ack-barrier\0done").unwrap();
+            assert_eq!(stream.read(&mut [0]).unwrap(), 0);
+        });
+        let runtime = runtime();
+        let mut connection = connect(ConnectionConfig {
+            host: "127.0.0.1".into(),
+            port,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(matches!(next_event(&runtime, &mut connection), BrokerEvent::Connected));
+        received.recv_timeout(Duration::from_secs(5)).unwrap();
+        connection
+            .publish("test/value".into(), b"data".to_vec(), Qos::AtMostOnce, false)
+            .unwrap();
+        assert!(matches!(next_event(&runtime, &mut connection), BrokerEvent::PublishQueued));
+        finish.send(()).unwrap();
+        assert!(matches!(next_event(&runtime, &mut connection), BrokerEvent::Message(_)));
+        drop(connection);
+        broker.join().unwrap();
     }
 
     #[test]
@@ -605,9 +1116,17 @@ mod tests {
         let options = mqtt_options(&config).unwrap();
         assert!(matches!(options.transport(), Transport::Ws));
         assert_eq!(options.client_id(), config.client_id);
-        assert_eq!(options.credentials(), Some(rumqttc::Login::new(config.username, config.password)));
+        assert_eq!(
+            options.credentials(),
+            Some(rumqttc::v5::mqttbytes::v5::Login::new(config.username, config.password))
+        );
         assert_eq!(options.keep_alive(), Duration::from_secs(30));
-        assert!(options.clean_session());
+        assert!(options.clean_start());
+        assert_eq!(options.max_packet_size(), Some(MAX_PACKET_SIZE));
+        assert_eq!(options.topic_alias_max(), Some(0));
+        assert_eq!(options.session_expiry_interval(), None); // MQTT 5 defaults to zero.
+        assert_eq!(options.connection_timeout(), 10);
+        assert_eq!(options.get_outgoing_inflight_upper_limit(), Some(100));
     }
 
     #[expect(
@@ -636,14 +1155,15 @@ mod tests {
             let connect = socket.read().unwrap().into_data();
             assert_eq!(connect[0], 0x10);
             assert_eq!(connect_client_id(&connect[2..]), "ws-client");
-            socket.send(WsMessage::Binary(vec![0x20, 2, 0, 0].into())).unwrap();
+            socket.send(WsMessage::Binary(vec![0x20, 3, 0, 0, 0].into())).unwrap();
             let subscribe = socket.read().unwrap().into_data();
             assert_eq!(subscribe[0], 0x82);
-            assert_eq!(&subscribe[4..], b"\0\x01#\0");
+            assert_eq!(&subscribe[4..], b"\0\0\x01#\0");
             socket
-                .send(WsMessage::Binary(vec![0x90, 3, subscribe[2], subscribe[3], 0].into()))
+                .send(WsMessage::Binary(vec![0x90, 4, subscribe[2], subscribe[3], 0, 0].into()))
                 .unwrap();
-            socket.send(WsMessage::Binary(b"\x30\x0b\0\x05topicdata".to_vec().into())).unwrap();
+            socket.send(WsMessage::Binary(metadata_publish().into())).unwrap();
+            assert_eq!(socket.read().unwrap().into_data().as_ref(), &[0x40, 2, 0, 42]);
             // Keep the broker alive until the client has consumed the message and stops.
             let _ = socket.read();
         });
@@ -658,10 +1178,7 @@ mod tests {
         .unwrap();
         assert!(matches!(next_event(&runtime, &mut connection), BrokerEvent::Connected));
         match next_matching_event(&runtime, &mut connection, |event| matches!(event, BrokerEvent::Message(_))) {
-            BrokerEvent::Message(message) => {
-                assert_eq!(message.topic, "topic");
-                assert_eq!(message.payload.as_ref(), b"data");
-            }
+            BrokerEvent::Message(message) => assert_metadata_message(&message),
             _ => unreachable!(),
         }
         drop(connection);
@@ -688,6 +1205,32 @@ mod tests {
     }
 
     #[test]
+    fn tcp_transport_receives_mqtt5_publish_metadata() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let broker = std::thread::spawn(move || {
+            let mut stream = handshake(&listener, 1);
+            stream.write_all(&metadata_publish()).unwrap();
+            assert_eq!(read_packet(&mut stream), (0x40, vec![0, 42]));
+            assert_eq!(stream.read(&mut [0]).unwrap(), 0);
+        });
+        let runtime = runtime();
+        let mut connection = connect(ConnectionConfig {
+            host: "127.0.0.1".into(),
+            port,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(matches!(next_event(&runtime, &mut connection), BrokerEvent::Connected));
+        match next_event(&runtime, &mut connection) {
+            BrokerEvent::Message(message) => assert_metadata_message(&message),
+            _ => panic!("expected a publish with MQTT 5 properties"),
+        }
+        drop(connection);
+        broker.join().unwrap();
+    }
+
+    #[test]
     fn connect_uses_the_configured_client_id() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -697,10 +1240,10 @@ mod tests {
             let (header, body) = read_packet(&mut stream);
             assert_eq!(header, 0x10);
             assert_eq!(connect_client_id(&body), "custom-client");
-            stream.write_all(&[0x20, 2, 0, 0]).unwrap();
+            stream.write_all(&[0x20, 3, 0, 0, 0]).unwrap();
             let (header, subscribe) = read_packet(&mut stream);
             assert_eq!(header, 0x82);
-            stream.write_all(&[0x90, 3, subscribe[0], subscribe[1], 0]).unwrap();
+            stream.write_all(&[0x90, 4, subscribe[0], subscribe[1], 0, 0]).unwrap();
             // Closing now can race with the client reading SUBACK; wait for client teardown.
             let mut byte = [0];
             assert_eq!(stream.read(&mut byte).unwrap(), 0, "dropping the connection must close its socket");
@@ -727,7 +1270,7 @@ mod tests {
             for pass in 0..2 {
                 let mut stream = handshake(&listener, 0);
                 // Retained QoS 0 PUBLISH: topic `test/value`, payload `42`.
-                stream.write_all(b"\x31\x0e\x00\x0atest/value42").unwrap();
+                stream.write_all(b"\x31\x0f\x00\x0atest/value\x0042").unwrap();
                 if pass == 0 {
                     received.recv_timeout(Duration::from_secs(5)).unwrap();
                 }
@@ -753,6 +1296,7 @@ mod tests {
                     assert_eq!(message.payload.as_ref(), b"42");
                     assert_eq!(message.qos, 0);
                     assert!(message.retained);
+                    assert_eq!(message.properties, MessageProperties::default());
                 }
                 BrokerEvent::Status(status) | BrokerEvent::OperationError(status) | BrokerEvent::PublishError(status) => {
                     panic!("expected retained message, got: {status}")
@@ -808,47 +1352,49 @@ mod tests {
 
     #[test]
     fn reports_rejected_subscriptions_without_connecting_when_only_one_filter_is_refused() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let topics = vec![
-            TopicSubscription {
-                topic: "home/#".into(),
-                qos: 0,
-            },
-            TopicSubscription {
-                topic: "office/#".into(),
-                qos: 1,
-            },
-            TopicSubscription {
-                topic: "$SYS/#".into(),
-                qos: 2,
-            },
-        ];
-        let expected = topics.clone();
-        let broker = std::thread::spawn(move || {
-            let mut stream = handshake_with_subscriptions(&listener, &expected, &[0, 0x80, 2]);
-            assert_eq!(stream.read(&mut [0]).unwrap(), 0);
-        });
-        let runtime = runtime();
-        let mut connection = connect(ConnectionConfig {
-            host: "127.0.0.1".into(),
-            port,
-            topics,
-            ..Default::default()
-        })
-        .unwrap();
-        let event = next_matching_event(&runtime, &mut connection, |event| match event {
-            BrokerEvent::Status(status) => status.contains("refused"),
-            BrokerEvent::Connected => true,
-            BrokerEvent::Message(_)
-            | BrokerEvent::Connecting
-            | BrokerEvent::OperationError(_)
-            | BrokerEvent::PublishQueued
-            | BrokerEvent::PublishError(_) => false,
-        });
-        assert!(matches!(event, BrokerEvent::Status(_)), "a refused subscription is not connected");
-        drop(connection);
-        broker.join().unwrap();
+        for rejected in [0x80, 0x83, 0x87, 0x8f, 0x91, 0x97, 0x9e, 0xa1, 0xa2] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let topics = vec![
+                TopicSubscription {
+                    topic: "home/#".into(),
+                    qos: 0,
+                },
+                TopicSubscription {
+                    topic: "office/#".into(),
+                    qos: 1,
+                },
+                TopicSubscription {
+                    topic: "$SYS/#".into(),
+                    qos: 2,
+                },
+            ];
+            let expected = topics.clone();
+            let broker = std::thread::spawn(move || {
+                let mut stream = handshake_with_subscriptions(&listener, &expected, &[0, rejected, 2]);
+                assert_eq!(stream.read(&mut [0]).unwrap(), 0);
+            });
+            let runtime = runtime();
+            let mut connection = connect(ConnectionConfig {
+                host: "127.0.0.1".into(),
+                port,
+                topics,
+                ..Default::default()
+            })
+            .unwrap();
+            let event = next_matching_event(&runtime, &mut connection, |event| match event {
+                BrokerEvent::Status(status) => status.contains("refused"),
+                BrokerEvent::Connected => true,
+                BrokerEvent::Message(_)
+                | BrokerEvent::Connecting
+                | BrokerEvent::OperationError(_)
+                | BrokerEvent::PublishQueued
+                | BrokerEvent::PublishError(_) => false,
+            });
+            assert!(matches!(event, BrokerEvent::Status(_)), "a refused subscription is not connected");
+            drop(connection);
+            broker.join().unwrap();
+        }
     }
 
     #[test]
@@ -938,6 +1484,17 @@ mod tests {
             assert!(connection.publish(invalid, Vec::new(), Qos::AtMostOnce, false).is_err());
         }
         assert!(matches!(commands.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn publish_packet_limit_includes_mqtt5_headers_properties_and_packet_id() {
+        for qos in [QoS::AtMostOnce, QoS::AtLeastOnce, QoS::ExactlyOnce] {
+            // At this size the remaining-length field occupies four bytes.
+            let overhead = 1 + 4 + 2 + "test/é".len() + usize::from(qos != QoS::AtMostOnce) * 2 + 1;
+            let maximum_payload = MAX_PACKET_SIZE as usize - overhead;
+            assert!(ensure_publish_packet_size("test/é", maximum_payload, qos, MAX_PACKET_SIZE).is_ok());
+            assert!(ensure_publish_packet_size("test/é", maximum_payload + 1, qos, MAX_PACKET_SIZE).is_err());
+        }
     }
 
     #[test]
@@ -1068,8 +1625,9 @@ mod tests {
                     let topic_len = usize::from(u16::from_be_bytes([body[0], body[1]]));
                     assert_eq!(&body[2..2 + topic_len], "test/é".as_bytes());
                     let offset = 2 + topic_len;
-                    let payload_offset = offset + if qos == 0 { 0 } else { 2 };
-                    assert_eq!(&body[payload_offset..], &[0, 0xff, b'\n']);
+                    let properties_offset = offset + if qos == 0 { 0 } else { 2 };
+                    assert_eq!(body[properties_offset], 0);
+                    assert_eq!(&body[properties_offset + 1..], &[0, 0xff, b'\n']);
                     // The UI must be able to finish its pending state before any ack.
                     acknowledged.recv_timeout(Duration::from_secs(5)).unwrap();
                     if qos != 0 {
@@ -1088,7 +1646,7 @@ mod tests {
             // TCP orders this marker after the final PUBCOMP. Receiving it
             // proves the worker drained the ack before drop, avoiding a reset
             // caused by closing a socket with unread incoming data.
-            stream.write_all(b"\x30\x16\x00\x10test/ack-barrierdone").unwrap();
+            stream.write_all(b"\x30\x17\x00\x10test/ack-barrier\0done").unwrap();
             assert_eq!(stream.read(&mut [0]).unwrap(), 0);
         });
         let runtime = runtime();
@@ -1123,13 +1681,202 @@ mod tests {
     }
 
     #[test]
+    fn negative_puback_reports_reason_without_disconnect_and_no_matching_subscribers_is_success() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (acknowledge, acknowledged) = std::sync::mpsc::channel();
+        let broker = std::thread::spawn(move || {
+            let mut stream = handshake(&listener, 0);
+            for reason in [0x87, 0x10] {
+                let (header, body) = read_packet(&mut stream);
+                assert_eq!(header, 0x32);
+                let pkid = &body[12..14];
+                acknowledged.recv_timeout(Duration::from_secs(5)).unwrap();
+                let mut ack = vec![pkid[0], pkid[1], reason];
+                let mut properties = vec![0x1f];
+                write_string(&mut properties, "publish permission denied");
+                write_variable_integer(&mut ack, properties.len());
+                ack.extend_from_slice(&properties);
+                stream.write_all(&wire_packet(0x40, &ack)).unwrap();
+            }
+            stream.write_all(b"\x30\x17\0\x10test/ack-barrier\0done").unwrap();
+            assert_eq!(stream.read(&mut [0]).unwrap(), 0);
+        });
+        let runtime = runtime();
+        let mut connection = connect(ConnectionConfig {
+            host: "127.0.0.1".into(),
+            port,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(matches!(next_event(&runtime, &mut connection), BrokerEvent::Connected));
+        for pass in 0..2 {
+            connection
+                .publish("test/value".into(), b"data".to_vec(), Qos::AtLeastOnce, false)
+                .unwrap();
+            assert!(matches!(next_event(&runtime, &mut connection), BrokerEvent::PublishQueued));
+            acknowledge.send(()).unwrap();
+            if pass == 0 {
+                match next_event(&runtime, &mut connection) {
+                    BrokerEvent::PublishError(error) => {
+                        assert!(error.contains("PUBACK: NotAuthorized"));
+                        assert!(error.contains("publish permission denied"));
+                    }
+                    _ => panic!("a rejected QoS 1 publish must report a publish error"),
+                }
+            }
+        }
+        assert!(matches!(next_event(&runtime, &mut connection), BrokerEvent::Message(_)));
+        drop(connection);
+        broker.join().unwrap();
+    }
+
+    #[test]
+    fn negative_qos_two_acknowledgements_report_errors_and_reset_without_replay() {
+        for acknowledgement in [0x50, 0x70] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let (acknowledge, acknowledged) = std::sync::mpsc::channel();
+            let broker = std::thread::spawn(move || {
+                let mut stream = handshake(&listener, 0);
+                let (header, body) = read_packet(&mut stream);
+                assert_eq!(header, 0x34);
+                let pkid = &body[12..14];
+                acknowledged.recv_timeout(Duration::from_secs(5)).unwrap();
+                if acknowledgement == 0x70 {
+                    stream.write_all(&[0x50, 2, pkid[0], pkid[1]]).unwrap();
+                    assert_eq!(read_packet(&mut stream), (0x62, pkid.to_vec()));
+                }
+                let reason = if acknowledgement == 0x50 { 0x87 } else { 0x92 };
+                stream.write_all(&[acknowledgement, 4, pkid[0], pkid[1], reason, 0]).unwrap();
+                assert_eq!(stream.read(&mut [0]).unwrap(), 0);
+                let mut stream = handshake(&listener, 0);
+                assert_eq!(stream.read(&mut [0]).unwrap(), 0, "rejected publishes must not replay");
+            });
+            let runtime = runtime();
+            let mut connection = connect(ConnectionConfig {
+                host: "127.0.0.1".into(),
+                port,
+                ..Default::default()
+            })
+            .unwrap();
+            assert!(matches!(next_event(&runtime, &mut connection), BrokerEvent::Connected));
+            connection
+                .publish("test/value".into(), b"data".to_vec(), Qos::ExactlyOnce, false)
+                .unwrap();
+            assert!(matches!(next_event(&runtime, &mut connection), BrokerEvent::PublishQueued));
+            acknowledge.send(()).unwrap();
+            match next_event(&runtime, &mut connection) {
+                BrokerEvent::PublishError(error) => assert!(error.contains(if acknowledgement == 0x50 {
+                    "PUBREC: NotAuthorized"
+                } else {
+                    "PUBCOMP: PacketIdentifierNotFound"
+                })),
+                _ => panic!("a rejected QoS 2 publish must report a publish error"),
+            }
+            match next_event(&runtime, &mut connection) {
+                BrokerEvent::Status(status) => assert!(status.contains("resetting the session")),
+                _ => panic!("negative QoS 2 acknowledgement must reset the stalled rumqttc session"),
+            }
+            assert!(matches!(next_event(&runtime, &mut connection), BrokerEvent::Connecting));
+            assert!(matches!(next_event(&runtime, &mut connection), BrokerEvent::Connected));
+            drop(connection);
+            broker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn broker_disconnect_reports_reason_cancels_inflight_publish_and_reconnects() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (disconnect, disconnected) = std::sync::mpsc::channel();
+        let broker = std::thread::spawn(move || {
+            let mut stream = handshake(&listener, 0);
+            assert_eq!(read_packet(&mut stream).0, 0x32);
+            disconnected.recv_timeout(Duration::from_secs(5)).unwrap();
+            let mut properties = vec![0x1f];
+            write_string(&mut properties, "maintenance");
+            let mut body = vec![0x8b];
+            write_variable_integer(&mut body, properties.len());
+            body.extend_from_slice(&properties);
+            stream.write_all(&wire_packet(0xe0, &body)).unwrap();
+            assert_eq!(stream.read(&mut [0]).unwrap(), 0);
+            let mut stream = handshake(&listener, 0);
+            assert_eq!(stream.read(&mut [0]).unwrap(), 0, "inflight publish must not replay");
+        });
+        let runtime = runtime();
+        let mut connection = connect(ConnectionConfig {
+            host: "127.0.0.1".into(),
+            port,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(matches!(next_event(&runtime, &mut connection), BrokerEvent::Connected));
+        connection
+            .publish("test/value".into(), b"data".to_vec(), Qos::AtLeastOnce, false)
+            .unwrap();
+        assert!(matches!(next_event(&runtime, &mut connection), BrokerEvent::PublishQueued));
+        disconnect.send(()).unwrap();
+        assert!(matches!(next_event(&runtime, &mut connection), BrokerEvent::PublishError(_)));
+        match next_event(&runtime, &mut connection) {
+            BrokerEvent::Status(status) => {
+                assert!(status.contains("ServerShuttingDown"));
+                assert!(status.contains("maintenance"));
+            }
+            _ => panic!("broker DISCONNECT must report its reason"),
+        }
+        assert!(matches!(next_event(&runtime, &mut connection), BrokerEvent::Connecting));
+        assert!(matches!(next_event(&runtime, &mut connection), BrokerEvent::Connected));
+        drop(connection);
+        broker.join().unwrap();
+    }
+
+    #[test]
+    fn invalid_utf8_topics_and_unnegotiated_aliases_reconnect_without_delivering_messages() {
+        for (body, expected) in [
+            (vec![0, 1, 0xff, 0, b'x'], "non-UTF-8"),
+            (vec![0, 1, b'x', 3, 0x23, 0, 1], "topic alias"),
+            (vec![0, 0, 3, 0x23, 0, 1], "topic alias"),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let (publish, published) = std::sync::mpsc::channel();
+            let broker = std::thread::spawn(move || {
+                let mut stream = handshake(&listener, 0);
+                published.recv_timeout(Duration::from_secs(5)).unwrap();
+                stream.write_all(&wire_packet(0x30, &body)).unwrap();
+                assert_eq!(stream.read(&mut [0]).unwrap(), 0);
+                let mut stream = handshake(&listener, 0);
+                assert_eq!(stream.read(&mut [0]).unwrap(), 0);
+            });
+            let runtime = runtime();
+            let mut connection = connect(ConnectionConfig {
+                host: "127.0.0.1".into(),
+                port,
+                ..Default::default()
+            })
+            .unwrap();
+            assert!(matches!(next_event(&runtime, &mut connection), BrokerEvent::Connected));
+            publish.send(()).unwrap();
+            match next_event(&runtime, &mut connection) {
+                BrokerEvent::Status(status) => assert!(status.contains(expected), "{status}"),
+                _ => panic!("invalid topic must not be delivered as a message"),
+            }
+            assert!(matches!(next_event(&runtime, &mut connection), BrokerEvent::Connecting));
+            assert!(matches!(next_event(&runtime, &mut connection), BrokerEvent::Connected));
+            drop(connection);
+            broker.join().unwrap();
+        }
+    }
+
+    #[test]
     fn publish_worker_failure_reports_publish_error_without_changing_the_session() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let (finished, received) = std::sync::mpsc::channel();
         let broker = std::thread::spawn(move || {
             let mut stream = handshake(&listener, 0);
-            assert_eq!(read_packet(&mut stream), (0x30, b"\x00\x0atest/value\x00\xff".to_vec()));
+            assert_eq!(read_packet(&mut stream), (0x30, b"\x00\x0atest/value\0\x00\xff".to_vec()));
             finished.send(()).unwrap();
             assert_eq!(stream.read(&mut [0]).unwrap(), 0);
         });
@@ -1178,7 +1925,8 @@ mod tests {
                 assert_eq!(header, 0x31 | (qos_level << 1));
                 // An empty retained publish is still a user publish, not a deletion command.
                 assert_eq!(&body[2..12], b"test/value");
-                assert_eq!(body.len(), 14);
+                assert_eq!(body.len(), 15);
+                assert_eq!(body[14], 0);
                 if qos_level == 2 {
                     stream.write_all(&[0x50, 2, body[12], body[13]]).unwrap();
                     assert_eq!(read_packet(&mut stream), (0x62, body[12..14].to_vec()));
@@ -1293,7 +2041,8 @@ mod tests {
                 assert_eq!(header, 0x31, "PUBLISH must be QoS 0, retained, and not DUP");
                 let length = u16::from_be_bytes([body[0], body[1]]) as usize;
                 assert_eq!(&body[2..2 + length], topic.as_bytes());
-                assert_eq!(body.len(), 2 + length, "deletion payload must be empty");
+                assert_eq!(body[2 + length], 0);
+                assert_eq!(body.len(), 3 + length, "deletion payload must be empty");
             }
             finished.send(()).unwrap();
             assert_eq!(stream.read(&mut [0]).unwrap(), 0);
@@ -1355,7 +2104,7 @@ mod tests {
         let (finished, received) = std::sync::mpsc::channel();
         let broker = std::thread::spawn(move || {
             let mut stream = handshake(&listener, 0);
-            assert_eq!(read_packet(&mut stream), (0x31, b"\x00\x0atest/value".to_vec()));
+            assert_eq!(read_packet(&mut stream), (0x31, b"\x00\x0atest/value\0".to_vec()));
             finished.send(()).unwrap();
             assert_eq!(stream.read(&mut [0]).unwrap(), 0);
         });

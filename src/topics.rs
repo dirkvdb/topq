@@ -11,12 +11,76 @@ use chrono::{DateTime, Local};
 pub const FLASH_DURATION: Duration = Duration::from_millis(600);
 const FLASH_FADE_IN: Duration = Duration::from_millis(100);
 
+/// Semantic MQTT 5 publish metadata, excluding connection-scoped topic aliases.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct MessageProperties {
+    content_type: Option<String>,
+    payload_format_indicator: Option<u8>,
+    message_expiry_interval: Option<u32>,
+    response_topic: Option<String>,
+    correlation_data: Option<Bytes>,
+    user_properties: Vec<(String, String)>,
+    subscription_identifiers: Vec<usize>,
+}
+
+impl MessageProperties {
+    pub(crate) fn from_publish(properties: Option<rumqttc::v5::mqttbytes::v5::PublishProperties>) -> Self {
+        let Some(properties) = properties else {
+            return Self::default();
+        };
+        Self {
+            content_type: properties.content_type,
+            payload_format_indicator: properties.payload_format_indicator,
+            message_expiry_interval: properties.message_expiry_interval,
+            response_topic: properties.response_topic,
+            correlation_data: properties.correlation_data,
+            user_properties: properties.user_properties,
+            subscription_identifiers: properties.subscription_identifiers,
+        }
+    }
+
+    pub fn content_type(&self) -> Option<&str> {
+        self.content_type.as_deref()
+    }
+
+    #[cfg_attr(not(test), expect(dead_code, reason = "Preserved MQTT 5 metadata for future inspector fields"))]
+    pub fn payload_format_indicator(&self) -> Option<u8> {
+        self.payload_format_indicator
+    }
+
+    #[cfg_attr(not(test), expect(dead_code, reason = "Preserved MQTT 5 metadata for future inspector fields"))]
+    pub fn message_expiry_interval(&self) -> Option<u32> {
+        self.message_expiry_interval
+    }
+
+    #[cfg_attr(not(test), expect(dead_code, reason = "Preserved MQTT 5 metadata for future inspector fields"))]
+    pub fn response_topic(&self) -> Option<&str> {
+        self.response_topic.as_deref()
+    }
+
+    #[cfg_attr(not(test), expect(dead_code, reason = "Preserved MQTT 5 metadata for future inspector fields"))]
+    pub fn correlation_data(&self) -> Option<&[u8]> {
+        self.correlation_data.as_deref()
+    }
+
+    #[cfg_attr(not(test), expect(dead_code, reason = "Preserved MQTT 5 metadata for future inspector fields"))]
+    pub fn user_properties(&self) -> &[(String, String)] {
+        &self.user_properties
+    }
+
+    #[cfg_attr(not(test), expect(dead_code, reason = "Preserved MQTT 5 metadata for future inspector fields"))]
+    pub fn subscription_identifiers(&self) -> &[usize] {
+        &self.subscription_identifiers
+    }
+}
+
 pub struct Message {
     pub topic: String,
     pub payload: Bytes,
     pub qos: u8,
     pub retained: bool,
     pub received_at: DateTime<Local>,
+    pub properties: MessageProperties,
 }
 
 pub struct TopicValue {
@@ -25,6 +89,7 @@ pub struct TopicValue {
     pub retained: bool,
     pub received_at: DateTime<Local>,
     pub messages: u64,
+    pub properties: MessageProperties,
 }
 
 impl TopicValue {
@@ -149,6 +214,7 @@ impl TopicStore {
                     retained: message.retained,
                     received_at: message.received_at,
                     messages,
+                    properties: message.properties,
                 });
                 break;
             }
@@ -233,6 +299,109 @@ mod tests {
             qos: 1,
             retained: true,
             received_at: Local::now(),
+            properties: MessageProperties::default(),
+        }
+    }
+
+    fn publish_properties() -> rumqttc::v5::mqttbytes::v5::PublishProperties {
+        rumqttc::v5::mqttbytes::v5::PublishProperties {
+            content_type: Some("application/json".into()),
+            payload_format_indicator: Some(1),
+            message_expiry_interval: Some(30),
+            topic_alias: Some(7),
+            response_topic: Some("response/topic".into()),
+            correlation_data: Some(Bytes::from_static(&[0x00, 0xff])),
+            user_properties: vec![("source".into(), "first".into()), ("source".into(), "second".into())],
+            subscription_identifiers: vec![3, 9],
+        }
+    }
+
+    #[test]
+    fn receive_stores_all_semantic_publish_properties() {
+        let mut store = TopicStore::default();
+        let mut incoming = message("home/temperature", b"21");
+        incoming.properties = MessageProperties::from_publish(Some(publish_properties()));
+        store.receive(incoming, Instant::now());
+
+        let properties = &store.nodes["home/temperature"].value.as_ref().unwrap().properties;
+        assert_eq!(properties.content_type(), Some("application/json"));
+        assert_eq!(properties.payload_format_indicator(), Some(1));
+        assert_eq!(properties.message_expiry_interval(), Some(30));
+        assert_eq!(properties.response_topic(), Some("response/topic"));
+        assert_eq!(properties.correlation_data(), Some([0x00, 0xff].as_slice()));
+        assert_eq!(
+            properties.user_properties(),
+            [("source".into(), "first".into()), ("source".into(), "second".into())]
+        );
+        assert_eq!(properties.subscription_identifiers(), [3, 9]);
+    }
+
+    #[test]
+    fn receive_replaces_properties_instead_of_merging_with_previous_metadata() {
+        let mut store = TopicStore::default();
+        let mut incoming = message("home/temperature", b"21");
+        incoming.properties = MessageProperties::from_publish(Some(publish_properties()));
+        store.receive(incoming, Instant::now());
+
+        let replacement = rumqttc::v5::mqttbytes::v5::PublishProperties {
+            content_type: Some("text/plain".into()),
+            user_properties: vec![("source".into(), "new".into())],
+            ..Default::default()
+        };
+        let expected = MessageProperties::from_publish(Some(replacement.clone()));
+        let mut incoming = message("home/temperature", b"22");
+        incoming.properties = MessageProperties::from_publish(Some(replacement));
+        store.receive(incoming, Instant::now());
+
+        let value = store.nodes["home/temperature"].value.as_ref().unwrap();
+        assert_eq!(value.properties, expected);
+        assert_eq!(value.payload.as_ref(), b"22");
+        assert_eq!(value.messages, 2);
+        assert_eq!((store.topics, store.messages), (1, 2));
+    }
+
+    #[test]
+    fn receive_clears_metadata_when_publish_properties_are_absent_or_empty() {
+        for properties in [None, Some(Default::default())] {
+            let mut store = TopicStore::default();
+            let mut incoming = message("home/temperature", b"21");
+            incoming.properties = MessageProperties::from_publish(Some(publish_properties()));
+            store.receive(incoming, Instant::now());
+
+            let mut incoming = message("home/temperature", b"22");
+            incoming.properties = MessageProperties::from_publish(properties);
+            store.receive(incoming, Instant::now());
+
+            assert_eq!(
+                store.nodes["home/temperature"].value.as_ref().unwrap().properties,
+                MessageProperties::default()
+            );
+        }
+    }
+
+    #[test]
+    fn publish_properties_discard_connection_scoped_topic_alias() {
+        let properties = rumqttc::v5::mqttbytes::v5::PublishProperties {
+            topic_alias: Some(7),
+            ..Default::default()
+        };
+        assert_eq!(MessageProperties::from_publish(Some(properties)), MessageProperties::default());
+    }
+
+    #[test]
+    fn publish_properties_do_not_override_payload_format_detection_or_display() {
+        for (payload, format, display) in [
+            (br#"{"on":true}"#.as_slice(), "JSON", "{\n  \"on\": true\n}"),
+            (b"hello".as_slice(), "Text", "hello"),
+            (&[0xff, 0x00], "Binary · hex", "ff 00"),
+        ] {
+            let mut store = TopicStore::default();
+            let mut incoming = message("test", payload);
+            incoming.properties = MessageProperties::from_publish(Some(publish_properties()));
+            store.receive(incoming, Instant::now());
+            let value = store.nodes["test"].value.as_ref().unwrap();
+            assert_eq!(value.format_label(), format);
+            assert_eq!(value.display_payload(), display);
         }
     }
 
