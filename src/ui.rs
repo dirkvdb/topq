@@ -101,7 +101,7 @@ fn connection_label(config: &ConnectionConfig) -> String {
         label.push_str(&format!(" · {}", config.username));
     }
     if config.websocket {
-        label.insert_str(0, "ws://");
+        label.insert_str(0, config.protocol());
     } else if config.tls {
         label.push_str(" · TLS");
     }
@@ -181,6 +181,7 @@ pub struct Explorer {
     host: Entity<InputState>,
     port: Entity<InputState>,
     protocol: Entity<SelectState<Vec<&'static str>>>,
+    validate_certificate: bool,
     client_id: Entity<InputState>,
     topic_input: Entity<InputState>,
     topic_filter: Entity<InputState>,
@@ -299,7 +300,7 @@ impl Explorer {
             .cloned();
         let initial = saved_config.clone().unwrap_or_default();
         let protocol = cx.new(|cx| {
-            let mut state = SelectState::new(vec!["mqtt://", "mqtts://", "ws://"], None, window, cx);
+            let mut state = SelectState::new(vec!["mqtt://", "mqtts://", "ws://", "wss://"], None, window, cx);
             state.set_selected_value(&initial.protocol(), window, cx);
             state
         });
@@ -378,8 +379,10 @@ impl Explorer {
             let SelectEvent::Confirm(Some(protocol)) = event else { return };
             let port = view.port.read(cx).value();
             let default_port = match (*protocol, port.as_str()) {
-                ("mqtts://", "1883") => Some("8883"),
-                ("mqtt://", "8883") => Some("1883"),
+                ("mqtts://", "1883" | "9001" | "9002") => Some("8883"),
+                ("mqtt://", "8883" | "9001" | "9002") => Some("1883"),
+                ("ws://", "1883" | "8883" | "9002") => Some("9001"),
+                ("wss://", "1883" | "8883" | "9001") => Some("9002"),
                 _ => None,
             };
             if let Some(port) = default_port {
@@ -445,6 +448,7 @@ impl Explorer {
             host,
             port,
             protocol,
+            validate_certificate: initial.validate_certificate,
             client_id,
             topic_input,
             topic_filter,

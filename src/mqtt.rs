@@ -11,7 +11,12 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use chrono::Local;
 
-use rumqttc::tokio_rustls::rustls::{ClientConfig, RootCertStore, crypto::aws_lc_rs};
+use rumqttc::tokio_rustls::rustls::{
+    self, ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme,
+    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+    crypto::{CryptoProvider, aws_lc_rs, verify_tls12_signature, verify_tls13_signature},
+    pki_types::{CertificateDer, ServerName, UnixTime},
+};
 use rumqttc::v5::{
     AsyncClient, Event, MqttOptions,
     mqttbytes::{
@@ -319,24 +324,79 @@ pub fn connect(config: ConnectionConfig) -> Result<Connection> {
     })
 }
 
-fn tls_transport(roots: RootCertStore) -> Result<Transport> {
-    ensure!(!roots.is_empty(), "Could not load trusted system certificates for TLS.");
-    let config = ClientConfig::builder_with_provider(Arc::new(aws_lc_rs::default_provider()))
+#[derive(Debug)]
+struct UncheckedServerCertVerifier {
+    provider: Arc<CryptoProvider>,
+}
+
+impl ServerCertVerifier for UncheckedServerCertVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        // Opting out removes server identity checks, not proof of private-key possession.
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        verify_tls12_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        verify_tls13_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+fn tls_transport(roots: RootCertStore, validate_certificate: bool, websocket: bool) -> Result<Transport> {
+    if validate_certificate {
+        ensure!(!roots.is_empty(), "Could not load trusted system certificates for TLS.");
+    }
+    let provider = Arc::new(aws_lc_rs::default_provider());
+    let builder = ClientConfig::builder_with_provider(Arc::clone(&provider))
         .with_safe_default_protocol_versions()
-        .context("Could not configure the TLS protocol versions.")?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    Ok(Transport::tls_with_config(config.into()))
+        .context("Could not configure the TLS protocol versions.")?;
+    let config = if validate_certificate {
+        builder.with_root_certificates(roots).with_no_client_auth()
+    } else {
+        builder
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(UncheckedServerCertVerifier { provider }))
+            .with_no_client_auth()
+    };
+    Ok(if websocket {
+        Transport::wss_with_config(config.into())
+    } else {
+        Transport::tls_with_config(config.into())
+    })
 }
 
 fn mqtt_options(config: &ConnectionConfig) -> Result<MqttOptions> {
     // rumqttc requires the full URL for WebSocket and reads its port from that URL.
     let host = if config.websocket {
+        let scheme = if config.tls { "wss" } else { "ws" };
         let host = &config.host;
         if host.parse::<std::net::Ipv6Addr>().is_ok() {
-            format!("ws://[{host}]:{}/mqtt", config.port)
+            format!("{scheme}://[{host}]:{}/mqtt", config.port)
         } else {
-            format!("ws://{host}:{}/mqtt", config.port)
+            format!("{scheme}://{host}:{}/mqtt", config.port)
         }
     } else {
         config.host.clone()
@@ -354,13 +414,15 @@ fn mqtt_options(config: &ConnectionConfig) -> Result<MqttOptions> {
     if !config.username.is_empty() {
         options.set_credentials(&config.username, &config.password);
     }
-    if config.websocket {
-        options.set_transport(Transport::ws());
-    } else if config.tls {
+    if config.tls {
         // The default transport helper panics when platform certificate loading fails.
         let mut roots = RootCertStore::empty();
-        roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
-        options.set_transport(tls_transport(roots)?);
+        if config.validate_certificate {
+            roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
+        }
+        options.set_transport(tls_transport(roots, config.validate_certificate, config.websocket)?);
+    } else if config.websocket {
+        options.set_transport(Transport::ws());
     }
     Ok(options)
 }
@@ -1166,6 +1228,60 @@ mod tests {
     }
 
     #[test]
+    fn mqtt_options_use_tls_when_certificate_validation_is_disabled() {
+        let config = ConnectionConfig {
+            tls: true,
+            validate_certificate: false,
+            ..Default::default()
+        };
+        let options = mqtt_options(&config).unwrap();
+        assert!(matches!(options.transport(), Transport::Tls(_)));
+    }
+
+    #[test]
+    fn mqtt_options_use_system_trusted_tls_for_secure_websocket() {
+        let config = ConnectionConfig {
+            port: 9002,
+            tls: true,
+            websocket: true,
+            validate_certificate: true,
+            ..Default::default()
+        };
+        let options = mqtt_options(&config).unwrap();
+        assert!(matches!(options.transport(), Transport::Wss(rumqttc::TlsConfiguration::Rustls(_))));
+    }
+
+    #[test]
+    fn mqtt_options_use_secure_websocket_when_certificate_validation_is_disabled() {
+        let config = ConnectionConfig {
+            port: 9002,
+            tls: true,
+            websocket: true,
+            validate_certificate: false,
+            ..Default::default()
+        };
+        let options = mqtt_options(&config).unwrap();
+        assert!(matches!(options.transport(), Transport::Wss(rumqttc::TlsConfiguration::Rustls(_))));
+    }
+
+    #[test]
+    fn mqtt_options_ignore_certificate_validation_for_tcp_and_unencrypted_websocket() {
+        for validate_certificate in [true, false] {
+            let config = ConnectionConfig {
+                validate_certificate,
+                ..Default::default()
+            };
+            assert!(matches!(mqtt_options(&config).unwrap().transport(), Transport::Tcp));
+            let config = ConnectionConfig {
+                websocket: true,
+                tls: false,
+                ..config
+            };
+            assert!(matches!(mqtt_options(&config).unwrap().transport(), Transport::Ws));
+        }
+    }
+
+    #[test]
     fn mqtt_options_use_websocket_urls_for_hostnames_ipv4_and_ipv6() {
         for (host, expected) in [
             ("broker.example", "ws://broker.example:9001/mqtt"),
@@ -1186,17 +1302,55 @@ mod tests {
     }
 
     #[test]
-    fn mqtt_options_prefer_unencrypted_websocket_over_tls_and_keep_mqtt_settings() {
+    fn mqtt_options_use_secure_websocket_urls_for_hostnames_ipv4_and_ipv6() {
+        for (host, expected) in [
+            ("broker.example", "wss://broker.example:9002/mqtt"),
+            ("127.0.0.1", "wss://127.0.0.1:9002/mqtt"),
+            ("::1", "wss://[::1]:9002/mqtt"),
+            ("[::1]", "wss://[::1]:9002/mqtt"),
+        ] {
+            let config = ConnectionConfig {
+                host: host.into(),
+                port: 9002,
+                tls: true,
+                websocket: true,
+                validate_certificate: false,
+                ..Default::default()
+            };
+            let options = mqtt_options(&config).unwrap();
+            assert_eq!(options.broker_address(), (expected.into(), 9002));
+            assert!(matches!(options.transport(), Transport::Wss(rumqttc::TlsConfiguration::Rustls(_))));
+        }
+    }
+
+    #[test]
+    fn mqtt_options_keep_custom_secure_websocket_ports() {
+        let config = ConnectionConfig {
+            host: "::1".into(),
+            port: 9443,
+            tls: true,
+            websocket: true,
+            validate_certificate: false,
+            ..Default::default()
+        };
+        assert_eq!(
+            mqtt_options(&config).unwrap().broker_address(),
+            ("wss://[::1]:9443/mqtt".into(), 9443)
+        );
+    }
+
+    #[test]
+    fn mqtt_options_use_secure_websocket_when_tls_is_enabled_and_keep_mqtt_settings() {
         let config = ConnectionConfig {
             websocket: true,
             tls: true,
-            client_id: "ws-client".into(),
+            client_id: "wss-client".into(),
             username: "mqtt-user".into(),
             password: "mqtt-secret".into(),
             ..Default::default()
         };
         let options = mqtt_options(&config).unwrap();
-        assert!(matches!(options.transport(), Transport::Ws));
+        assert!(matches!(options.transport(), Transport::Wss(rumqttc::TlsConfiguration::Rustls(_))));
         assert_eq!(options.client_id(), config.client_id);
         assert_eq!(
             options.credentials(),
@@ -2455,10 +2609,133 @@ mod tests {
         assert!(error.to_string().contains("Could not queue"));
     }
 
+    // Self-signed P-256 certificate for broker.example and its signature over TLS_TEST_MESSAGE.
+    // Only public material is embedded; tests do not need OpenSSL, a private key, or the clock.
+    const TLS_TEST_CERT: &[u8] = b"\x30\x82\x01\x8b\x30\x82\x01\x32\xa0\x03\x02\x01\x02\x02\x01\x01\x30\x0a\x06\x08\x2a\x86\x48\xce\
+        \x3d\x04\x03\x02\x30\x19\x31\x17\x30\x15\x06\x03\x55\x04\x03\x0c\x0e\x62\x72\x6f\x6b\x65\x72\x2e\
+        \x65\x78\x61\x6d\x70\x6c\x65\x30\x1e\x17\x0d\x32\x36\x31\x30\x30\x36\x30\x38\x31\x36\x33\x33\x5a\
+        \x17\x0d\x33\x36\x31\x30\x30\x33\x30\x38\x31\x36\x33\x33\x5a\x30\x19\x31\x17\x30\x15\x06\x03\x55\
+        \x04\x03\x0c\x0e\x62\x72\x6f\x6b\x65\x72\x2e\x65\x78\x61\x6d\x70\x6c\x65\x30\x59\x30\x13\x06\x07\
+        \x2a\x86\x48\xce\x3d\x02\x01\x06\x08\x2a\x86\x48\xce\x3d\x03\x01\x07\x03\x42\x00\x04\x72\x17\xf9\
+        \xa1\x75\x39\x9b\xb4\xb0\x4c\x1b\xcd\x23\x9d\xd3\x56\xde\xac\x61\xfb\x36\x3b\x73\xab\x43\x4e\xda\
+        \x5e\xf7\x81\x5b\x01\x0f\x8c\xd3\x98\xaa\xcf\xfc\x12\xe5\x4d\xf6\x68\xc7\x8e\xcd\xad\xcc\x79\x83\
+        \x53\x57\xce\x9b\x70\x95\x12\xb0\x08\x9a\xa6\xd3\xb6\xa3\x6b\x30\x69\x30\x1d\x06\x03\x55\x1d\x0e\
+        \x04\x16\x04\x14\x9b\x0d\x65\x35\xcb\xd6\x5b\x88\x38\x9d\xc7\x09\x72\x19\xc3\x41\x5d\xd3\x98\x01\
+        \x30\x1f\x06\x03\x55\x1d\x23\x04\x18\x30\x16\x80\x14\x9b\x0d\x65\x35\xcb\xd6\x5b\x88\x38\x9d\xc7\
+        \x09\x72\x19\xc3\x41\x5d\xd3\x98\x01\x30\x19\x06\x03\x55\x1d\x11\x04\x12\x30\x10\x82\x0e\x62\x72\
+        \x6f\x6b\x65\x72\x2e\x65\x78\x61\x6d\x70\x6c\x65\x30\x0c\x06\x03\x55\x1d\x13\x01\x01\xff\x04\x02\
+        \x30\x00\x30\x0a\x06\x08\x2a\x86\x48\xce\x3d\x04\x03\x02\x03\x47\x00\x30\x44\x02\x20\x6d\xf7\xa1\
+        \x24\x43\x74\x6b\x8f\xbd\xf5\x73\xcb\x71\x8b\xb2\x1b\xf0\xa7\x79\xd8\x85\x1a\x8c\xad\x19\xe2\x27\
+        \x45\xda\x9f\xc4\x2e\x02\x20\x23\xbd\x17\xa1\xaa\xe6\x7b\x32\x95\x8c\xef\x06\x68\x4b\x8f\xde\x8e\
+        \x4f\xa6\xe7\x55\x2d\xc6\x4d\xb2\x0d\xeb\x84\xeb\xb2\x5e\x2a";
+    const TLS_TEST_MESSAGE: &[u8] = b"TLS handshake test message";
+    const TLS_TEST_SIGNATURE: &[u8] = b"\x30\x44\x02\x20\x6d\x11\x26\xde\x32\x92\x92\xc7\x4e\x85\xcd\x47\x87\xc3\x19\x57\x35\xd3\x05\x82\
+        \x6d\xb7\xc8\x61\xc5\x65\x0a\x8d\x06\x82\xda\xad\x02\x20\x26\x2a\x66\x7f\x84\x37\x1a\x59\xed\x80\
+        \xae\xba\x89\x3f\xe6\xf8\x4c\xf7\x36\x17\xd5\x24\x45\xde\x6d\x5a\x88\x6a\x8f\xd2\x58\xa6";
+
+    fn unchecked_verifier() -> UncheckedServerCertVerifier {
+        UncheckedServerCertVerifier {
+            provider: Arc::new(aws_lc_rs::default_provider()),
+        }
+    }
+
+    fn tls_test_signature(scheme: SignatureScheme) -> DigitallySignedStruct {
+        use rustls::internal::msgs::codec::Codec;
+
+        // DigitallySignedStruct has no public constructor; decode its TLS wire representation.
+        let mut encoded = u16::from(scheme).to_be_bytes().to_vec();
+        encoded.extend_from_slice(&u16::try_from(TLS_TEST_SIGNATURE.len()).unwrap().to_be_bytes());
+        encoded.extend_from_slice(TLS_TEST_SIGNATURE);
+        DigitallySignedStruct::read_bytes(&encoded).unwrap()
+    }
+
+    #[test]
+    fn unchecked_verifier_accepts_a_self_signed_certificate_with_the_wrong_hostname() {
+        let cert = CertificateDer::from(TLS_TEST_CERT);
+        let name = ServerName::try_from("other.example").unwrap();
+        let result = unchecked_verifier().verify_server_cert(&cert, &[], &name, &[], UnixTime::since_unix_epoch(Duration::ZERO));
+        assert!(result.is_ok(), "Unchecked server identity verification failed: {result:?}");
+    }
+
+    #[test]
+    fn unchecked_verifier_accepts_valid_tls12_and_tls13_handshake_signatures() {
+        let verifier = unchecked_verifier();
+        let cert = CertificateDer::from(TLS_TEST_CERT);
+        let signature = tls_test_signature(SignatureScheme::ECDSA_NISTP256_SHA256);
+        let tls12 = verifier.verify_tls12_signature(TLS_TEST_MESSAGE, &cert, &signature);
+        let tls13 = verifier.verify_tls13_signature(TLS_TEST_MESSAGE, &cert, &signature);
+        assert!(tls12.is_ok(), "Valid TLS 1.2 signature rejected: {tls12:?}");
+        assert!(tls13.is_ok(), "Valid TLS 1.3 signature rejected: {tls13:?}");
+    }
+
+    #[test]
+    fn unchecked_verifier_rejects_forged_tls12_and_tls13_handshake_signatures() {
+        let verifier = unchecked_verifier();
+        let cert = CertificateDer::from(TLS_TEST_CERT);
+        let signature = tls_test_signature(SignatureScheme::ECDSA_NISTP256_SHA256);
+        assert!(verifier.verify_tls12_signature(b"tampered handshake", &cert, &signature).is_err());
+        assert!(verifier.verify_tls13_signature(b"tampered handshake", &cert, &signature).is_err());
+    }
+
+    #[test]
+    fn unchecked_verifier_rejects_malformed_certificates_during_signature_verification() {
+        let verifier = unchecked_verifier();
+        let cert = CertificateDer::from(&b"not a certificate"[..]);
+        let signature = tls_test_signature(SignatureScheme::ECDSA_NISTP256_SHA256);
+        assert!(verifier.verify_tls12_signature(TLS_TEST_MESSAGE, &cert, &signature).is_err());
+        assert!(verifier.verify_tls13_signature(TLS_TEST_MESSAGE, &cert, &signature).is_err());
+    }
+
+    #[test]
+    fn unchecked_verifier_rejects_tls12_only_signature_schemes_for_tls13() {
+        let cert = CertificateDer::from(TLS_TEST_CERT);
+        let signature = tls_test_signature(SignatureScheme::RSA_PKCS1_SHA256);
+        assert!(matches!(
+            unchecked_verifier().verify_tls13_signature(TLS_TEST_MESSAGE, &cert, &signature),
+            Err(rustls::Error::PeerMisbehaved(_))
+        ));
+    }
+
+    #[test]
+    fn unchecked_verifier_advertises_only_the_crypto_providers_signature_schemes() {
+        let verifier = unchecked_verifier();
+        assert_eq!(
+            verifier.supported_verify_schemes(),
+            verifier.provider.signature_verification_algorithms.supported_schemes()
+        );
+    }
+
+    #[test]
+    fn tls_transport_allows_empty_roots_when_certificate_validation_is_disabled() {
+        assert!(matches!(
+            tls_transport(RootCertStore::empty(), false, false).unwrap(),
+            Transport::Tls(_)
+        ));
+    }
+
+    #[test]
+    fn wss_transport_allows_empty_roots_when_certificate_validation_is_disabled() {
+        assert!(matches!(
+            tls_transport(RootCertStore::empty(), false, true).unwrap(),
+            Transport::Wss(rumqttc::TlsConfiguration::Rustls(_))
+        ));
+    }
+
+    #[test]
+    fn wss_transport_returns_an_error_when_no_trusted_certificates_are_available() {
+        assert_eq!(
+            tls_transport(RootCertStore::empty(), true, true)
+                .err()
+                .expect("WSS without trusted roots must fail")
+                .to_string(),
+            "Could not load trusted system certificates for TLS."
+        );
+    }
+
     #[test]
     fn tls_transport_returns_an_error_when_no_trusted_certificates_are_available() {
         assert_eq!(
-            tls_transport(RootCertStore::empty())
+            tls_transport(RootCertStore::empty(), true, false)
                 .err()
                 .expect("TLS without trusted roots must fail")
                 .to_string(),

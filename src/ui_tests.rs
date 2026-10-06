@@ -2787,6 +2787,7 @@ fn connection_cards_open_a_full_width_form_and_return_to_the_overview(cx: &mut T
 
 #[gpui_kit::test]
 fn canceling_connection_deletion_preserves_the_connection_and_topics(cx: &mut TestAppContext) {
+    cx.update(|cx| cx.set_reduce_motion(true));
     let (handle, view) = open(cx, false, 1200., 760.);
     cx.update_window(handle, |_, window, cx| {
         window.render_frame(cx);
@@ -2804,14 +2805,23 @@ fn canceling_connection_deletion_preserves_the_connection_and_topics(cx: &mut Te
             window.click(button, cx);
         })
         .unwrap();
-        assert!(cx.has_pending_prompt());
-        assert_eq!(cx.pending_prompt().unwrap().0, "Delete connection \"Home\"?");
+        assert!(!cx.has_pending_prompt());
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.has_active_dialog(cx));
+            assert_eq!(window.within("dialog").find("cancel").label(), Some("Cancel"));
+            assert_eq!(window.within("dialog").find("ok").label(), Some("Delete"));
+        })
+        .unwrap();
         cx.update(|cx| {
             assert_eq!(view.read(cx).saved_connections.connections.len(), 1);
             assert_eq!(view.read(cx).topics.topics, 2);
         });
-        cx.simulate_prompt_answer("Cancel");
+        cx.update_window(handle, |_, window, cx| window.within("dialog").click("cancel", cx))
+            .unwrap();
         cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| assert!(!window.has_active_dialog(cx)))
+            .unwrap();
         cx.update(|cx| {
             let view = view.read(cx);
             assert_eq!(view.saved_connections.connections.len(), 1);
@@ -2820,6 +2830,38 @@ fn canceling_connection_deletion_preserves_the_connection_and_topics(cx: &mut Te
             assert_eq!(view.topics.topics, 2);
         });
     }
+}
+
+#[gpui_kit::test]
+fn escape_dismisses_connection_deletion_and_restores_focus(cx: &mut TestAppContext) {
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let (handle, view) = open(cx, false, 1200., 760.);
+    let mut previous_focus = None;
+    cx.update_window(handle, |_, window, cx| {
+        window.activate_window();
+        window.render_frame(cx);
+        window.click("settings", cx);
+        window.render_frame(cx);
+        previous_focus = window.focused(cx);
+        window.click("delete-connection:0", cx);
+        window.render_frame(cx);
+        assert!(window.has_active_dialog(cx));
+        assert!(!previous_focus.as_ref().unwrap().is_focused(window));
+        window.press("escape", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(!window.has_active_dialog(cx));
+        assert!(window.find("connection-card:0").visible());
+        assert!(previous_focus.as_ref().unwrap().is_focused(window));
+        let view = view.read(cx);
+        assert_eq!(view.saved_connections.connections.len(), 1);
+        assert!(view.status.is_connected());
+        assert_eq!(view.topics.topics, 2);
+    })
+    .unwrap();
 }
 
 #[gpui_kit::test]
@@ -2897,6 +2939,7 @@ fn deleting_an_inactive_connection_preserves_the_active_connections_topics(cx: &
 
 #[gpui_kit::test]
 fn confirming_connection_deletion_preserves_topics_when_saving_fails(cx: &mut TestAppContext) {
+    cx.update(|cx| cx.set_reduce_motion(true));
     let (handle, view) = open(cx, false, 1200., 760.);
     view.update(cx, |view, cx| {
         // Validation fails before any settings or credentials are written.
@@ -2914,9 +2957,15 @@ fn confirming_connection_deletion_preserves_topics_when_saving_fails(cx: &mut Te
         window.click("delete-connection:0", cx);
     })
     .unwrap();
-    assert!(cx.has_pending_prompt());
-    cx.simulate_prompt_answer("Delete");
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.has_active_dialog(cx));
+        window.within("dialog").click("ok", cx);
+    })
+    .unwrap();
     cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| assert!(!window.has_active_dialog(cx)))
+        .unwrap();
     cx.update(|cx| {
         let view = view.read(cx);
         assert_eq!(view.saved_connections.connections.len(), 2);
@@ -3543,6 +3592,112 @@ fn broker_settings_align_protocol_host_and_port_across_themes_and_text_sizes(cx:
 }
 
 #[gpui_kit::test]
+fn certificate_validation_is_tls_only_and_persists_when_saving(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, true, 1200., 1200.);
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        let checkbox = window.find("validate-certificate");
+        assert_eq!(checkbox.label(), Some("Validate certificate"));
+        assert_eq!(checkbox.checked(), Some(true));
+        assert!(checkbox.bounds().top() > window.find("field:port").bounds().bottom());
+        window.click("validate-certificate", cx);
+        assert!(view.read(cx).validate_certificate);
+        window.click("port", cx);
+        window.press("tab", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("client-id").focused(), Some(true));
+        window.click("name", cx);
+        window.input("TLS broker", cx);
+        window.click("broker-protocol", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| window.press("down", cx)).unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| window.press("enter", cx)).unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("broker-protocol").value(), Some("mqtts://"));
+        assert!(window.try_find("certificate-validation-warning").is_none());
+        window.click("validate-certificate", cx);
+        assert_eq!(window.find("validate-certificate").checked(), Some(false));
+        assert!(!view.read(cx).validate_certificate);
+        assert!(window.find("certificate-validation-warning").visible());
+        window.click("broker-protocol", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| window.press("down", cx)).unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| window.press("enter", cx)).unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("broker-protocol").value(), Some("ws://"));
+        assert_eq!(window.find("validate-certificate").checked(), Some(false));
+        assert!(window.try_find("certificate-validation-warning").is_none());
+        window.click("validate-certificate", cx);
+        assert!(!view.read(cx).validate_certificate);
+        window.click("broker-protocol", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| window.press("down", cx)).unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| window.press("enter", cx)).unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("broker-protocol").value(), Some("wss://"));
+        assert_eq!(window.find("port").value(), Some("9002"));
+        assert_eq!(window.find("validate-certificate").checked(), Some(false));
+        assert!(window.find("certificate-validation-warning").visible());
+        window.click("port", cx);
+        window.press("tab", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("validate-certificate").focused(), Some(true));
+        window.press("space", cx);
+        assert!(view.read(cx).validate_certificate);
+        assert!(window.try_find("certificate-validation-warning").is_none());
+        window.press("space", cx);
+        assert!(!view.read(cx).validate_certificate);
+        window.click("save-connection", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        let saved = &view.read(cx).saved_connections.connections[0];
+        assert!(saved.tls);
+        assert!(saved.websocket);
+        assert_eq!(saved.port, 9002);
+        assert!(!saved.validate_certificate);
+        window.click("edit-connection:0", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("broker-protocol").value(), Some("wss://"));
+        assert_eq!(window.find("port").value(), Some("9002"));
+        assert_eq!(window.find("validate-certificate").checked(), Some(false));
+        assert!(window.find("certificate-validation-warning").visible());
+        window.click("validate-certificate", cx);
+        assert!(view.read(cx).validate_certificate);
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
 fn editing_connections_restores_broker_protocol_and_preserves_custom_ports(cx: &mut TestAppContext) {
     let (handle, view) = open(cx, false, 1200., 1200.);
     cx.update_window(handle, |_, window, cx| {
@@ -3551,7 +3706,12 @@ fn editing_connections_restores_broker_protocol_and_preserves_custom_ports(cx: &
     })
     .unwrap();
     cx.run_until_parked();
-    for (tls, websocket, expected) in [(false, false, "mqtt://"), (true, false, "mqtts://"), (false, true, "ws://")] {
+    for (tls, websocket, expected) in [
+        (false, false, "mqtt://"),
+        (true, false, "mqtts://"),
+        (false, true, "ws://"),
+        (true, true, "wss://"),
+    ] {
         view.update(cx, |view, cx| {
             let config = &mut view.saved_connections.connections[0];
             config.tls = tls;
@@ -3585,8 +3745,59 @@ fn editing_connections_restores_broker_protocol_and_preserves_custom_ports(cx: &
         window.render_frame(cx);
         assert_eq!(window.find("broker-protocol").value(), Some("mqtt://"));
         assert_eq!(window.find("port").value(), Some("1883"));
+        assert_eq!(window.find("validate-certificate").checked(), Some(true));
     })
     .unwrap();
+}
+
+#[gpui_kit::test]
+fn broker_protocol_switches_default_ports_and_preserves_custom_ports(cx: &mut TestAppContext) {
+    let (handle, _) = open(cx, true, 1200., 1200.);
+    for custom_port in [None, Some("19001")] {
+        if let Some(port) = custom_port {
+            cx.update_window(handle, |_, window, cx| {
+                window.render_frame(cx);
+                window.click("port", cx);
+                window.press("secondary-a", cx);
+                window.input(port, cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+        }
+        for (keys, protocol, default_port) in [
+            (vec!["down", "down"], "ws://", "9001"),
+            (vec!["down"], "wss://", "9002"),
+            (vec!["up"], "ws://", "9001"),
+            (vec!["up"], "mqtts://", "8883"),
+            (vec!["down", "down"], "wss://", "9002"),
+            (vec!["up", "up", "up"], "mqtt://", "1883"),
+            (vec!["down", "down", "down"], "wss://", "9002"),
+            (vec!["up", "up"], "mqtts://", "8883"),
+            (vec!["down"], "ws://", "9001"),
+            (vec!["up", "up"], "mqtt://", "1883"),
+            (vec!["down"], "mqtts://", "8883"),
+            (vec!["up"], "mqtt://", "1883"),
+        ] {
+            cx.update_window(handle, |_, window, cx| {
+                window.render_frame(cx);
+                window.click("broker-protocol", cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            for key in keys {
+                cx.update_window(handle, |_, window, cx| window.press(key, cx)).unwrap();
+                cx.run_until_parked();
+            }
+            cx.update_window(handle, |_, window, cx| window.press("enter", cx)).unwrap();
+            cx.run_until_parked();
+            cx.update_window(handle, |_, window, cx| {
+                window.render_frame(cx);
+                assert_eq!(window.find("broker-protocol").value(), Some(protocol));
+                assert_eq!(window.find("port").value(), Some(custom_port.unwrap_or(default_port)));
+            })
+            .unwrap();
+        }
+    }
 }
 
 #[gpui_kit::test]
@@ -3633,6 +3844,26 @@ fn broker_protocol_supports_keyboard_selection_default_ports_and_tab_order(cx: &
         window.render_frame(cx);
         assert_eq!(window.find("port").focused(), Some(true));
         window.input("9001", cx);
+        window.press("tab", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("validate-certificate").focused(), Some(true));
+        window.press("space", cx);
+        assert_eq!(window.find("validate-certificate").checked(), Some(false));
+        assert!(!view.read(cx).validate_certificate);
+        window.press("space", cx);
+        assert_eq!(window.find("validate-certificate").checked(), Some(true));
+        assert!(view.read(cx).validate_certificate);
+        window.press("tab", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("client-id").focused(), Some(true));
         window.click("broker-protocol", cx);
     })
     .unwrap();

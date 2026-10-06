@@ -11,8 +11,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 #[cfg(not(test))]
-use directories::BaseDirs;
-use directories::ProjectDirs;
+use directories::{BaseDirs, ProjectDirs};
 use keyring::{Entry, Error as KeyringError};
 use serde::{Deserialize, Serialize};
 
@@ -62,7 +61,9 @@ pub struct ConnectionConfig {
     #[serde(skip)]
     pub password: String,
     pub tls: bool,
-    /// Use unencrypted MQTT over WebSocket, taking precedence over `tls`.
+    /// Validate the server certificate chain and hostname for TLS connections; defaults to true.
+    pub validate_certificate: bool,
+    /// Use MQTT over WebSocket, secured with TLS when `tls` is true.
     #[serde(default)]
     pub websocket: bool,
 }
@@ -108,6 +109,7 @@ impl Default for ConnectionConfig {
             username: String::new(),
             password: String::new(),
             tls: false,
+            validate_certificate: true,
             websocket: false,
         }
     }
@@ -125,6 +127,7 @@ struct DeserializedConnectionConfig {
     base_topic: Option<String>,
     username: String,
     tls: bool,
+    validate_certificate: bool,
     websocket: bool,
 }
 
@@ -140,6 +143,7 @@ impl Default for DeserializedConnectionConfig {
             base_topic: None,
             username: config.username,
             tls: config.tls,
+            validate_certificate: config.validate_certificate,
             websocket: config.websocket,
         }
     }
@@ -162,6 +166,7 @@ impl From<DeserializedConnectionConfig> for ConnectionConfig {
             username: config.username,
             password: String::new(),
             tls: config.tls,
+            validate_certificate: config.validate_certificate,
             websocket: config.websocket,
         }
     }
@@ -179,14 +184,13 @@ fn default_client_id() -> String {
 }
 
 impl ConnectionConfig {
-    /// Returns the broker protocol prefix; WebSocket takes precedence over TLS.
+    /// Returns the broker protocol prefix for the transport and TLS settings.
     pub fn protocol(&self) -> &'static str {
-        if self.websocket {
-            "ws://"
-        } else if self.tls {
-            "mqtts://"
-        } else {
-            "mqtt://"
+        match (self.websocket, self.tls) {
+            (false, false) => "mqtt://",
+            (false, true) => "mqtts://",
+            (true, false) => "ws://",
+            (true, true) => "wss://",
         }
     }
 
@@ -241,6 +245,22 @@ impl ConnectionConfig {
     }
 }
 
+// Tests must never resolve user configuration paths or open the system credential store.
+// Thread-local storage also keeps concurrently running test fixtures independent.
+#[cfg(test)]
+std::thread_local! {
+    static TEST_CONFIG_DIR: tempfile::TempDir = tempfile::tempdir()
+        .expect("Could not create a temporary application configuration directory.");
+    static TEST_CREDENTIAL_STORE: std::sync::Arc<keyring_core::mock::Store> = keyring_core::mock::Store::new()
+        .expect("Could not create an in-memory test credential store.");
+}
+
+#[cfg(test)]
+pub fn config_path() -> Result<PathBuf> {
+    Ok(TEST_CONFIG_DIR.with(|dir| dir.path().join("mqtt-ui").join("connections.json")))
+}
+
+#[cfg(not(test))]
 pub fn config_path() -> Result<PathBuf> {
     let dirs = ProjectDirs::from("", "", "mqtt-ui").context("Could not locate your application configuration directory.")?;
     Ok(dirs.config_dir().join("connections.json"))
@@ -429,7 +449,7 @@ struct SavedConnection {
 fn credential_account(config: &ConnectionConfig) -> String {
     // Preserve legacy TCP/TLS keys; WebSocket uses a separate protocol scope.
     let transport = if config.websocket {
-        "ws"
+        if config.tls { "wss" } else { "ws" }
     } else if config.tls {
         "true"
     } else {
@@ -447,6 +467,18 @@ fn credential_account(config: &ConnectionConfig) -> String {
     )
 }
 
+#[cfg(test)]
+fn password_entry(config: &ConnectionConfig) -> Result<Entry> {
+    use keyring_core::api::CredentialStoreApi;
+
+    TEST_CREDENTIAL_STORE.with(|store| {
+        Ok(Entry {
+            inner: store.build("mqtt-ui", &credential_account(config), None)?,
+        })
+    })
+}
+
+#[cfg(not(test))]
 fn password_entry(config: &ConnectionConfig) -> Result<Entry> {
     Entry::new("mqtt-ui", &credential_account(config))
         .map_err(credential_error)
@@ -687,12 +719,12 @@ mod tests {
     }
 
     #[test]
-    fn protocol_selects_tcp_tls_or_websocket_with_websocket_taking_precedence() {
+    fn protocol_selects_tcp_or_websocket_with_optional_tls() {
         for (tls, websocket, expected) in [
             (false, false, "mqtt://"),
             (true, false, "mqtts://"),
             (false, true, "ws://"),
-            (true, true, "ws://"),
+            (true, true, "wss://"),
         ] {
             let config = ConnectionConfig {
                 tls,
@@ -711,6 +743,47 @@ mod tests {
             assert_eq!(config.protocol(), expected);
         }
         assert!(!ConnectionConfig::default().websocket);
+    }
+
+    #[test]
+    fn certificate_validation_defaults_to_true_for_new_and_legacy_connections() {
+        assert!(ConnectionConfig::default().validate_certificate);
+        for json in ["{}", r#"{"tls":false}"#, r#"{"tls":true}"#, r#"{"websocket":true}"#] {
+            let config: ConnectionConfig = serde_json::from_str(json).unwrap();
+            assert!(config.validate_certificate);
+        }
+    }
+
+    #[test]
+    fn disabled_certificate_validation_roundtrips_through_json() {
+        let config = ConnectionConfig {
+            tls: true,
+            validate_certificate: false,
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&config).unwrap();
+        assert_eq!(json["validate_certificate"], false);
+        let loaded: ConnectionConfig = serde_json::from_value(json).unwrap();
+        assert!(!loaded.validate_certificate);
+        assert!(loaded.tls);
+    }
+
+    #[test]
+    fn secure_websocket_roundtrips_with_certificate_validation_settings() {
+        for validate_certificate in [true, false] {
+            let config = ConnectionConfig {
+                tls: true,
+                websocket: true,
+                port: 9002,
+                validate_certificate,
+                ..Default::default()
+            };
+            let json = serde_json::to_value(&config).unwrap();
+            let loaded: ConnectionConfig = serde_json::from_value(json).unwrap();
+            assert_eq!(loaded.protocol(), "wss://");
+            assert_eq!(loaded.port, 9002);
+            assert_eq!(loaded.validate_certificate, validate_certificate);
+        }
     }
 
     #[test]
@@ -896,18 +969,22 @@ mod tests {
     }
 
     #[test]
-    fn websocket_credentials_are_separate_and_ignore_the_tls_flag() {
+    fn websocket_credentials_are_separate_for_each_protocol() {
         let mut config = authenticated_config();
         let tcp = credential_account(&config);
         config.tls = true;
         let tls = credential_account(&config);
         config.websocket = true;
         let websocket = credential_account(&config);
-        assert_eq!(websocket, "9:localhost:1883:ws:9:mqtt-user");
+        assert_eq!(websocket, "9:localhost:1883:wss:9:mqtt-user");
         assert_ne!(websocket, tcp);
         assert_ne!(websocket, tls);
         config.tls = false;
-        assert_eq!(credential_account(&config), websocket);
+        let unencrypted_websocket = credential_account(&config);
+        assert_eq!(unencrypted_websocket, "9:localhost:1883:ws:9:mqtt-user");
+        assert_ne!(unencrypted_websocket, websocket);
+        assert_ne!(unencrypted_websocket, tcp);
+        assert_ne!(unencrypted_websocket, tls);
     }
 
     #[test]
@@ -938,6 +1015,58 @@ mod tests {
                 .iter()
                 .all(|config| config["websocket"] == false)
         );
+    }
+
+    #[test]
+    fn legacy_saved_connections_default_to_validating_certificates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("connections.json");
+        let entries = mock_entries();
+        fs::write(&path, r#"{"connections":[{"tls":true}],"selected":0}"#).unwrap();
+        let saved = load_connections_from(&path, &entries).unwrap();
+        assert!(saved.connections[0].validate_certificate);
+        save_connections_to(&path, &saved, &entries).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(json["connections"][0]["validate_certificate"], true);
+    }
+
+    #[test]
+    fn disabled_certificate_validation_persists_without_changing_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("connections.json");
+        let entries = mock_entries();
+        let mut config = ConnectionConfig {
+            tls: true,
+            ..authenticated_config()
+        };
+        let account = credential_account(&config);
+        save_connections_to(
+            &path,
+            &SavedConnections {
+                connections: vec![config.clone()],
+                selected: Some(0),
+            },
+            &entries,
+        )
+        .unwrap();
+        config.validate_certificate = false;
+        assert_eq!(credential_account(&config), account);
+        save_connections_to(
+            &path,
+            &SavedConnections {
+                connections: vec![config.clone()],
+                selected: Some(0),
+            },
+            &entries,
+        )
+        .unwrap();
+        let loaded = load_connections_from(&path, &entries).unwrap();
+        assert!(!loaded.connections[0].validate_certificate);
+        assert_eq!(loaded.connections[0].password, config.password);
+        assert_eq!(loaded.selected, Some(0));
+        let json: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(json["connections"][0]["validate_certificate"], false);
+        assert!(json["connections"][0].get("password").is_none());
     }
 
     #[test]
@@ -1004,6 +1133,65 @@ mod tests {
     #[test]
     fn multi_connection_file_uses_a_new_path() {
         assert_eq!(config_path().unwrap().file_name().unwrap(), "connections.json");
+    }
+
+    #[test]
+    fn application_persistence_uses_temporary_configuration_and_mock_credentials() {
+        let path = config_path().unwrap();
+        TEST_CONFIG_DIR.with(|dir| {
+            assert_eq!(path, dir.path().join("mqtt-ui").join("connections.json"));
+            assert!(path.with_file_name("appearance.json").starts_with(dir.path()));
+        });
+        let config = authenticated_config();
+        let entry = password_entry(&config).unwrap();
+        assert!(entry.inner.as_any().is::<mock::Cred>(), "tests must not use a system credential");
+        assert!(matches!(entry.get_password(), Err(KeyringError::NoEntry)));
+        save_connections(&SavedConnections {
+            connections: vec![config.clone()],
+            selected: Some(0),
+        })
+        .unwrap();
+        assert!(path.is_file());
+        assert_eq!(load_connections().unwrap().connections[0].password, config.password);
+        assert_eq!(entry.get_password().unwrap(), config.password);
+        save_connections(&SavedConnections::default()).unwrap();
+        assert!(load_connections().unwrap().connections.is_empty());
+        assert!(matches!(entry.get_password(), Err(KeyringError::NoEntry)));
+    }
+
+    #[test]
+    fn application_test_storage_is_thread_local_and_temporary_files_are_cleaned_up() {
+        let config = authenticated_config();
+        let path = config_path().unwrap();
+        TEST_CONFIG_DIR.with(|dir| assert!(path.starts_with(dir.path())));
+        let entry = password_entry(&config).unwrap();
+        assert!(entry.inner.as_any().is::<mock::Cred>());
+        entry.set_password("parent-thread-secret").unwrap();
+        let other_path = std::thread::spawn(move || {
+            let other_path = config_path().unwrap();
+            TEST_CONFIG_DIR.with(|dir| assert!(other_path.starts_with(dir.path())));
+            let other_entry = password_entry(&config).unwrap();
+            assert!(other_entry.inner.as_any().is::<mock::Cred>());
+            assert!(matches!(other_entry.get_password(), Err(KeyringError::NoEntry)));
+            assert!(load_connections().unwrap().connections.is_empty());
+            save_connections(&SavedConnections {
+                connections: vec![config.clone()],
+                selected: Some(0),
+            })
+            .unwrap();
+            assert_eq!(load_connections().unwrap().connections[0].password, config.password);
+            assert!(other_path.is_file());
+            other_path
+        })
+        .join()
+        .unwrap();
+        assert_ne!(other_path, path);
+        assert!(
+            !other_path.parent().unwrap().exists(),
+            "temporary configuration must be cleaned up on thread exit"
+        );
+        assert_eq!(entry.get_password().unwrap(), "parent-thread-secret");
+        assert!(load_connections().unwrap().connections.is_empty());
     }
 
     #[test]

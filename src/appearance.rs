@@ -667,6 +667,30 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn default_save_falls_back_to_config_path_and_roundtrips(cx: &mut TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        let setup_path = directory.path().join("appearance.json");
+        cx.update(|cx| {
+            setup(cx, &setup_path);
+            cx.set_global(Appearance::default());
+            assert!(cx.global::<Appearance>().path.is_none());
+            let expected_path = config::config_path().unwrap().with_file_name("appearance.json");
+            assert_ne!(expected_path, setup_path);
+
+            save(cx).unwrap();
+
+            assert_eq!(cx.global::<Appearance>().path.as_deref(), Some(expected_path.as_path()));
+            assert!(!setup_path.exists());
+            let saved: serde_json::Value = serde_json::from_slice(&fs::read(&expected_path).unwrap()).unwrap();
+            let expected = serde_json::to_value(Appearance::default()).unwrap();
+            assert_eq!(saved, expected);
+            let reloaded = load(&expected_path, cx).unwrap();
+            assert_eq!(reloaded.path.as_deref(), Some(expected_path.as_path()));
+            assert_eq!(serde_json::to_value(reloaded).unwrap(), expected);
+        });
+    }
+
+    #[gpui_kit::test]
     fn malformed_settings_recovery_retains_the_original_save_path(cx: &mut TestAppContext) {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("appearance.json");

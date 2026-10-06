@@ -7,8 +7,9 @@ use crate::{
 };
 use gpui_kit::assets::IconName as AssetIconName;
 use gpui_kit::component::{
-    ActiveTheme, AxisExt, Disableable, Icon, IconName, Sizable, StyledExt, ThemeMode, ThemeRegistry,
-    button::{Button, ButtonVariants},
+    ActiveTheme, AxisExt, Disableable, Icon, IconName, Sizable, StyledExt, ThemeMode, ThemeRegistry, WindowExt,
+    button::{Button, ButtonVariant, ButtonVariants},
+    checkbox::Checkbox,
     collapsible::Collapsible,
     input::{Input, InputGroup, InputState},
     label::Label,
@@ -20,8 +21,8 @@ use gpui_kit::component::{
 };
 use gpui_kit::{
     AnyElement, App, AvailableSpace, Bounds, Context, Element, ElementId, Entity, GlobalElementId, InspectorElementId, IntoElement,
-    LayoutId, MouseButton, Pixels, PromptButton, PromptLevel, Role, SharedString, Style, TestSupportExt, WeakEntity, Window, div,
-    prelude::*, px, relative, rems, size,
+    LayoutId, MouseButton, Pixels, Role, SharedString, Style, TestSupportExt, WeakEntity, Window, div, prelude::*, px, relative, rems,
+    size,
 };
 
 // The native header's title row shrink-wraps its suffix. A large preferred width with a zero
@@ -238,6 +239,7 @@ impl Explorer {
             self.invalid_field(ConnectionField::Topics, "Add or cancel the topic before saving.".into(), window, cx);
             return;
         }
+        let protocol = self.protocol.read(cx).selected_value().copied();
         let config = ConnectionConfig {
             name,
             host: self.host.read(cx).value().trim().to_owned(),
@@ -246,8 +248,9 @@ impl Explorer {
             topics: self.subscription_topics.clone(),
             username: self.username.read(cx).value().to_string(),
             password: self.password.read(cx).value().to_string(),
-            tls: self.protocol.read(cx).selected_value() == Some(&"mqtts://"),
-            websocket: self.protocol.read(cx).selected_value() == Some(&"ws://"),
+            tls: matches!(protocol, Some("mqtts://" | "wss://")),
+            validate_certificate: self.validate_certificate,
+            websocket: matches!(protocol, Some("ws://" | "wss://")),
         };
         if let Err(error) = config.validate() {
             self.invalid_field(error.field(), error.to_string(), window, cx);
@@ -307,6 +310,7 @@ impl Explorer {
             input.set_masked(true, window, cx);
             input.set_value(config.password.clone(), window, cx);
         });
+        self.validate_certificate = config.validate_certificate;
         self.protocol
             .update(cx, |state, cx| state.set_selected_value(&config.protocol(), window, cx));
         self.field_error = None;
@@ -393,27 +397,29 @@ impl Explorer {
         let Some(config) = self.saved_connections.connections.get(index) else {
             return;
         };
-        let message = format!("Delete connection \"{}\"?", connection_label(config));
+        let message = SharedString::from(format!("Delete connection \"{}\"?", connection_label(config)));
         let detail = if self.saved_connections.selected == Some(index) && self.active_config.is_some() {
             "This will remove the saved connection, disconnect from the broker, and clear its topics."
         } else {
             "This will remove the saved connection."
         };
-        let answer = window.prompt(
-            PromptLevel::Warning,
-            &message,
-            Some(detail),
-            &[PromptButton::cancel("Cancel"), PromptButton::new("Delete")],
-            cx,
-        );
-        cx.spawn_in(window, async move |view, cx| {
-            if answer.await == Ok(1) {
-                _ = view.update_in(cx, |view, window, cx| {
-                    view.remove_connection_with_save(index, window, cx, config::save_connections);
-                });
-            }
-        })
-        .detach();
+        let view = cx.weak_entity();
+        window.open_alert_dialog(cx, move |dialog, _, _| {
+            let view = view.clone();
+            dialog
+                .title(message.clone())
+                .description(detail)
+                .confirm()
+                .cancel_text("Cancel")
+                .ok_text("Delete")
+                .ok_variant(ButtonVariant::Danger)
+                .on_ok(move |_, window, cx| {
+                    _ = view.update(cx, |view, cx| {
+                        view.remove_connection_with_save(index, window, cx, config::save_connections);
+                    });
+                    true
+                })
+        });
     }
 
     pub(super) fn remove_connection_with_save(
@@ -528,12 +534,15 @@ impl Explorer {
             })
     }
 
-    fn broker_settings(&self) -> SettingItem {
+    fn broker_settings(&self, cx: &Context<Self>) -> SettingItem {
+        let view = cx.weak_entity();
+        let validate_certificate = self.validate_certificate;
         let protocol = self.protocol.clone();
         let host = self.host.clone();
         let port = self.port.clone();
         let field_error = self.field_error.clone();
         SettingItem::render(move |_, _, cx| {
+            let tls = matches!(protocol.read(cx).selected_value().copied(), Some("mqtts://" | "wss://"));
             let error_for = |field| {
                 field_error
                     .as_ref()
@@ -585,8 +594,42 @@ impl Explorer {
                             cx,
                         ))),
                 )
+                .child(
+                    Checkbox::new("validate-certificate")
+                        .label("Validate certificate")
+                        .checked(validate_certificate)
+                        .disabled(!tls)
+                        .on_change({
+                            let view = view.clone();
+                            move |checked, _, cx| {
+                                _ = view.update(cx, |view, cx| {
+                                    view.validate_certificate = *checked;
+                                    cx.notify();
+                                });
+                            }
+                        }),
+                )
+                .when(tls && !validate_certificate, |column| {
+                    column.child(
+                        div()
+                            .id("certificate-validation-warning")
+                            .test_support()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Certificate and hostname checks are disabled. Use only with trusted brokers."),
+                    )
+                })
         })
-        .keywords(["Broker settings", "Protocol", "Host", "Port", "MQTT", "TLS", "WebSocket"])
+        .keywords([
+            "Broker settings",
+            "Protocol",
+            "Host",
+            "Port",
+            "MQTT",
+            "TLS",
+            "WebSocket",
+            "Validate certificate",
+        ])
     }
 
     fn connections_page(&self, cx: &mut Context<Self>) -> SettingPage {
@@ -1058,7 +1101,7 @@ impl Explorer {
         .keywords(["save", "connect", "remove"]);
         let mut group = SettingGroup::new().gap_1().item(header).items([
             self.setting_input("name", "Connection name", &self.name, Some(ConnectionField::Name), cx),
-            self.broker_settings(),
+            self.broker_settings(cx),
             self.setting_input("client-id", "Client ID", &self.client_id, Some(ConnectionField::ClientId), cx),
             self.setting_input("username", "Username", &self.username, Some(ConnectionField::Username), cx),
             self.setting_input("password", "Password", &self.password, None, cx),
