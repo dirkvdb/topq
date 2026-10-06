@@ -138,6 +138,24 @@ impl Explorer {
         cx.notify();
     }
 
+    pub(super) fn escape_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.show_config && self.connection_form_open && self.editing.is_none() {
+            self.back_to_connections(window, cx);
+        } else {
+            self.cancel_connection(window, cx);
+        }
+    }
+
+    fn back_to_connections(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.connection_form_open = false;
+        self.topic_editor_open = false;
+        self.topic_editor_restore_focus = None;
+        self.field_error = None;
+        self.error = None;
+        self.focus.focus(window, cx);
+        cx.notify();
+    }
+
     pub(super) fn cancel_connection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.show_config {
             cx.propagate();
@@ -979,13 +997,8 @@ impl Explorer {
                 .gap_3()
                 .child(Button::new("back-to-connections").small().ghost().label("← Connections").on_click({
                     let view = header_view.clone();
-                    move |_, _, cx| {
-                        _ = view.update(cx, |view, cx| {
-                            view.connection_form_open = false;
-                            view.field_error = None;
-                            view.error = None;
-                            cx.notify();
-                        });
+                    move |_, window, cx| {
+                        _ = view.update(cx, |view, cx| view.back_to_connections(window, cx));
                     }
                 }))
                 .child(

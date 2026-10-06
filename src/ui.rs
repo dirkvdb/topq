@@ -1578,7 +1578,7 @@ impl Render for Explorer {
             .key_context(if self.show_config { "Explorer SettingsDialog" } else { "Explorer" })
             .track_focus(&self.focus)
             .on_action(cx.listener(|view, _: &OpenConnection, window, cx| view.open_connection(window, cx)))
-            .on_action(cx.listener(|view, _: &CancelConnection, window, cx| view.cancel_connection(window, cx)))
+            .on_action(cx.listener(|view, _: &CancelConnection, window, cx| view.escape_settings(window, cx)))
             .on_action(cx.listener(|view, _: &FocusTopics, window, cx| view.focus_topics(window, cx)))
             .on_action(cx.listener(|view, _: &FocusTopicFilter, window, cx| view.focus_topic_filter(window, cx)))
             .on_action(cx.listener(|view, _: &FirstTopic, _, cx| view.select_boundary(false, cx)))

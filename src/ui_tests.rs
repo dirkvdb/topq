@@ -3663,6 +3663,15 @@ fn broker_protocol_supports_keyboard_selection_default_ports_and_tab_order(cx: &
     cx.run_until_parked();
     cx.update_window(handle, |_, window, cx| {
         window.render_frame(cx);
+        assert!(window.find("settings-dialog").visible());
+        assert!(window.find("connections-overview").visible());
+        assert!(window.try_find("name").is_none());
+        window.press("escape", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
         assert!(window.try_find("settings-dialog").is_none());
         assert!(!view.read(cx).show_config);
     })
@@ -4219,6 +4228,93 @@ fn topic_rows_use_compact_spacing_and_remain_comfortable_at_larger_text_sizes(cx
         })
         .unwrap();
     }
+}
+
+#[gpui_kit::test]
+fn escape_returns_from_a_new_connection_to_settings_before_closing(cx: &mut TestAppContext) {
+    for target in ["name", "password", "toggle-password", "topic-filter"] {
+        let (handle, view) = open(cx, false, 1200., 1600.);
+        let mut previous_focus = None;
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            previous_focus = window.focused(cx);
+            window.click("settings", cx);
+            window.click("new-connection", cx);
+            if target == "topic-filter" {
+                window.click("begin-add-topic", cx);
+                window.input("draft/#", cx);
+            } else {
+                window.click(target, cx);
+            }
+            window.press("escape", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let state = view.read(cx);
+            assert!(state.show_config, "Escape from {target} must keep settings open");
+            assert!(!state.connection_form_open);
+            assert!(!state.topic_editor_open);
+            assert!(state.topic_editor_restore_focus.is_none());
+            assert!(state.field_error.is_none());
+            assert!(state.error.is_none());
+            assert_eq!(state.saved_connections.connections.len(), 1);
+            assert_eq!(state.saved_connections.connections[0].name, "Home");
+            assert!(window.find("connections-overview").visible());
+            assert!(window.try_find("name").is_none());
+            assert!(window.try_find("topic-editor").is_none());
+            window.press("escape", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("settings-dialog").is_none());
+            assert!(previous_focus.as_ref().unwrap().is_focused(window));
+        })
+        .unwrap();
+    }
+}
+
+#[gpui_kit::test]
+fn escape_returns_from_the_initial_new_connection_to_empty_settings(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, true, 1200., 1600.);
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("name", cx);
+        window.input("Unsaved", cx);
+        window.press("escape", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(view.read(cx).show_config);
+        assert!(!view.read(cx).connection_form_open);
+        assert!(view.read(cx).saved_connections.connections.is_empty());
+        assert!(window.find("connections-overview").visible());
+        assert!(window.find("new-connection").visible());
+        assert!(window.try_find("name").is_none());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn close_settings_button_still_closes_the_new_connection_view(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, true, 1200., 1600.);
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("close-settings", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(!view.read(cx).show_config);
+        assert!(window.try_find("settings-dialog").is_none());
+    })
+    .unwrap();
 }
 
 #[gpui_kit::test]
