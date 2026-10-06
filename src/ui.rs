@@ -35,6 +35,7 @@ use crate::{
 };
 
 mod explorer_pane;
+mod monitor;
 mod payload;
 mod payload_ansi;
 mod payload_diff;
@@ -214,6 +215,10 @@ pub struct Explorer {
     expanded: BTreeSet<String>,
     selected: Option<String>,
     payload: Entity<EditorState>,
+    numeric_fields: Vec<monitor::NumericField>,
+    hovered_field: Option<String>,
+    monitoring: monitor::Monitoring,
+    monitor_panes: Entity<ResizableState>,
     payload_preview: bool,
     payload_raw: Option<Entity<payload_raw::RawPayload>>,
     payload_image: Option<std::sync::Arc<gpui_kit::Image>>,
@@ -472,6 +477,10 @@ impl Explorer {
             username,
             password,
             payload,
+            numeric_fields: Vec::new(),
+            hovered_field: None,
+            monitoring: monitor::Monitoring::default(),
+            monitor_panes: cx.new(|_| ResizableState::default()),
             payload_preview: true,
             payload_raw: None,
             payload_image: None,
@@ -565,6 +574,7 @@ impl Explorer {
     fn clear_topics(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.publish_pending = false;
         self.publish_feedback = None;
+        self.monitoring.clear();
         self.topics = TopicStore::default();
         self.topic_rows.borrow_mut().clear();
         self.expanded.clear();
@@ -613,6 +623,7 @@ impl Explorer {
         let mut topics_changed = false;
         let mut details_changed = false;
         let mut shell_changed = false;
+        let mut charts_changed = false;
         for event in events {
             shell_changed |= !matches!(&event, BrokerEvent::Message(_));
             match event {
@@ -631,6 +642,7 @@ impl Explorer {
                     self.publish_feedback = Some(Err(error));
                 }
                 BrokerEvent::Message(message) => {
+                    charts_changed |= self.monitoring.receive(&message);
                     // Invalidate existing row caches before drawing. The virtual
                     // list may measure entry zero before painting it, so render-time
                     // notifications would be too late for that frame's cache reuse.
@@ -669,7 +681,7 @@ impl Explorer {
         if topics_changed {
             self.topics_view.update(cx, |_, cx| cx.notify());
         }
-        if details_changed {
+        if details_changed || charts_changed {
             self.details_view.update(cx, |_, cx| cx.notify());
         }
         if shell_changed {
@@ -1453,6 +1465,9 @@ impl Explorer {
                         .h_flex()
                         .flex_none()
                         .child(div().flex_1().font_medium().child("Latest value"))
+                        .when(!self.numeric_fields.is_empty(), |toolbar| {
+                            toolbar.child(self.monitor_field_menu(cx))
+                        })
                         .child(
                             Toggle::new("preview-value")
                                 .small()
@@ -1522,7 +1537,27 @@ impl Explorer {
                 )
                 .child("No message received on this exact topic.");
         }
-        panel.child(content)
+        if self.monitoring.is_empty() {
+            panel.child(content)
+        } else {
+            // The resize API consumes resolved geometry; minima/default follow UI zoom.
+            let rem = cx.theme().font_size;
+            panel.child(
+                v_resizable("payload-chart-panes")
+                    .with_state(&self.monitor_panes)
+                    .child(
+                        resizable_panel()
+                            .size_range(rems(10.).to_pixels(rem)..gpui_kit::Pixels::MAX)
+                            .child(content),
+                    )
+                    .child(
+                        resizable_panel()
+                            .size(rems(18.).to_pixels(rem))
+                            .size_range(rems(10.).to_pixels(rem)..gpui_kit::Pixels::MAX)
+                            .child(self.monitoring.render(cx)),
+                    ),
+            )
+        }
     }
 
     fn explorer(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {

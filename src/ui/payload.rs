@@ -5,7 +5,10 @@ use std::{ops::Range, sync::Arc, time::Instant};
 use gpui_kit::component::input::{Editor, RangeDecoration, RangeDecorationCollection, RangeDecorationStyle};
 use gpui_kit::{AnyElement, Image, ImageFormat, ObjectFit, StyledImage, TestSupportExt, div, img, prelude::*, relative};
 
-use super::{ActiveTheme, App, Context, Explorer, StyledExt, Window, payload_diff};
+use super::{
+    ActiveTheme, App, AssetIconName, Button, ButtonVariants, Context, DropdownMenu, Explorer, PopupMenuItem, Sizable, StyledExt, Window,
+    monitor, payload_diff,
+};
 use crate::{
     appearance::Appearance,
     topics::{FLASH_DURATION, flash_amount},
@@ -101,6 +104,63 @@ fn image_status(id: &'static str, message: &'static str, color: gpui_kit::Hsla) 
 }
 
 impl Explorer {
+    pub(super) fn start_monitoring(&mut self, pointer: &str, cx: &mut Context<Self>) {
+        let Some(topic) = self.selected.as_ref() else { return };
+        let Some(value) = self.topics.nodes.get(topic).and_then(|node| node.value.as_ref()) else {
+            return;
+        };
+        if self.monitoring.start(topic, pointer, &value.payload, value.received_at) {
+            self.details_view.update(cx, |_, cx| cx.notify());
+        }
+    }
+
+    pub(super) fn toggle_monitor_chart(&mut self, topic: &str, pointer: &str, cx: &mut Context<Self>) {
+        if self.monitoring.toggle_chart(topic, pointer) {
+            self.details_view.update(cx, |_, cx| cx.notify());
+        }
+    }
+
+    pub(super) fn set_monitor_smoothing(&mut self, topic: &str, pointer: &str, smooth: bool, cx: &mut Context<Self>) {
+        if self.monitoring.set_smoothing(topic, pointer, smooth) {
+            self.details_view.update(cx, |_, cx| cx.notify());
+        }
+    }
+
+    pub(super) fn stop_monitoring(&mut self, topic: &str, pointer: &str, cx: &mut Context<Self>) {
+        if self.monitoring.stop(topic, pointer) {
+            self.details_view.update(cx, |_, cx| cx.notify());
+        }
+    }
+
+    pub(super) fn monitor_field_menu(&self, cx: &Context<Self>) -> impl IntoElement {
+        let view = cx.weak_entity();
+        Button::new("monitor-field-menu")
+            .ghost()
+            .small()
+            .label("Monitor field")
+            .dropdown_caret(true)
+            .dropdown_menu(move |mut menu, _, cx| {
+                let Some(view) = view.upgrade() else { return menu };
+                let explorer = view.read(cx);
+                for field in &explorer.numeric_fields {
+                    let pointer = field.pointer().to_owned();
+                    let monitored = explorer
+                        .selected
+                        .as_ref()
+                        .is_some_and(|topic| explorer.monitoring.contains(topic, &pointer));
+                    let owner = view.downgrade();
+                    menu = menu.item(
+                        PopupMenuItem::new(if pointer.is_empty() { "(root)".to_owned() } else { pointer.clone() })
+                            .checked(monitored)
+                            .on_click(move |_, _, cx| {
+                                let _ = owner.update(cx, |view, cx| view.start_monitoring(&pointer, cx));
+                            }),
+                    );
+                }
+                menu
+            })
+    }
+
     pub(super) fn payload_view(&self, cx: &Context<Self>) -> AnyElement {
         if let Some(raw) = &self.payload_raw {
             return raw.clone().into_any_element();
@@ -133,10 +193,48 @@ impl Explorer {
                 )
                 .into_any_element();
         }
+        let numeric = !self.numeric_fields.is_empty();
+        let hovered = self
+            .hovered_field
+            .as_ref()
+            .and_then(|pointer| self.numeric_fields.iter().find(|field| field.pointer() == pointer));
+        let button = hovered.and_then(|field| {
+            let editor = self.payload.read(cx);
+            let bounds = editor.range_to_bounds(&(field.offset()..field.offset() + 1))?;
+            let pointer = field.pointer().to_owned();
+            let field_name = if pointer.is_empty() {
+                "(root)"
+            } else {
+                pointer.strip_prefix('/').unwrap_or(&pointer)
+            };
+            let monitored = self
+                .selected
+                .as_ref()
+                .is_some_and(|topic| self.monitoring.contains(topic, &pointer));
+            // Anchor in the same window coordinates as the text, not the editor's inset content origin.
+            // The slot follows indentation and shares the measured row height for exact centering.
+            let position = gpui_kit::point(bounds.left() - gpui_kit::rems(1.5).to_pixels(cx.theme().font_size), bounds.top());
+            Some(
+                gpui_kit::anchored().position(position).child(
+                    div().h_flex().justify_center().w_5().h(bounds.size.height).child(
+                        Button::new("monitor-hovered-field")
+                            .ghost()
+                            .xsmall()
+                            .icon(AssetIconName::ChartLine)
+                            .accessibility_label(format!("Monitor JSON field {field_name}"))
+                            .tooltip(if monitored { "Already monitored" } else { "Monitor field" })
+                            .on_click(cx.listener(move |view, _, _, cx| view.start_monitoring(&pointer, cx))),
+                    ),
+                ),
+            )
+        });
+        let owner = cx.weak_entity();
         div()
             .id("payload-editor")
             .test_support()
+            .relative()
             .size_full()
+            .when(numeric, |container| container.pl_6())
             .child(
                 Editor::new(&self.payload)
                     .readonly(true)
@@ -145,6 +243,51 @@ impl Explorer {
                     .text_sm()
                     .aria_label("Latest topic payload"),
             )
+            .when(numeric, |container| {
+                container.child(
+                    // Observe capture without a hitbox: the editor owns text selection and may stop bubbling.
+                    gpui_kit::canvas(
+                        |_, _, _| (),
+                        move |viewport, _, window, _| {
+                            let scroll_owner = owner.clone();
+                            window.on_mouse_event(move |event: &gpui_kit::ScrollWheelEvent, phase, _, cx| {
+                                if !phase.bubble() && viewport.contains(&event.position) {
+                                    let _ = scroll_owner.update(cx, |view, cx| {
+                                        if view.hovered_field.take().is_some() {
+                                            view.details_view.update(cx, |_, cx| cx.notify());
+                                        }
+                                    });
+                                }
+                            });
+                            window.on_mouse_event(move |event: &gpui_kit::MouseMoveEvent, phase, _, cx| {
+                                if phase.bubble() {
+                                    return;
+                                }
+                                let _ = owner.update(cx, |view, cx| {
+                                    let editor = view.payload.read(cx);
+                                    let hovered = viewport
+                                        .contains(&event.position)
+                                        .then(|| {
+                                            view.numeric_fields.iter().find_map(|field| {
+                                                let bounds = editor.range_to_bounds(&(field.offset()..field.offset() + 1))?;
+                                                (event.position.y >= bounds.origin.y && event.position.y < bounds.bottom())
+                                                    .then(|| field.pointer().to_owned())
+                                            })
+                                        })
+                                        .flatten();
+                                    if hovered != view.hovered_field {
+                                        view.hovered_field = hovered;
+                                        view.details_view.update(cx, |_, cx| cx.notify());
+                                    }
+                                });
+                            });
+                        },
+                    )
+                    .absolute()
+                    .inset_0(),
+                )
+            })
+            .when_some(button, |container, button| container.child(button))
             .into_any_element()
     }
 
@@ -220,6 +363,30 @@ impl Explorer {
         } else {
             Vec::new()
         };
+        if changed
+            || !same_topic
+            || self.payload.read(cx).language_name()
+                != if self.payload_preview && format == "JSON" {
+                    "json"
+                } else {
+                    "plaintext"
+                }
+        {
+            self.numeric_fields = if self.payload_preview && format == "JSON" {
+                monitor::numeric_fields(&text)
+            } else {
+                Vec::new()
+            };
+            // Live value changes do not end the pointer interaction with this field.
+            if !same_topic
+                || self
+                    .hovered_field
+                    .as_ref()
+                    .is_some_and(|pointer| !self.numeric_fields.iter().any(|field| field.pointer() == pointer))
+            {
+                self.hovered_field = None;
+            }
+        }
         self.payload_format = format;
         self.payload_topic = self.selected.clone();
         let language = if self.payload_preview && format == "JSON" {

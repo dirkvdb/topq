@@ -9,6 +9,7 @@ An MQTT 5 topic explorer built with Rust and [GPUI Kit](https://gpui-kit.com).
 - Connection management to quickly connect to your favorite brokers, with optional TLS and WebSocket support.
 - Live topic tree
 - Payload pane to inspect the message payloads
+- Live line and area charts for monitored numeric JSON fields, with per-chart toggles and responsive rows.
 - Deletion of retained messages for a selected topic and its known subtopics.
 - Publish messages.
 
@@ -93,3 +94,6 @@ Activate the devenv virtual environment, then run:
 ```bash
 just run
 ```
+
+## Credits
+Big thanks to [MQTT Explorer](https://mqtt-explorer.com/) for the source of inspiration. I have been a long time user of MQTT Explorer and have enjoyed using it, but in a quest to reduce the number of Electron apps I use, I decided to build a native alternative.

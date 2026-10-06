@@ -1,5 +1,6 @@
 use bytes::Bytes;
 use chrono::Local;
+use gpui_kit::InputEvent as _;
 use gpui_kit::component::{ActiveTheme, Theme, ThemeMode, WindowExt};
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{
@@ -12,6 +13,324 @@ use crate::{
     config::{ConnectionConfig, ConnectionField, TopicSubscription},
     topics::Message,
 };
+
+#[gpui_kit::test]
+fn numeric_field_hover_creates_live_chart_and_last_close_hides_section(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, false, 1200., 900.);
+    for mode in [ThemeMode::Light, ThemeMode::Dark] {
+        cx.update_window(handle, |_, window, cx| {
+            Theme::change(mode, None, cx);
+            Theme::update(cx, |theme| theme.font_size = px(if mode == ThemeMode::Dark { 20. } else { 16. }));
+            window.activate_window();
+            view.update(cx, |view, cx| {
+                let mut incoming = message("home/a");
+                incoming.payload = Bytes::from_static(b"{\"power\":-12.5,\"status\":\"ready\"}");
+                view.apply_broker_events([crate::mqtt::BrokerEvent::Message(incoming)], window, cx);
+                view.select_topic("home/a", window, cx);
+            });
+            window.render_frame(cx);
+            assert!(window.try_find("monitor-panel").is_none());
+            assert!(window.try_find("monitor-hovered-field").is_none());
+            let field = &view.read(cx).numeric_fields[0];
+            let bounds = view
+                .read(cx)
+                .payload
+                .read(cx)
+                .range_to_bounds(&(field.offset()..field.offset() + 1))
+                .unwrap();
+
+            window.dispatch_event(
+                gpui_kit::MouseMoveEvent {
+                    position: bounds.center(),
+                    pressed_button: None,
+                    modifiers: Default::default(),
+                }
+                .to_platform_input(),
+                cx,
+            );
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(view.read(cx).hovered_field.as_deref(), Some("/power"));
+            let icon = window.find("monitor-hovered-field");
+            assert!(icon.visible());
+            let field = &view.read(cx).numeric_fields[0];
+            let row = view
+                .read(cx)
+                .payload
+                .read(cx)
+                .range_to_bounds(&(field.offset()..field.offset() + 1))
+                .unwrap();
+            assert!(
+                (icon.bounds().center().y - row.center().y).abs() <= px(1.),
+                "monitor icon {:?} must be centered on JSON row {:?}",
+                icon.bounds(),
+                row,
+            );
+            window.hover("monitor-hovered-field", cx);
+            // A live update must not dismiss the action under a stationary pointer.
+            for power in [-1250.75, -12.5] {
+                view.update(cx, |view, cx| {
+                    let mut incoming = message("home/a");
+                    incoming.payload = Bytes::from(format!("{{\"power\":{power},\"status\":\"updated\"}}"));
+                    view.apply_broker_events([crate::mqtt::BrokerEvent::Message(incoming)], window, cx);
+                });
+                window.render_frame(cx);
+                assert_eq!(view.read(cx).hovered_field.as_deref(), Some("/power"));
+                assert!(window.find("monitor-hovered-field").visible());
+            }
+            window.click("monitor-hovered-field", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(view.read(cx).monitoring.contains("home/a", "/power"));
+            let chart = window.find("monitor-panel").bounds();
+            assert!(chart.top() >= window.find("payload").bounds().bottom());
+            assert!(chart.size.height > px(100.));
+            let id = gpui_kit::ElementId::Name("monitor:6:home/a/power".into());
+            let latest = window.find((id.clone(), "latest"));
+            assert_eq!(latest.label(), Some("-12.5"));
+            assert!((latest.bounds().center().x - window.find(id.clone()).bounds().center().x).abs() <= px(1.));
+            let toggle = window.find((id.clone(), "toggle-chart"));
+            assert_eq!(toggle.label(), Some("Show area chart"));
+            let smoothing = window.find((id.clone(), "smooth"));
+            assert_eq!(smoothing.label(), Some("Disable line smoothing"));
+            assert_eq!(smoothing.checked(), Some(true));
+            assert!(toggle.bounds().right() <= smoothing.bounds().left());
+            assert!(smoothing.bounds().right() <= window.find((id.clone(), "stop")).bounds().left());
+            window.click((id.clone(), "smooth"), cx);
+            window.click((id, "toggle-chart"), cx);
+            view.update(cx, |view, cx| {
+                // Monitoring stays attached to home/a while another topic is selected.
+                view.select_topic("home/b", window, cx);
+                assert!(view.hovered_field.is_none());
+                let mut incoming = message("home/a");
+                incoming.payload = Bytes::from_static(b"{\"power\":42}");
+                view.apply_broker_events([crate::mqtt::BrokerEvent::Message(incoming)], window, cx);
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let id = gpui_kit::ElementId::Name("monitor:6:home/a/power".into());
+            assert_eq!(window.find((id.clone(), "latest")).label(), Some("42"));
+            assert_eq!(window.find((id.clone(), "smooth")).label(), Some("Enable line smoothing"));
+            assert_eq!(window.find((id.clone(), "toggle-chart")).label(), Some("Show line chart"));
+            window.click((id.clone(), "toggle-chart"), cx);
+            for _ in 0..20 {
+                if window.find((id.clone(), "toggle-chart")).focused() == Some(true) {
+                    break;
+                }
+                window.press("tab", cx);
+            }
+            assert_eq!(window.find((id, "toggle-chart")).focused(), Some(true));
+            window.press("space", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let id = gpui_kit::ElementId::Name("monitor:6:home/a/power".into());
+            assert_eq!(window.find((id, "toggle-chart")).label(), Some("Show line chart"));
+            window.press("enter", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let id = gpui_kit::ElementId::Name("monitor:6:home/a/power".into());
+            assert_eq!(window.find((id.clone(), "toggle-chart")).label(), Some("Show area chart"));
+            window.press("tab", cx);
+            assert_eq!(window.find((id, "smooth")).focused(), Some(true));
+            window.press("space", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let id = gpui_kit::ElementId::Name("monitor:6:home/a/power".into());
+            assert_eq!(window.find((id.clone(), "smooth")).label(), Some("Disable line smoothing"));
+            window.click((id, "stop"), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(view.read(cx).monitoring.is_empty());
+            assert!(window.try_find("monitor-panel").is_none());
+        })
+        .unwrap();
+    }
+}
+
+#[gpui_kit::test]
+fn monitor_icon_tracks_nested_json_rows_and_scroll_at_different_font_sizes(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, false, 1100., 700.);
+    for font_size in [16., 20., 24.] {
+        cx.update_window(handle, |_, window, cx| {
+            Theme::update(cx, |theme| theme.font_size = px(font_size));
+            window.activate_window();
+            view.update(cx, |view, cx| {
+                let mut incoming = message("home/a");
+                view.select_topic("home/b", window, cx);
+                incoming.payload = Bytes::from(
+                    serde_json::json!({
+                        "first": 1,
+                        "nested": {"second": 2, "third": 3},
+                        "values": (0..40).collect::<Vec<_>>(),
+                    })
+                    .to_string(),
+                );
+                view.apply_broker_events([crate::mqtt::BrokerEvent::Message(incoming)], window, cx);
+                view.select_topic("home/a", window, cx);
+            });
+            window.render_frame(cx);
+            for pointer in ["/first", "/nested/second", "/nested/third"] {
+                let field = view
+                    .read(cx)
+                    .numeric_fields
+                    .iter()
+                    .find(|field| field.pointer() == pointer)
+                    .unwrap();
+                let row = view
+                    .read(cx)
+                    .payload
+                    .read(cx)
+                    .range_to_bounds(&(field.offset()..field.offset() + 1))
+                    .unwrap();
+                window.dispatch_event(
+                    gpui_kit::MouseMoveEvent {
+                        position: row.center(),
+                        pressed_button: None,
+                        modifiers: Default::default(),
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+                window.render_frame(cx);
+                let icon = window.find("monitor-hovered-field").bounds();
+                assert!(
+                    (icon.center().y - row.center().y).abs() <= px(1.),
+                    "{pointer}: icon {icon:?}, row {row:?}"
+                );
+                assert!((row.left() - icon.right() - px(font_size / 4.)).abs() <= px(1.));
+
+                window.hover("monitor-hovered-field", cx);
+                assert_eq!(view.read(cx).hovered_field.as_deref(), Some(pointer));
+            }
+            window.scroll(
+                "payload-editor",
+                gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.), px(-2000.))),
+                cx,
+            );
+            assert!(view.read(cx).hovered_field.is_none());
+            window.render_frame(cx);
+            let field = view.read(cx).numeric_fields.last().unwrap();
+            let row = view
+                .read(cx)
+                .payload
+                .read(cx)
+                .range_to_bounds(&(field.offset()..field.offset() + 1))
+                .unwrap();
+            window.dispatch_event(
+                gpui_kit::MouseMoveEvent {
+                    position: row.center(),
+                    pressed_button: None,
+                    modifiers: Default::default(),
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.render_frame(cx);
+            let icon = window.find("monitor-hovered-field");
+            assert!(icon.visible());
+            assert!((icon.bounds().center().y - row.center().y).abs() <= px(1.));
+        })
+        .unwrap();
+        cx.run_until_parked();
+    }
+}
+
+#[gpui_kit::test]
+fn monitor_field_menu_supports_keyboard_selection_without_hover(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, false, 1000., 800.);
+    cx.update_window(handle, |_, window, cx| {
+        window.activate_window();
+        view.update(cx, |view, cx| {
+            let mut incoming = message("home/a");
+            incoming.payload = Bytes::from_static(b"{\"power\":5}");
+            view.apply_broker_events([crate::mqtt::BrokerEvent::Message(incoming)], window, cx);
+            view.select_topic("home/a", window, cx);
+        });
+        window.render_frame(cx);
+        window.click("monitor-field-menu", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.press("down", cx);
+        window.press("enter", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(view.read(cx).monitoring.contains("home/a", "/power"));
+        assert!(window.find("monitor-panel").visible());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn monitoring_charts_wrap_into_rows_as_window_width_changes(cx: &mut TestAppContext) {
+    for (width, columns) in [(900., 1), (1400., 2), (2600., 3)] {
+        let (handle, view) = open(cx, false, width, 800.);
+        cx.update_window(handle, |_, window, cx| {
+            Theme::update(cx, |theme| theme.font_size = px(16.));
+            window.activate_window();
+            view.update(cx, |view, cx| {
+                let mut incoming = message("home/a");
+                incoming.payload = Bytes::from_static(b"{\"a\":1,\"b\":2,\"c\":3}");
+                view.apply_broker_events([crate::mqtt::BrokerEvent::Message(incoming)], window, cx);
+                view.select_topic("home/a", window, cx);
+                for pointer in ["/a", "/b", "/c"] {
+                    view.start_monitoring(pointer, cx);
+                }
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let bounds: Vec<_> = ["a", "b", "c"]
+                .iter()
+                .map(|field| {
+                    window
+                        .find(gpui_kit::ElementId::Name(format!("monitor:6:home/a/{field}").into()))
+                        .bounds()
+                })
+                .collect();
+            for ix in 1..columns {
+                assert!((bounds[ix].top() - bounds[0].top()).abs() <= px(1.));
+                assert!(bounds[ix].left() > bounds[ix - 1].right());
+            }
+            if columns < 3 {
+                assert!(bounds[columns].top() >= bounds[0].bottom());
+            }
+            let panel = window.find("monitor-panel").bounds();
+            for chart in bounds {
+                assert!(chart.left() >= panel.left() && chart.right() <= panel.right());
+            }
+        })
+        .unwrap();
+        cx.run_until_parked();
+    }
+}
 
 fn open(cx: &mut TestAppContext, form: bool, width: f32, height: f32) -> (AnyWindowHandle, Entity<Explorer>) {
     cx.update(|cx| {
