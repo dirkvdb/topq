@@ -9,7 +9,7 @@ An MQTT 5 topic explorer built with Rust and [GPUI Kit](https://gpui-kit.com).
 - Connection management to quickly connect to your favorite brokers, with optional TLS and WebSocket support.
 - Live topic tree
 - Payload pane to inspect the message payloads
-- Live line and area charts for monitored numeric JSON fields, with per-chart toggles and responsive rows.
+- Live line and area charts for monitored numeric JSON fields, with independent per-chart type and smoothing controls and responsive rows. Clicking a field’s inline monitor icon always opens a new standalone chart, leaving existing charts unchanged and sharing the field’s history and color. Drag the icon onto a chart to compare fields on shared time/value axes, or use the chart’s **Add field…** menu with the keyboard. Adding a monitored field moves at most one standalone copy into the target; other copies and grouped charts remain unchanged. Closing a chart stops collecting a field only when no other chart uses it. Each field retains at most 300 samples.
 - Deletion of retained messages for a selected topic and its known subtopics.
 - Publish messages.
 

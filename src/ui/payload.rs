@@ -114,20 +114,29 @@ impl Explorer {
         }
     }
 
-    pub(super) fn toggle_monitor_chart(&mut self, topic: &str, pointer: &str, cx: &mut Context<Self>) {
-        if self.monitoring.toggle_chart(topic, pointer) {
+    pub(super) fn add_monitor_field(&mut self, id: monitor::ChartId, field: &monitor::FieldKey, cx: &mut Context<Self>) {
+        let Some(value) = self.topics.nodes.get(field.topic()).and_then(|node| node.value.as_ref()) else {
+            return;
+        };
+        if self.monitoring.add(id, field, &value.payload, value.received_at) {
             self.details_view.update(cx, |_, cx| cx.notify());
         }
     }
 
-    pub(super) fn set_monitor_smoothing(&mut self, topic: &str, pointer: &str, smooth: bool, cx: &mut Context<Self>) {
-        if self.monitoring.set_smoothing(topic, pointer, smooth) {
+    pub(super) fn toggle_monitor_chart(&mut self, id: monitor::ChartId, cx: &mut Context<Self>) {
+        if self.monitoring.toggle_chart(id) {
             self.details_view.update(cx, |_, cx| cx.notify());
         }
     }
 
-    pub(super) fn stop_monitoring(&mut self, topic: &str, pointer: &str, cx: &mut Context<Self>) {
-        if self.monitoring.stop(topic, pointer) {
+    pub(super) fn set_monitor_smoothing(&mut self, id: monitor::ChartId, smooth: bool, cx: &mut Context<Self>) {
+        if self.monitoring.set_smoothing(id, smooth) {
+            self.details_view.update(cx, |_, cx| cx.notify());
+        }
+    }
+
+    pub(super) fn stop_monitoring(&mut self, id: monitor::ChartId, cx: &mut Context<Self>) {
+        if self.monitoring.stop(id) {
             self.details_view.update(cx, |_, cx| cx.notify());
         }
     }
@@ -137,24 +146,20 @@ impl Explorer {
         Button::new("monitor-field-menu")
             .ghost()
             .small()
-            .label("Monitor field")
+            .label("New field chart")
             .dropdown_caret(true)
             .dropdown_menu(move |mut menu, _, cx| {
                 let Some(view) = view.upgrade() else { return menu };
                 let explorer = view.read(cx);
                 for field in &explorer.numeric_fields {
                     let pointer = field.pointer().to_owned();
-                    let monitored = explorer
-                        .selected
-                        .as_ref()
-                        .is_some_and(|topic| explorer.monitoring.contains(topic, &pointer));
                     let owner = view.downgrade();
                     menu = menu.item(
-                        PopupMenuItem::new(if pointer.is_empty() { "(root)".to_owned() } else { pointer.clone() })
-                            .checked(monitored)
-                            .on_click(move |_, _, cx| {
+                        PopupMenuItem::new(if pointer.is_empty() { "(root)".to_owned() } else { pointer.clone() }).on_click(
+                            move |_, _, cx| {
                                 let _ = owner.update(cx, |view, cx| view.start_monitoring(&pointer, cx));
-                            }),
+                            },
+                        ),
                     );
                 }
                 menu
@@ -202,15 +207,12 @@ impl Explorer {
             let editor = self.payload.read(cx);
             let bounds = editor.range_to_bounds(&(field.offset()..field.offset() + 1))?;
             let pointer = field.pointer().to_owned();
+            let drag_field = monitor::FieldKey::new(self.selected.as_deref()?, &pointer);
             let field_name = if pointer.is_empty() {
                 "(root)"
             } else {
                 pointer.strip_prefix('/').unwrap_or(&pointer)
             };
-            let monitored = self
-                .selected
-                .as_ref()
-                .is_some_and(|topic| self.monitoring.contains(topic, &pointer));
             // Anchor in the same window coordinates as the text, not the editor's inset content origin.
             // The slot follows indentation and shares the measured row height for exact centering.
             let position = gpui_kit::point(bounds.left() - gpui_kit::rems(1.5).to_pixels(cx.theme().font_size), bounds.top());
@@ -221,8 +223,14 @@ impl Explorer {
                             .ghost()
                             .xsmall()
                             .icon(AssetIconName::ChartLine)
-                            .accessibility_label(format!("Monitor JSON field {field_name}"))
-                            .tooltip(if monitored { "Already monitored" } else { "Monitor field" })
+                            .accessibility_label(format!("New chart for JSON field {field_name}"))
+                            .tooltip("Click for a new chart, or drag onto a chart")
+                            .map(|mut button| {
+                                button
+                                    .interactivity()
+                                    .on_drag(drag_field, |field, _, _, cx| cx.new(|_| field.clone()));
+                                button
+                            })
                             .on_click(cx.listener(move |view, _, _, cx| view.start_monitoring(&pointer, cx))),
                     ),
                 ),

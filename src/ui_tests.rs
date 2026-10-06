@@ -14,6 +14,321 @@ use crate::{
     topics::Message,
 };
 
+fn hover_numeric_field(view: &Entity<Explorer>, pointer: &str, window: &mut Window, cx: &mut App) {
+    let field = view
+        .read(cx)
+        .numeric_fields
+        .iter()
+        .find(|field| field.pointer() == pointer)
+        .unwrap();
+    let bounds = view
+        .read(cx)
+        .payload
+        .read(cx)
+        .range_to_bounds(&(field.offset()..field.offset() + 1))
+        .unwrap();
+    window.dispatch_event(
+        gpui_kit::MouseMoveEvent {
+            position: bounds.center(),
+            pressed_button: None,
+            modifiers: Default::default(),
+        }
+        .to_platform_input(),
+        cx,
+    );
+    window.render_frame(cx);
+}
+
+fn assert_monitor_drop_inset(window: &mut Window, id: &gpui_kit::ElementId) {
+    let frame = window.find(id.clone()).bounds();
+    let plot = window.find((id.clone(), "plot")).bounds();
+    let inset = window.rem_size() * 0.25 + px(1.);
+    for gap in [
+        plot.left() - frame.left(),
+        frame.right() - plot.right(),
+        frame.bottom() - plot.bottom(),
+    ] {
+        assert!(
+            (gap - inset).abs() <= px(1.),
+            "the drop rectangle should leave a compact inset around the chart"
+        );
+    }
+}
+
+#[gpui_kit::test]
+fn inline_monitor_drag_merges_into_exact_plot_and_duplicate_drop_is_a_noop(cx: &mut TestAppContext) {
+    for already_monitored in [false, true] {
+        let (handle, view) = open(cx, false, 1500., 1000.);
+        let a = gpui_kit::ElementId::Name("monitor-chart:0".into());
+        let b = gpui_kit::ElementId::Name("monitor:6:home/a/b".into());
+        let c = gpui_kit::ElementId::Name("monitor-chart:1".into());
+        cx.update_window(handle, |_, window, cx| {
+            window.activate_window();
+            view.update(cx, |view, cx| {
+                let mut incoming = message("home/a");
+                incoming.payload = Bytes::from_static(b"{\"a\":1,\"b\":2,\"c\":3}");
+                view.apply_broker_events([crate::mqtt::BrokerEvent::Message(incoming)], window, cx);
+                view.select_topic("home/a", window, cx);
+                for pointer in ["/a", "/c"] {
+                    view.start_monitoring(pointer, cx);
+                }
+                if already_monitored {
+                    view.start_monitoring("/b", cx);
+                }
+            });
+            window.render_frame(cx);
+            hover_numeric_field(&view, "/b", window, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(view.read(cx).hovered_field.as_deref(), Some("/b"));
+            assert_monitor_drop_inset(window, &a);
+            let source = window.find("monitor-hovered-field").bounds();
+            let destination = window.find((a.clone(), "plot")).bounds();
+            assert!(source.bottom() < destination.top());
+            window.drag_to("monitor-hovered-field", (a.clone(), "plot"), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(
+                view.read(cx)
+                    .monitoring
+                    .members(view.read(cx).monitoring.chart_ids().next().unwrap())
+                    .unwrap()
+                    .len(),
+                2
+            );
+            assert_monitor_drop_inset(window, &a);
+            assert!(window.try_find("monitor-chart:2").is_none());
+            assert!(window.find(c.clone()).visible());
+            assert_eq!(window.find((b.clone(), "legend")).label(), Some("b"));
+            hover_numeric_field(&view, "/b", window, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.drag_to("monitor-hovered-field", (a.clone(), "plot"), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            assert_eq!(
+                view.read(cx)
+                    .monitoring
+                    .members(view.read(cx).monitoring.chart_ids().next().unwrap())
+                    .unwrap()
+                    .len(),
+                2
+            );
+            view.update(cx, |view, cx| {
+                view.select_topic("home/b", window, cx);
+                for (topic, payload) in [("home/a/child", "{\"a\":100,\"b\":200}"), ("home/a", "{\"a\":4,\"b\":5,\"c\":6}")] {
+                    let mut incoming = message(topic);
+                    incoming.payload = Bytes::copy_from_slice(payload.as_bytes());
+                    view.apply_broker_events([crate::mqtt::BrokerEvent::Message(incoming)], window, cx);
+                }
+            });
+            window.render_frame(cx);
+            assert_eq!(
+                window
+                    .find((gpui_kit::ElementId::Name("monitor:6:home/a/a".into()), "legend"))
+                    .label(),
+                Some("a")
+            );
+            assert_eq!(window.find((b.clone(), "legend")).label(), Some("b"));
+            assert!(window.try_find((c.clone(), "latest")).is_none());
+            window.click((a.clone(), "toggle-chart"), cx);
+            window.click((a.clone(), "smooth"), cx);
+            window.click((a.clone(), "stop"), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(!view.read(cx).monitoring.contains("home/a", "/a"));
+            assert!(!view.read(cx).monitoring.contains("home/a", "/b"));
+            assert!(view.read(cx).monitoring.contains("home/a", "/c"));
+            assert!(window.try_find(a.clone()).is_none());
+            assert!(window.find(c.clone()).visible());
+        })
+        .unwrap();
+    }
+}
+
+#[gpui_kit::test]
+fn inline_monitor_click_duplicates_grouped_and_standalone_fields_without_changing_existing_charts(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, false, 2600., 1100.);
+    let group = gpui_kit::ElementId::Name("monitor-chart:0".into());
+    cx.update_window(handle, |_, window, cx| {
+        window.activate_window();
+        view.update(cx, |view, cx| {
+            let mut incoming = message("home/a");
+            incoming.payload = Bytes::from_static(b"{\"a\":1,\"b\":2}");
+            view.apply_broker_events([crate::mqtt::BrokerEvent::Message(incoming)], window, cx);
+            view.select_topic("home/a", window, cx);
+            view.start_monitoring("/a", cx);
+        });
+        window.render_frame(cx);
+        hover_numeric_field(&view, "/b", window, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.drag_to("monitor-hovered-field", (group.clone(), "plot"), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        let id = view.read(cx).monitoring.chart_ids().next().unwrap();
+        assert_eq!(view.read(cx).monitoring.members(id).unwrap().len(), 2);
+        window.click((group.clone(), "toggle-chart"), cx);
+        window.click((group.clone(), "smooth"), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    for count in [2, 3] {
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            hover_numeric_field(&view, "/b", window, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("monitor-hovered-field", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let ids: Vec<_> = view.read(cx).monitoring.chart_ids().collect();
+            assert_eq!(ids.len(), count);
+            for pair in ids.windows(2) {
+                let previous = window.find(pair[0].element_id()).bounds();
+                let next = window.find(pair[1].element_id()).bounds();
+                assert!(next.top() > previous.top() || ((next.top() - previous.top()).abs() <= px(1.) && next.left() > previous.left()));
+            }
+            assert_eq!(view.read(cx).monitoring.members(ids[0]).unwrap().len(), 2);
+            assert!(window.find(group.clone()).visible());
+            assert_eq!(window.find((group.clone(), "toggle-chart")).label(), Some("Show line chart"));
+            assert_eq!(window.find((group.clone(), "smooth")).checked(), Some(false));
+            for id in &ids[1..] {
+                let members = view.read(cx).monitoring.members(*id).unwrap();
+                assert_eq!(members.len(), 1);
+                assert_eq!(members[0], super::monitor::FieldKey::new("home/a", "/b"));
+                let id = id.element_id();
+                assert!(window.find(id.clone()).visible());
+                assert!(window.try_find((id.clone(), "latest")).is_none());
+                assert_eq!(window.find((id.clone(), "toggle-chart")).label(), Some("Show area chart"));
+                assert_eq!(window.find((id, "smooth")).checked(), Some(true));
+            }
+        })
+        .unwrap();
+    }
+    cx.update_window(handle, |_, window, cx| {
+        window.click((gpui_kit::ElementId::Name("monitor-chart:1".into()), "toggle-chart"), cx);
+        window.click((gpui_kit::ElementId::Name("monitor-chart:1".into()), "smooth"), cx);
+        view.update(cx, |view, cx| {
+            let mut incoming = message("home/a");
+            incoming.payload = Bytes::from_static(b"{\"a\":3,\"b\":4}");
+            view.apply_broker_events([crate::mqtt::BrokerEvent::Message(incoming)], window, cx);
+        });
+        window.render_frame(cx);
+        for (number, smooth) in [(1, false), (2, true)] {
+            let id = gpui_kit::ElementId::Name(format!("monitor-chart:{number}").into());
+            assert!(window.try_find((id.clone(), "latest")).is_none());
+            assert_eq!(window.find((id.clone(), "smooth")).checked(), Some(smooth));
+            assert_eq!(
+                window.find((id, "toggle-chart")).label(),
+                Some(if number == 1 { "Show line chart" } else { "Show area chart" })
+            );
+        }
+        assert!(window.try_find((group.clone(), "latest")).is_none());
+        window.click((group.clone(), "stop"), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(!view.read(cx).monitoring.contains("home/a", "/a"));
+        assert!(view.read(cx).monitoring.contains("home/a", "/b"));
+        assert!(window.try_find(group).is_none());
+        for id in [1, 2] {
+            window.click((gpui_kit::ElementId::Name(format!("monitor-chart:{id}").into()), "stop"), cx);
+        }
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(view.read(cx).monitoring.is_empty());
+        assert!(window.try_find("monitor-panel").is_none());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn chart_add_field_menu_merges_with_keyboard_without_payload_hover(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, false, 1200., 900.);
+    let a = gpui_kit::ElementId::Name("monitor-chart:0".into());
+    let b = gpui_kit::ElementId::Name("monitor:6:home/a/b".into());
+    cx.update_window(handle, |_, window, cx| {
+        window.activate_window();
+        view.update(cx, |view, cx| {
+            let mut incoming = message("home/a");
+            incoming.payload = Bytes::from_static(b"{\"a\":1,\"b\":2}");
+            view.apply_broker_events([crate::mqtt::BrokerEvent::Message(incoming)], window, cx);
+            view.select_topic("home/a", window, cx);
+            view.start_monitoring("/a", cx);
+        });
+        window.render_frame(cx);
+        assert!(window.try_find("monitor-hovered-field").is_none());
+        window.click((a.clone(), "toggle-chart"), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        for _ in 0..30 {
+            if window.find((a.clone(), "add-field")).focused() == Some(true) {
+                break;
+            }
+            window.press("tab", cx);
+        }
+        assert_eq!(window.find((a.clone(), "add-field")).focused(), Some(true));
+        window.press("enter", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.press("down", cx);
+        window.press("enter", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            view.read(cx)
+                .monitoring
+                .members(view.read(cx).monitoring.chart_ids().next().unwrap())
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(window.find((b.clone(), "legend")).label(), Some("b"));
+        assert_eq!(view.read(cx).monitoring.chart_ids().count(), 1);
+        assert!(window.try_find("popup-menu").is_none());
+    })
+    .unwrap();
+}
+
 #[gpui_kit::test]
 fn numeric_field_hover_creates_live_chart_and_last_close_hides_section(cx: &mut TestAppContext) {
     let (handle, view) = open(cx, false, 1200., 900.);
@@ -91,10 +406,8 @@ fn numeric_field_hover_creates_live_chart_and_last_close_hides_section(cx: &mut 
             let chart = window.find("monitor-panel").bounds();
             assert!(chart.top() >= window.find("payload").bounds().bottom());
             assert!(chart.size.height > px(100.));
-            let id = gpui_kit::ElementId::Name("monitor:6:home/a/power".into());
-            let latest = window.find((id.clone(), "latest"));
-            assert_eq!(latest.label(), Some("-12.5"));
-            assert!((latest.bounds().center().x - window.find(id.clone()).bounds().center().x).abs() <= px(1.));
+            let id = gpui_kit::ElementId::Name(format!("monitor-chart:{}", if mode == ThemeMode::Dark { 1 } else { 0 }).into());
+            assert!(window.try_find((id.clone(), "latest")).is_none());
             let toggle = window.find((id.clone(), "toggle-chart"));
             assert_eq!(toggle.label(), Some("Show area chart"));
             let smoothing = window.find((id.clone(), "smooth"));
@@ -117,8 +430,8 @@ fn numeric_field_hover_creates_live_chart_and_last_close_hides_section(cx: &mut 
         cx.run_until_parked();
         cx.update_window(handle, |_, window, cx| {
             window.render_frame(cx);
-            let id = gpui_kit::ElementId::Name("monitor:6:home/a/power".into());
-            assert_eq!(window.find((id.clone(), "latest")).label(), Some("42"));
+            let id = gpui_kit::ElementId::Name(format!("monitor-chart:{}", if mode == ThemeMode::Dark { 1 } else { 0 }).into());
+            assert!(window.try_find((id.clone(), "latest")).is_none());
             assert_eq!(window.find((id.clone(), "smooth")).label(), Some("Enable line smoothing"));
             assert_eq!(window.find((id.clone(), "toggle-chart")).label(), Some("Show line chart"));
             window.click((id.clone(), "toggle-chart"), cx);
@@ -135,7 +448,7 @@ fn numeric_field_hover_creates_live_chart_and_last_close_hides_section(cx: &mut 
         cx.run_until_parked();
         cx.update_window(handle, |_, window, cx| {
             window.render_frame(cx);
-            let id = gpui_kit::ElementId::Name("monitor:6:home/a/power".into());
+            let id = gpui_kit::ElementId::Name(format!("monitor-chart:{}", if mode == ThemeMode::Dark { 1 } else { 0 }).into());
             assert_eq!(window.find((id, "toggle-chart")).label(), Some("Show line chart"));
             window.press("enter", cx);
         })
@@ -143,7 +456,7 @@ fn numeric_field_hover_creates_live_chart_and_last_close_hides_section(cx: &mut 
         cx.run_until_parked();
         cx.update_window(handle, |_, window, cx| {
             window.render_frame(cx);
-            let id = gpui_kit::ElementId::Name("monitor:6:home/a/power".into());
+            let id = gpui_kit::ElementId::Name(format!("monitor-chart:{}", if mode == ThemeMode::Dark { 1 } else { 0 }).into());
             assert_eq!(window.find((id.clone(), "toggle-chart")).label(), Some("Show area chart"));
             window.press("tab", cx);
             assert_eq!(window.find((id, "smooth")).focused(), Some(true));
@@ -153,7 +466,7 @@ fn numeric_field_hover_creates_live_chart_and_last_close_hides_section(cx: &mut 
         cx.run_until_parked();
         cx.update_window(handle, |_, window, cx| {
             window.render_frame(cx);
-            let id = gpui_kit::ElementId::Name("monitor:6:home/a/power".into());
+            let id = gpui_kit::ElementId::Name(format!("monitor-chart:{}", if mode == ThemeMode::Dark { 1 } else { 0 }).into());
             assert_eq!(window.find((id.clone(), "smooth")).label(), Some("Disable line smoothing"));
             window.click((id, "stop"), cx);
         })
@@ -282,6 +595,25 @@ fn monitor_field_menu_supports_keyboard_selection_without_hover(cx: &mut TestApp
         window.render_frame(cx);
         assert!(view.read(cx).monitoring.contains("home/a", "/power"));
         assert!(window.find("monitor-panel").visible());
+        assert_eq!(view.read(cx).monitoring.chart_ids().count(), 1);
+        window.click("monitor-field-menu", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.press("down", cx);
+        window.press("enter", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(view.read(cx).monitoring.chart_ids().count(), 2);
+        for id in view.read(cx).monitoring.chart_ids() {
+            assert!(window.try_find(id.element_id()).is_some());
+            assert!(window.try_find((id.element_id(), "latest")).is_none());
+        }
+        assert!(window.try_find("popup-menu").is_none());
     })
     .unwrap();
 }
@@ -307,13 +639,11 @@ fn monitoring_charts_wrap_into_rows_as_window_width_changes(cx: &mut TestAppCont
         cx.run_until_parked();
         cx.update_window(handle, |_, window, cx| {
             window.render_frame(cx);
-            let bounds: Vec<_> = ["a", "b", "c"]
-                .iter()
-                .map(|field| {
-                    window
-                        .find(gpui_kit::ElementId::Name(format!("monitor:6:home/a/{field}").into()))
-                        .bounds()
-                })
+            let bounds: Vec<_> = view
+                .read(cx)
+                .monitoring
+                .chart_ids()
+                .map(|id| window.find(id.element_id()).bounds())
                 .collect();
             for ix in 1..columns {
                 assert!((bounds[ix].top() - bounds[0].top()).abs() <= px(1.));
