@@ -181,12 +181,29 @@ impl Explorer {
         self.persist_form(false, window, cx);
     }
 
+    fn duplicate_connection_name_error(&self, cx: &App) -> Option<&'static str> {
+        let value = self.name.read(cx).value();
+        let name = value.trim();
+        (!name.is_empty()
+            && self
+                .saved_connections
+                .connections
+                .iter()
+                .enumerate()
+                .any(|(index, connection)| Some(index) != self.editing && connection.name.trim() == name))
+        .then_some("This connection name is already in use. Choose a different name.")
+    }
+
     fn persist_form(&mut self, connect: bool, window: &mut Window, cx: &mut Context<Self>) {
         if connect && self.status.is_connecting() {
             return;
         }
         self.field_error = None;
         self.error = None;
+        if let Some(error) = self.duplicate_connection_name_error(cx) {
+            self.invalid_field(ConnectionField::Name, error.into(), window, cx);
+            return;
+        }
         let port = match self.port.read(cx).value().trim().parse::<u16>() {
             Ok(port) => port,
             Err(_) => {
@@ -426,13 +443,20 @@ impl Explorer {
         label: &'static str,
         input: &Entity<InputState>,
         field: Option<ConnectionField>,
+        cx: &App,
     ) -> SettingItem {
         let input = input.clone();
-        let error = self
-            .field_error
-            .as_ref()
-            .filter(|(which, _)| Some(*which) == field)
-            .map(|(_, message)| message.clone());
+        let error = if field == Some(ConnectionField::Name) {
+            self.duplicate_connection_name_error(cx).map(str::to_owned)
+        } else {
+            None
+        }
+        .or_else(|| {
+            self.field_error
+                .as_ref()
+                .filter(|(which, _)| Some(*which) == field)
+                .map(|(_, message)| message.clone())
+        });
         SettingItem::render(move |_, _, cx| Self::connection_input(id, label, &input, error.clone(), cx).px_1().pb_1()).keywords([label])
     }
 
@@ -946,6 +970,7 @@ impl Explorer {
     fn connection_form_page(&self, cx: &mut Context<Self>) -> SettingPage {
         let editing = self.editing;
         let connecting = self.status.is_connecting();
+        let duplicate_name_error = self.duplicate_connection_name_error(cx);
         let header_view = cx.weak_entity();
         let header = SettingItem::render(move |_, _, _| {
             div()
@@ -990,19 +1015,25 @@ impl Explorer {
                         }
                     }))
                 })
-                .child(Button::new("save-connection").small().label("Save").on_click({
-                    let view = actions_view.clone();
-                    move |_, window, cx| {
-                        _ = view.update(cx, |view, cx| view.save_from_form(window, cx));
-                    }
-                }))
+                .child(
+                    Button::new("save-connection")
+                        .small()
+                        .label("Save")
+                        .disabled(duplicate_name_error.is_some())
+                        .on_click({
+                            let view = actions_view.clone();
+                            move |_, window, cx| {
+                                _ = view.update(cx, |view, cx| view.save_from_form(window, cx));
+                            }
+                        }),
+                )
                 .child(
                     Button::new("connect")
                         .small()
                         .primary()
                         .label("Save & connect")
                         .loading(connecting)
-                        .disabled(connecting)
+                        .disabled(connecting || duplicate_name_error.is_some())
                         .on_click({
                             let view = actions_view.clone();
                             move |_, window, cx| {
@@ -1013,11 +1044,11 @@ impl Explorer {
         })
         .keywords(["save", "connect", "remove"]);
         let mut group = SettingGroup::new().gap_1().item(header).items([
-            self.setting_input("name", "Connection name", &self.name, Some(ConnectionField::Name)),
+            self.setting_input("name", "Connection name", &self.name, Some(ConnectionField::Name), cx),
             self.broker_settings(),
-            self.setting_input("client-id", "Client ID", &self.client_id, Some(ConnectionField::ClientId)),
-            self.setting_input("username", "Username", &self.username, Some(ConnectionField::Username)),
-            self.setting_input("password", "Password", &self.password, None),
+            self.setting_input("client-id", "Client ID", &self.client_id, Some(ConnectionField::ClientId), cx),
+            self.setting_input("username", "Username", &self.username, Some(ConnectionField::Username), cx),
+            self.setting_input("password", "Password", &self.password, None, cx),
             self.subscription_topics_section(cx),
         ]);
         if let Some(error) = self.error.clone() {

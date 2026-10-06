@@ -3917,6 +3917,142 @@ fn saving_requires_a_connection_name(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn duplicate_connection_name_disables_saving_until_corrected(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, false, 1200., 1600.);
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("settings", cx);
+        window.click("new-connection", cx);
+        window.click("name", cx);
+        window.input(" Home ", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("name-error").label(),
+            Some("This connection name is already in use. Choose a different name.")
+        );
+        for id in ["save-connection", "connect"] {
+            window.click(id, cx);
+            assert!(view.read(cx).field_error.is_none(), "disabled {id} must not invoke validation");
+        }
+        assert!(view.read(cx).connection_form_open);
+        assert_eq!(view.read(cx).saved_connections.connections.len(), 1);
+        window.click("name", cx);
+        window.press("secondary-a", cx);
+        window.input("Workshop", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("name-error").is_none());
+        window.click("port", cx);
+        window.press("secondary-a", cx);
+        window.input("invalid", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| window.click("save-connection", cx))
+        .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.find("port-error").visible(), "correcting the name must enable saving");
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn duplicate_connection_name_prevents_enter_from_saving_or_connecting(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, false, 1200., 1600.);
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("settings", cx);
+        window.click("new-connection", cx);
+        window.click("name", cx);
+        window.input("Home", cx);
+        window.press("enter", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.find("name-error").visible());
+        assert_eq!(window.find("name").focused(), Some(true));
+        let view = view.read(cx);
+        assert!(view.connection_form_open);
+        assert!(view.connection.is_none());
+        assert_eq!(view.saved_connections.connections.len(), 1);
+        assert_eq!(view.saved_connections.connections[0].name, "Home");
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn editing_connection_allows_its_own_name_but_rejects_another_connections_name(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, false, 1200., 1600.);
+    view.update(cx, |view, _| {
+        view.saved_connections.connections.push(ConnectionConfig {
+            name: "Workshop".into(),
+            ..Default::default()
+        });
+    });
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("settings", cx);
+        window.click("edit-connection:0", cx);
+        assert!(window.try_find("name-error").is_none());
+        for id in ["save-connection", "connect"] {
+            assert_ne!(window.find(id).disabled(), Some(true));
+        }
+        window.click("name", cx);
+        window.press("secondary-a", cx);
+        window.input("Workshop", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.find("name-error").visible());
+        for id in ["save-connection", "connect"] {
+            window.click(id, cx);
+            assert!(view.read(cx).field_error.is_none(), "disabled {id} must not invoke validation");
+        }
+        window.click("name", cx);
+        window.press("secondary-a", cx);
+        window.input("Home", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("name-error").is_none());
+        window.click("port", cx);
+        window.press("secondary-a", cx);
+        window.input("invalid", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| window.click("connect", cx)).unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.find("port-error").visible(),
+            "restoring its own name must enable Save & connect"
+        );
+        assert!(
+            window.find("port-error").visible(),
+            "restoring its own name must enable Save & connect"
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
 fn enter_keeps_invalid_port_next_to_its_field_and_returns_focus(cx: &mut TestAppContext) {
     let (handle, view) = open(cx, true, 760., 540.);
     cx.update_window(handle, |_, window, cx| {

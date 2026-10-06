@@ -355,7 +355,7 @@ impl Explorer {
                         input.update(cx, |input, cx| input.select_all(window, cx));
                     }
                     InputEvent::PressEnter { .. } if view.show_config && view.connection_form_open => view.connect_from_form(window, cx),
-                    InputEvent::Change if view.field_error.is_some() => {
+                    InputEvent::Change if view.field_error.is_some() || input == &view.name => {
                         view.field_error = None;
                         cx.notify();
                     }
