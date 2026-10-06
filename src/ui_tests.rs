@@ -54,6 +54,59 @@ fn open(cx: &mut TestAppContext, form: bool, width: f32, height: f32) -> (AnyWin
     })
 }
 
+#[test]
+fn payload_size_uses_readable_decimal_units() {
+    for (bytes, expected) in [
+        (0, "0 bytes"),
+        (1, "1 byte"),
+        (999, "999 bytes"),
+        (1_000, "1.0 KB"),
+        (2_261, "2.3 KB"),
+        (999_000, "999.0 KB"),
+        (1_000_000, "1.0 MB"),
+        (1_500_000, "1.5 MB"),
+        (16 * 1024 * 1024, "16.8 MB"),
+    ] {
+        assert_eq!(super::format_payload_size(bytes), expected, "{bytes} bytes");
+    }
+}
+
+#[gpui_kit::test]
+fn payload_size_tag_follows_the_latest_message(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, false, 760., 540.);
+    cx.update_window(handle, |_, window, cx| {
+        Theme::update(cx, |theme| theme.font_size = px(20.));
+        window.activate_window();
+        window.render_frame(cx);
+        window.press("home", cx);
+        window.press("right", cx);
+        window.press("down", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    for (bytes, expected) in [(1, "1 byte"), (999, "999 bytes"), (2_261, "2.3 KB"), (1_500_000, "1.5 MB")] {
+        cx.update_window(handle, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                let mut incoming = message("home/a");
+                incoming.payload = Bytes::from(vec![b'x'; bytes]);
+                view.topics.receive(incoming, std::time::Instant::now());
+                view.refresh_details(window, cx);
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let badge = window.find("payload-size");
+            assert_eq!(badge.label(), Some(expected));
+            assert!(badge.visible());
+            assert!(badge.bounds().right() <= window.find("topic-metadata").bounds().right());
+        })
+        .unwrap();
+    }
+}
+
 #[gpui_kit::test]
 fn publish_topic_tab_cycles_inline_proposals_without_changing_typed_text(cx: &mut TestAppContext) {
     let (handle, view) = open(cx, false, 1200., 760.);

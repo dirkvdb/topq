@@ -116,6 +116,16 @@ fn topic_summary(topics: usize, messages: u64) -> String {
     )
 }
 
+fn format_payload_size(bytes: usize) -> String {
+    if bytes >= 1_000_000 {
+        format!("{:.1} MB", bytes as f64 / 1_000_000.)
+    } else if bytes >= 1_000 {
+        format!("{:.1} KB", bytes as f64 / 1_000.)
+    } else {
+        format!("{bytes} {}", if bytes == 1 { "byte" } else { "bytes" })
+    }
+}
+
 fn relative_received_age(received_at: &chrono::DateTime<chrono::Local>) -> String {
     let seconds = chrono::Local::now().signed_duration_since(received_at).num_seconds().max(0);
     if seconds == 0 {
@@ -1324,6 +1334,8 @@ impl Explorer {
             } else {
                 self.payload_format
             };
+            let bytes = value.payload.len();
+            let payload_size = format_payload_size(bytes);
 
             content = content
                 .child(
@@ -1350,11 +1362,17 @@ impl Explorer {
                                     ),
                                 )
                                 .child(Tag::secondary().small().child(format!("QoS {}", value.qos)))
-                                .child(Tag::secondary().small().child(format!(
-                                    "{} {}",
-                                    value.payload.len(),
-                                    if value.payload.len() == 1 { "byte" } else { "bytes" }
-                                )))
+                                .child(
+                                    div()
+                                        .id("payload-size")
+                                        .test_support()
+                                        .aria_label(payload_size.clone())
+                                        .flex_none()
+                                        .tooltip(move |window, cx| {
+                                            Tooltip::new(format!("{bytes} {}", if bytes == 1 { "byte" } else { "bytes" })).build(window, cx)
+                                        })
+                                        .child(Tag::secondary().small().child(payload_size)),
+                                )
                                 .child(Tag::secondary().small().child(format!(
                                     "{} {}",
                                     value.messages,
