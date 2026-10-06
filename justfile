@@ -23,6 +23,7 @@ profile duration_ms='30000':
 
 # Includes sampled CPU stacks; requires host profiling permissions.
 profile-cpu duration_ms='30000':
+    echo 1 | sudo tee /proc/sys/kernel/perf_event_paranoid
     HOTPATH_SHUTDOWN_MS="{{duration_ms}}" {{if os() == "linux" { "setsid -w " } else { "" }}}cargo run --locked --profile profiling --features hotpath,hotpath-alloc,hotpath-cpu
 
 # Run in a second terminal while a profiling build is active.
