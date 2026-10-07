@@ -93,7 +93,6 @@ pub struct TopicValue {
 }
 
 impl TopicValue {
-    #[hotpath::measure(impl_type = "TopicValue")]
     pub fn display_payload(&self) -> String {
         match std::str::from_utf8(&self.payload) {
             Ok(text) => serde_json::from_str::<serde_json::Value>(text)
@@ -179,7 +178,6 @@ impl TopicStore {
     ///
     /// Zero-length publishes remove cached values, matching retained-message deletion.
     /// Empty levels are preserved: `a`, `a/`, `/a` and `a//b` are distinct MQTT topics.
-    #[hotpath::measure(impl_type = "TopicStore")]
     pub fn receive(&mut self, message: Message, now: Instant) -> bool {
         // Brokers normally unset retain when forwarding deletions to existing subscribers.
         if message.payload.is_empty() {

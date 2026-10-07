@@ -20,16 +20,3 @@ run:
 # Refresh bundled themes from the source revision of gpui-kit in Cargo.lock.
 sync-themes:
     python3 scripts/sync_themes.py
-
-# Optimized timing/allocation report; duration is milliseconds (0 waits for window close).
-profile duration_ms='30000':
-    HOTPATH_SHUTDOWN_MS="{{duration_ms}}" cargo run --locked --profile profiling --features hotpath,hotpath-alloc
-
-# Includes sampled CPU stacks; requires host profiling permissions.
-profile-cpu duration_ms='30000':
-    echo 1 | sudo tee /proc/sys/kernel/perf_event_paranoid
-    HOTPATH_SHUTDOWN_MS="{{duration_ms}}" {{if os() == "linux" { "setsid -w " } else { "" }}}cargo run --locked --profile profiling --features hotpath,hotpath-alloc,hotpath-cpu
-
-# Run in a second terminal while a profiling build is active.
-profile-console:
-    hotpath console

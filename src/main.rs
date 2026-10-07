@@ -16,7 +16,6 @@ fn init_logging() {
     }
 }
 
-#[hotpath::main]
 fn main() {
     init_logging();
     gpui_kit::application().with_assets(gpui_kit::assets::AllAssets).run(|cx| {

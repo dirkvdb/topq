@@ -646,7 +646,6 @@ impl Explorer {
         cx.notify();
     }
 
-    #[hotpath::measure(impl_type = "Explorer")]
     fn apply_broker_events(&mut self, events: impl IntoIterator<Item = BrokerEvent>, window: &mut Window, cx: &mut Context<Self>) {
         let now = Instant::now();
         let mut tree_changed = false;
@@ -758,7 +757,6 @@ impl Explorer {
         });
     }
 
-    #[hotpath::measure(impl_type = "Explorer")]
     fn refresh_animation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let now = Instant::now();
         self.payload_highlight.refresh(now, cx);
@@ -784,7 +782,6 @@ impl Explorer {
         paths
     }
 
-    #[hotpath::measure(impl_type = "Explorer")]
     fn sync_tree(&mut self, cx: &mut Context<Self>) {
         // Children sort after their prefix, so reverse order builds complete roots
         // without recursing through broker-controlled topic depth.
@@ -1357,7 +1354,6 @@ impl Explorer {
             })
     }
 
-    #[hotpath::measure(impl_type = "Explorer")]
     fn details(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mut panel = div().id("details-pane").test_support().v_flex().size_full().min_h_0().min_w_0();
         let Some(path) = &self.selected else {
@@ -1683,7 +1679,6 @@ impl Explorer {
 }
 
 impl Render for Explorer {
-    #[hotpath::measure(impl_type = "Explorer")]
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.restore_publish_height && self.publish_open && !self.show_config {
             self.restore_publish_height = false;

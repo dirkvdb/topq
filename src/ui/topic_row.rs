@@ -159,7 +159,6 @@ impl TopicRow {
 }
 
 impl Render for TopicRow {
-    #[hotpath::measure(impl_type = "TopicRow")]
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         #[cfg(test)]
         {

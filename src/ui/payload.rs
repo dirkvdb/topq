@@ -51,7 +51,6 @@ impl PayloadHighlight {
         self.collection.clear(cx);
     }
 
-    #[hotpath::measure(impl_type = "PayloadHighlight")]
     pub(super) fn refresh(&mut self, now: Instant, cx: &mut App) {
         let Some((started, _)) = self.pulse else { return };
         if Appearance::motion_reduced(cx) || now.saturating_duration_since(started) >= FLASH_DURATION {
@@ -307,7 +306,6 @@ impl Explorer {
         self.payload_highlight.clear(cx);
     }
 
-    #[hotpath::measure(impl_type = "Explorer")]
     pub(super) fn refresh_details(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let value = self
             .selected
