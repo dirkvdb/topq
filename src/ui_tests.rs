@@ -3533,6 +3533,140 @@ fn appearance_menus_support_keyboard_selection_dismissal_and_saved_preferences(c
 }
 
 #[gpui_kit::test]
+fn appearance_menus_load_custom_themes_created_after_opening_explorer_and_save_selection(cx: &mut TestAppContext) {
+    use std::fs;
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("appearance.json");
+    let themes_directory = config::config_path().unwrap().with_file_name("themes");
+    let (handle, view) = open(cx, true, 760., 540.);
+    cx.update(|cx| {
+        cx.set_global(crate::appearance::load(&path, cx).unwrap());
+        for name in ["AAA Custom Light", "AAA Custom Dark"] {
+            assert!(
+                gpui_kit::component::ThemeRegistry::global(cx)
+                    .sorted_themes()
+                    .iter()
+                    .all(|theme| theme.name != name)
+            );
+        }
+    });
+    cx.update_window(handle, |_, window, cx| {
+        crate::appearance::select_mode(AppearanceMode::Light, window, cx).unwrap();
+        window.render_frame(cx);
+        window.click("settings-section-appearance", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    // Write only after Explorer is open, so startup theme loading cannot satisfy the test.
+    fs::create_dir_all(themes_directory.parent().unwrap()).unwrap();
+    fs::create_dir(&themes_directory).unwrap();
+    fs::write(themes_directory.join("broken.json"), "invalid JSON").unwrap();
+    for (file, name, mode) in [
+        ("light.json", "AAA Custom Light", "light"),
+        ("dark.json", "AAA Custom Dark", "dark"),
+    ] {
+        fs::write(
+            themes_directory.join(file),
+            serde_json::to_vec(&serde_json::json!({
+                "name": name,
+                "themes": [{"name": name, "mode": mode, "colors": {}}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    for (id, mode, name, other_name, preference) in [
+        (
+            "light-theme",
+            ThemeMode::Light,
+            "AAA Custom Light",
+            "AAA Custom Dark",
+            "light_theme",
+        ),
+        ("dark-theme", ThemeMode::Dark, "AAA Custom Dark", "AAA Custom Light", "dark_theme"),
+    ] {
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click(id, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let themes: Vec<_> = gpui_kit::component::ThemeRegistry::global(cx)
+                .sorted_themes()
+                .into_iter()
+                .filter(|theme| theme.mode == mode)
+                .collect();
+            let target = themes.iter().position(|theme| theme.name == name).unwrap();
+            let menu = window.within("popup-menu");
+            for (index, theme) in themes.iter().enumerate() {
+                let item = menu.find(index);
+                assert_eq!(item.label(), Some(theme.name.as_str()));
+                assert_ne!(item.label(), Some(other_name));
+            }
+            assert!(menu.try_find(themes.len()).is_none());
+            assert!(menu.find(target).visible());
+            if mode == ThemeMode::Light {
+                for _ in 0..themes.len() {
+                    window.press("up", cx);
+                    if window.within("popup-menu").find(target).selected() == Some(true) {
+                        break;
+                    }
+                }
+                assert_eq!(window.within("popup-menu").find(target).selected(), Some(true));
+                window.press("enter", cx);
+            } else {
+                window.within("popup-menu").click(target, cx);
+            }
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let label = format!("{} theme: {name}", if mode.is_dark() { "Dark" } else { "Light" });
+            assert_eq!(window.find(id).label(), Some(label.as_str()));
+            assert_eq!(Appearance::selected_theme(mode, cx), name);
+            assert_eq!(Appearance::mode(cx), AppearanceMode::Light);
+            assert_eq!(cx.theme().theme_name().as_str(), "AAA Custom Light");
+            assert!(view.read(cx).error.is_none());
+            assert!(window.try_find("popup-menu").is_none());
+            let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(saved[preference], name);
+        })
+        .unwrap();
+    }
+
+    cx.update_window(handle, |_, window, cx| window.click("appearance-mode", cx))
+        .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.within("popup-menu").click(2usize, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(Appearance::mode(cx), AppearanceMode::Dark);
+        assert_eq!(cx.theme().theme_name().as_str(), "AAA Custom Dark");
+        assert_eq!(window.find("appearance-mode").label(), Some("Mode: Dark"));
+        assert!(window.try_find("popup-menu").is_none());
+    })
+    .unwrap();
+    cx.update(|cx| {
+        cx.set_global(crate::appearance::load(&path, cx).unwrap());
+        assert_eq!(Appearance::mode(cx), AppearanceMode::Dark);
+        assert_eq!(Appearance::selected_theme(ThemeMode::Light, cx), "AAA Custom Light");
+        assert_eq!(Appearance::selected_theme(ThemeMode::Dark, cx), "AAA Custom Dark");
+    });
+    fs::remove_dir_all(&themes_directory).unwrap();
+}
+
+#[gpui_kit::test]
 fn title_bar_picker_lists_saved_servers_and_settings_hold_theme(cx: &mut TestAppContext) {
     let (handle, view) = open(cx, false, 1200., 760.);
     view.update(cx, |view, cx| {

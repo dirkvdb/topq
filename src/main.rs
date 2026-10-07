@@ -1,6 +1,7 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 mod appearance;
+mod bundled_themes;
 mod config;
 mod mqtt;
 mod topics;

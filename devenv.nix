@@ -55,6 +55,7 @@ in
     hotpath
     samply
     just
+    python3
     sccache
     pkg-config
     fontconfig

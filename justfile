@@ -17,6 +17,10 @@ test: test_release
 run:
     cargo run --release
 
+# Refresh bundled themes from the source revision of gpui-kit in Cargo.lock.
+sync-themes:
+    python3 scripts/sync_themes.py
+
 # Optimized timing/allocation report; duration is milliseconds (0 waits for window close).
 profile duration_ms='30000':
     HOTPATH_SHUTDOWN_MS="{{duration_ms}}" cargo run --locked --profile profiling --features hotpath,hotpath-alloc

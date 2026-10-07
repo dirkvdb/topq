@@ -1412,6 +1412,9 @@ impl Explorer {
             .label(label)
             .dropdown_caret(true)
             .dropdown_menu(move |menu, window, cx| {
+                if let Err(error) = appearance::load_custom_themes(cx) {
+                    tracing::error!("Could not load custom themes: {error:#}");
+                }
                 let mut menu = menu
                     .min_w(rems(14.).to_pixels(window.rem_size()))
                     .max_h(rems(24.).to_pixels(window.rem_size()))

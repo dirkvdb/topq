@@ -68,8 +68,8 @@ Appearance settings live alongside connection settings in `config.json`:
 - `light_theme` and `dark_theme`: exact theme names for each mode, not filenames. Defaults are `Ayu Light` and `Ayu Dark`. Missing themes or themes for the wrong mode fall back to the defaults.
 - `reduce_motion`: `system` (default) follows the OS preference, `on` reduces motion, and `off` overrides the OS preference to allow motion.
 
-Place custom theme JSON files in the configuration directory's `themes/` subdirectory. See the [GPUI Kit theme documentation](https://gpui-kit.com/component/theme) for the theme format.
-
+Place custom theme JSON files in `~/.config/topq/themes/` (or `$XDG_CONFIG_HOME/topq/themes/` when set on Linux).
+Theme files use the [GPUI Kit theme format](https://gpui-kit.com/component/theme)
 
 ## Development
 

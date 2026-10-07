@@ -156,15 +156,10 @@ impl Appearance {
 }
 
 pub(crate) fn register_bundled(cx: &mut App) -> Result<()> {
-    for content in [
-        include_str!("../themes/charcoal-grove.json"),
-        include_str!("../themes/ayu.json"),
-        include_str!("../themes/tokyonight.json"),
-        include_str!("../themes/collection.json"),
-    ] {
+    for (name, content) in crate::bundled_themes::THEMES {
         ThemeRegistry::global_mut(cx)
             .load_themes_from_str(content)
-            .context("Could not load a bundled theme.")?;
+            .with_context(|| format!("Could not load bundled theme {name}."))?;
     }
     Ok(())
 }
@@ -173,19 +168,11 @@ pub(crate) fn init(cx: &mut App) {
     if let Err(error) = register_bundled(cx) {
         eprintln!("{error:#}");
     }
-    let mut preferences = match config::config_path() {
-        Ok(path) => {
-            if let Err(error) = load_custom(&path.with_file_name("themes"), cx) {
-                eprintln!("Could not load custom themes: {error:#}");
-            }
-            match config::application_config_read_path() {
-                Ok(settings_path) => load_or_default(&settings_path, cx),
-                Err(error) => {
-                    eprintln!("Could not locate appearance settings: {error:#}");
-                    Appearance::default()
-                }
-            }
-        }
+    if let Err(error) = load_custom_themes(cx) {
+        tracing::error!("Could not load custom themes: {error:#}");
+    }
+    let mut preferences = match config::application_config_read_path() {
+        Ok(path) => load_or_default(&path, cx),
         Err(error) => {
             eprintln!("Could not locate appearance settings: {error:#}");
             Appearance::default()
@@ -251,6 +238,10 @@ fn load_or_default(path: &Path, cx: &App) -> Appearance {
     })
 }
 
+pub(crate) fn load_custom_themes(cx: &mut App) -> Result<()> {
+    load_custom(&config::config_path()?.with_file_name("themes"), cx)
+}
+
 fn load_custom(directory: &Path, cx: &mut App) -> Result<()> {
     let entries = match fs::read_dir(directory) {
         Ok(entries) => entries,
@@ -270,7 +261,7 @@ fn load_custom(directory: &Path, cx: &mut App) -> Result<()> {
             .map_err(anyhow::Error::from)
             .and_then(|content| ThemeRegistry::global_mut(cx).load_themes_from_str(&content));
         if let Err(error) = result {
-            eprintln!("Could not load theme {}: {error:#}", path.display());
+            tracing::error!("Could not load theme {}: {error:#}", path.display());
         }
     }
     Ok(())
@@ -716,10 +707,10 @@ mod tests {
             assert_eq!(saved["reduce_motion"], "system");
             select_mode(AppearanceMode::Dark, window, cx).unwrap();
             assert_eq!(Theme::global(cx).theme_name().as_str(), "Tokyo Night");
-            select_theme(ThemeMode::Dark, "Matrix".into(), window, cx).unwrap();
-            assert_eq!(Theme::global(cx).theme_name().as_str(), "Matrix");
+            select_theme(ThemeMode::Dark, "Gruvbox Dark".into(), window, cx).unwrap();
+            assert_eq!(Theme::global(cx).theme_name().as_str(), "Gruvbox Dark");
             assert_eq!(Appearance::mode(cx), AppearanceMode::Dark);
-            assert_eq!(Theme::global(cx).radius, px(0.));
+            assert_eq!(Theme::global(cx).radius, Theme::default().radius);
             assert_tokens(cx);
         })
         .unwrap();
@@ -734,7 +725,7 @@ mod tests {
         cx.update_window(handle.into(), |_, window, cx| {
             assert_eq!(ThemeMode::from(window.appearance()), ThemeMode::Light);
             select_theme(ThemeMode::Light, "Gruvbox Light".into(), window, cx).unwrap();
-            select_theme(ThemeMode::Dark, "Matrix".into(), window, cx).unwrap();
+            select_theme(ThemeMode::Dark, "Gruvbox Dark".into(), window, cx).unwrap();
             select_mode(AppearanceMode::System, window, cx).unwrap();
             assert_eq!(Appearance::mode(cx), AppearanceMode::System);
             assert_eq!(Theme::global(cx).theme_name().as_str(), "Gruvbox Light");
@@ -962,6 +953,53 @@ mod tests {
             assert_eq!(cx.global::<Appearance>().path.as_deref(), Some(path.as_path()));
         })
         .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn startup_discovers_custom_themes_before_loading_saved_preferences(cx: &mut TestAppContext) {
+        let themes = config::config_path().unwrap().with_file_name("themes");
+        fs::create_dir_all(&themes).unwrap();
+        fs::write(
+            themes.join("custom.json"),
+            r#"{"name":"Custom","themes":[
+                {"name":"Custom Light","mode":"light","colors":{}},
+                {"name":"Custom Dark","mode":"dark","colors":{}}
+            ]}"#,
+        )
+        .unwrap();
+        let settings = config::application_config_read_path().unwrap();
+        fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        fs::write(
+            &settings,
+            r#"{"mode":"dark","light_theme":"Custom Light","dark_theme":"Custom Dark"}"#,
+        )
+        .unwrap();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            init(cx);
+            assert_eq!(Appearance::selected_theme(ThemeMode::Light, cx), "Custom Light");
+            assert_eq!(Appearance::selected_theme(ThemeMode::Dark, cx), "Custom Dark");
+            assert_eq!(Theme::global(cx).theme_name().as_str(), "Custom Dark");
+        });
+        fs::remove_file(settings).unwrap();
+        fs::remove_dir_all(themes).unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn custom_theme_scan_ignores_non_json_files_and_directories(cx: &mut TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        let content = r#"{"name":"Ignored","themes":[{"name":"Ignored Dark","mode":"dark","colors":{}}]}"#;
+        fs::write(directory.path().join("ignored.txt"), content).unwrap();
+        let nested = directory.path().join("nested.json");
+        fs::create_dir(&nested).unwrap();
+        fs::write(nested.join("ignored.json"), content).unwrap();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            let count = ThemeRegistry::global(cx).themes().len();
+            load_custom(directory.path(), cx).unwrap();
+            load_custom(&directory.path().join("missing"), cx).unwrap();
+            assert_eq!(ThemeRegistry::global(cx).themes().len(), count);
+        });
     }
 
     #[gpui_kit::test]
