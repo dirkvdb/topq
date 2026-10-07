@@ -295,11 +295,136 @@ pub(crate) struct SavedConnections {
 }
 
 pub(crate) fn load_connections() -> Result<SavedConnections> {
-    load_connections_from(&config_path()?, &password_entry)
+    load_connections_from(&application_config_read_path()?, &password_entry)
 }
 
 pub(crate) fn save_connections(saved: &SavedConnections) -> Result<()> {
-    save_connections_to(&config_path()?, saved, &password_entry)
+    let config_path = config_path()?;
+    let state_path = state_config_path()?;
+    let source_path = prioritized_config_path(&state_path, &config_path)?;
+    let destination_path = writable_config_path(&config_path, &state_path)?;
+    let result = save_connections_to_with_source(&destination_path, &source_path, saved, &password_entry);
+    if result.as_ref().is_err_and(is_io_error) && destination_path != state_path && config_path_is_writable(&state_path) {
+        return save_connections_to_with_source(&state_path, &source_path, saved, &password_entry)
+            .with_context(|| format!("Configuration cannot be written to {}.", state_path.display()));
+    }
+    match result {
+        Err(error) if is_io_error(&error) && destination_path == state_path => {
+            Err(error).with_context(|| format!("Configuration cannot be written to {}.", state_path.display()))
+        }
+        Err(error) if is_io_error(&error) => Err(error).with_context(|| {
+            format!(
+                "Configuration cannot be written to {} or {}.",
+                config_path.display(),
+                state_path.display()
+            )
+        }),
+        result => result,
+    }
+}
+
+pub(crate) fn application_config_read_path() -> Result<PathBuf> {
+    prioritized_config_path(&state_config_path()?, &config_path()?)
+}
+
+fn state_config_path() -> Result<PathBuf> {
+    Ok(state_path()?.with_file_name("config.json"))
+}
+
+fn prioritized_config_path(state_path: &Path, config_path: &Path) -> Result<PathBuf> {
+    match fs::symlink_metadata(state_path) {
+        Ok(_) => Ok(state_path.to_path_buf()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(config_path.to_path_buf()),
+        Err(error) => Err(error).context("Could not inspect the application state configuration."),
+    }
+}
+
+fn writable_config_path(config_path: &Path, state_path: &Path) -> Result<PathBuf> {
+    let state_exists = match fs::symlink_metadata(state_path) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error).context("Could not inspect the application state configuration."),
+    };
+    if state_exists {
+        return if config_path_is_writable(state_path) {
+            Ok(state_path.to_path_buf())
+        } else {
+            Err(anyhow!(
+                "Configuration cannot be written: {} is not writable.",
+                state_path.display()
+            ))
+        };
+    }
+    if config_path_is_writable(config_path) {
+        return Ok(config_path.to_path_buf());
+    }
+    if config_path_is_writable(state_path) {
+        return Ok(state_path.to_path_buf());
+    }
+    Err(anyhow!(
+        "Configuration cannot be written: neither {} nor {} is writable.",
+        config_path.display(),
+        state_path.display()
+    ))
+}
+
+fn config_path_is_writable(path: &Path) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    if !nearest_existing_directory_is_writable(parent) {
+        return false;
+    }
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            fs::metadata(path).is_ok_and(|target| target.is_file() && permissions_allow_write(&target))
+        }
+        Ok(metadata) => metadata.is_file() && permissions_allow_write(&metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(_) => false,
+    }
+}
+
+fn nearest_existing_directory_is_writable(path: &Path) -> bool {
+    let mut candidate = path;
+    loop {
+        match fs::metadata(candidate) {
+            Ok(metadata) => return metadata.is_dir() && permissions_allow_directory_write(&metadata),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let Some(parent) = candidate.parent() else {
+                    return false;
+                };
+                candidate = parent;
+            }
+            Err(_) => return false,
+        }
+    }
+}
+
+#[cfg(unix)]
+fn permissions_allow_write(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode() & 0o222 != 0
+}
+
+#[cfg(not(unix))]
+fn permissions_allow_write(metadata: &fs::Metadata) -> bool {
+    !metadata.permissions().readonly()
+}
+
+#[cfg(unix)]
+fn permissions_allow_directory_write(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode() & 0o222 != 0 && metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn permissions_allow_directory_write(metadata: &fs::Metadata) -> bool {
+    !metadata.permissions().readonly()
+}
+
+fn is_io_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.downcast_ref::<std::io::Error>().is_some())
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -395,7 +520,17 @@ fn rollback_credentials(
     Ok(())
 }
 
+#[cfg(test)]
 fn save_connections_to(path: &Path, saved: &SavedConnections, entry: &impl Fn(&ConnectionConfig) -> Result<Entry>) -> Result<()> {
+    save_connections_to_with_source(path, path, saved, entry)
+}
+
+fn save_connections_to_with_source(
+    path: &Path,
+    source_path: &Path,
+    saved: &SavedConnections,
+    entry: &impl Fn(&ConnectionConfig) -> Result<Entry>,
+) -> Result<()> {
     if saved.selected.is_some_and(|index| index >= saved.connections.len()) {
         return Err(anyhow!("Selected connection index is out of range."));
     }
@@ -408,7 +543,7 @@ fn save_connections_to(path: &Path, saved: &SavedConnections, entry: &impl Fn(&C
             ));
         }
     }
-    let previous = read_connections(path)?.unwrap_or_default();
+    let previous = read_connections(source_path)?.unwrap_or_default();
     let retained_secrets: HashSet<_> = saved
         .connections
         .iter()
@@ -460,7 +595,7 @@ fn save_connections_to(path: &Path, saved: &SavedConnections, entry: &impl Fn(&C
                 applied.push(index);
             }
         }
-        update_json(path, &stored)
+        update_json_with_fallback(path, (path != source_path).then_some(source_path), &stored)
     })();
     if let Err(error) = result {
         if rollback_credentials(&changes, &applied, entry).is_err() {
@@ -760,16 +895,63 @@ fn write_toml(path: &Path, value: &impl Serialize) -> Result<()> {
 }
 
 pub(crate) fn update_json(path: &Path, value: &impl Serialize) -> Result<()> {
+    update_json_with_fallback(path, None, value)
+}
+
+fn update_json_with_fallback(path: &Path, fallback_path: Option<&Path>, value: &impl Serialize) -> Result<()> {
     if path.file_name().is_none_or(|name| name != "config.json") {
         return write_json(path, value);
     }
-    let mut current = read_config_value(path)?.unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+    let mut current = match read_config_value(path)? {
+        Some(value) => value,
+        None => match fallback_path {
+            Some(fallback_path) => read_config_value(fallback_path)?.unwrap_or_else(empty_config_value),
+            None => empty_config_value(),
+        },
+    };
     let updates = serde_json::to_value(value)?;
     let (Some(current), Some(updates)) = (current.as_object_mut(), updates.as_object()) else {
         return Err(anyhow!("Configuration settings must be JSON objects."));
     };
     current.extend(updates.clone());
     write_json(path, &current)
+}
+
+fn empty_config_value() -> serde_json::Value {
+    serde_json::Value::Object(serde_json::Map::new())
+}
+
+pub(crate) fn update_application_config(preferred_path: &Path, value: &impl Serialize) -> Result<PathBuf> {
+    let config_path = config_path()?;
+    let state_path = state_config_path()?;
+    if preferred_path != config_path && preferred_path != state_path {
+        update_json(preferred_path, value)?;
+        return Ok(preferred_path.to_path_buf());
+    }
+
+    let destination_path = writable_config_path(&config_path, &state_path)?;
+    let source_path = prioritized_config_path(&state_path, &config_path)?;
+    let fallback_path = (destination_path != source_path).then_some(source_path.as_path());
+    match update_json_with_fallback(&destination_path, fallback_path, value) {
+        Ok(()) => Ok(destination_path),
+        Err(error) if destination_path != state_path && is_io_error(&error) && config_path_is_writable(&state_path) => {
+            let fallback_path = prioritized_config_path(&state_path, &config_path)?;
+            update_json_with_fallback(&state_path, Some(&fallback_path), value)
+                .with_context(|| format!("Configuration cannot be written to {}.", state_path.display()))?;
+            Ok(state_path)
+        }
+        Err(error) if destination_path == state_path && is_io_error(&error) => {
+            Err(error).with_context(|| format!("Configuration cannot be written to {}.", state_path.display()))
+        }
+        Err(error) if is_io_error(&error) => Err(error).with_context(|| {
+            format!(
+                "Configuration cannot be written to {} or {}.",
+                config_path.display(),
+                state_path.display()
+            )
+        }),
+        Err(error) => Err(error).with_context(|| format!("Could not write application configuration at {}.", destination_path.display())),
+    }
 }
 
 pub(crate) fn read_config_value(path: &Path) -> Result<Option<serde_json::Value>> {
@@ -1342,6 +1524,110 @@ mod tests {
     #[test]
     fn application_configuration_uses_a_single_config_file() {
         assert_eq!(config_path().unwrap().file_name().unwrap(), "config.json");
+    }
+
+    #[test]
+    fn state_configuration_path_takes_precedence_over_config_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join(".config/topq/config.json");
+        let state = directory.path().join(".local/state/topq/config.json");
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        fs::create_dir_all(state.parent().unwrap()).unwrap();
+        fs::write(&config, r#"{"mode":"dark"}"#).unwrap();
+        fs::write(&state, r#"{"mode":"light"}"#).unwrap();
+
+        assert_eq!(prioritized_config_path(&state, &config).unwrap(), state);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_only_config_file_uses_the_state_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join(".config/topq/config.json");
+        let state = directory.path().join(".local/state/topq/config.json");
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        fs::write(&config, "{}").unwrap();
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o444)).unwrap();
+
+        assert_eq!(writable_config_path(&config, &state).unwrap(), state);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_to_read_only_config_uses_the_state_directory() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join(".config/topq/config.json");
+        let target = directory.path().join("store/config.json");
+        let state = directory.path().join(".local/state/topq/config.json");
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, "{}").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o444)).unwrap();
+        symlink(&target, &config).unwrap();
+
+        assert_eq!(writable_config_path(&config, &state).unwrap(), state);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reports_an_error_when_neither_configuration_path_is_writable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join(".config/topq/config.json");
+        let state = directory.path().join(".local/state/topq/config.json");
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        fs::create_dir_all(state.parent().unwrap()).unwrap();
+        fs::write(&config, "{}").unwrap();
+        fs::write(&state, "{}").unwrap();
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o444)).unwrap();
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o444)).unwrap();
+
+        let error = writable_config_path(&config, &state).unwrap_err();
+        assert!(error.to_string().contains("Configuration cannot be written"));
+        assert!(error.to_string().contains(state.to_str().unwrap()));
+    }
+
+    #[test]
+    fn migrating_config_to_state_preserves_existing_settings() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join(".config/topq/config.json");
+        let state = directory.path().join(".local/state/topq/config.json");
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        fs::write(&config, r#"{"mode":"dark","connections":[]}"#).unwrap();
+
+        update_json_with_fallback(&state, Some(&config), &serde_json::json!({"light_theme":"Ayu Light"})).unwrap();
+
+        let saved = read_config_value(&state).unwrap().unwrap();
+        assert_eq!(saved["mode"], "dark");
+        assert_eq!(saved["connections"], serde_json::json!([]));
+        assert_eq!(saved["light_theme"], "Ayu Light");
+    }
+
+    #[test]
+    fn connection_save_to_state_preserves_config_preferences() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join(".config/topq/config.json");
+        let state = directory.path().join(".local/state/topq/config.json");
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        fs::write(&config, r#"{"mode":"dark","connections":[]}"#).unwrap();
+        let saved = SavedConnections {
+            connections: vec![ConnectionConfig {
+                name: "State connection".into(),
+                ..Default::default()
+            }],
+            selected: Some(0),
+        };
+
+        save_connections_to_with_source(&state, &config, &saved, &mock_entries()).unwrap();
+
+        let value = read_config_value(&state).unwrap().unwrap();
+        assert_eq!(value["mode"], "dark");
+        assert_eq!(value["connections"][0]["name"], "State connection");
     }
 
     #[test]

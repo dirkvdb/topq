@@ -178,7 +178,13 @@ pub(crate) fn init(cx: &mut App) {
             if let Err(error) = load_custom(&path.with_file_name("themes"), cx) {
                 eprintln!("Could not load custom themes: {error:#}");
             }
-            load_or_default(&path, cx)
+            match config::application_config_read_path() {
+                Ok(settings_path) => load_or_default(&settings_path, cx),
+                Err(error) => {
+                    eprintln!("Could not locate appearance settings: {error:#}");
+                    Appearance::default()
+                }
+            }
         }
         Err(error) => {
             eprintln!("Could not locate appearance settings: {error:#}");
@@ -362,12 +368,13 @@ pub(crate) fn set_reduce_motion(reduce_motion: ReduceMotion, cx: &mut App) -> Re
 }
 
 fn save(cx: &mut App) -> Result<()> {
-    let path = match &cx.global::<Appearance>().path {
+    let preferred_path = match &cx.global::<Appearance>().path {
         Some(path) => path.clone(),
         None => config::config_path()?,
     };
-    cx.global_mut::<Appearance>().path = Some(path.clone());
-    config::update_json(&path, cx.global::<Appearance>())
+    let path = config::update_application_config(&preferred_path, cx.global::<Appearance>())?;
+    cx.global_mut::<Appearance>().path = Some(path);
+    Ok(())
 }
 
 pub(crate) fn sync_system(window: &mut Window, cx: &mut App) {
