@@ -1504,34 +1504,37 @@ impl Explorer {
                                     ),
                                 ),
                         )
-                        .when_some(value.properties.content_type(), |metadata, content_type| {
-                            let tooltip_content_type = content_type.to_owned();
-                            metadata.child(
-                                div()
-                                    .id("message-content-type")
-                                    .test_support()
-                                    .aria_label(format!("Content type: {content_type}"))
-                                    .h_flex()
-                                    .flex_none()
-                                    .min_w_0()
-                                    .gap_2()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(div().flex_none().child("Content type"))
-                                    .child(
-                                        Tag::secondary().small().min_w_0().child(
-                                            div()
-                                                .id("message-content-type-value")
-                                                .test_support()
-                                                .aria_label(content_type.to_owned())
-                                                .min_w_0()
-                                                .truncate()
-                                                .tooltip(move |window, cx| Tooltip::new(tooltip_content_type.clone()).build(window, cx))
-                                                .child(content_type.to_owned()),
+                        .when_some(
+                            value.properties.content_type().filter(|_| self.payload_format != "Image"),
+                            |metadata, content_type| {
+                                let tooltip_content_type = content_type.to_owned();
+                                metadata.child(
+                                    div()
+                                        .id("message-content-type")
+                                        .test_support()
+                                        .aria_label(format!("Content type: {content_type}"))
+                                        .h_flex()
+                                        .flex_none()
+                                        .min_w_0()
+                                        .gap_2()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(div().flex_none().child("Content type"))
+                                        .child(
+                                            Tag::secondary().small().min_w_0().child(
+                                                div()
+                                                    .id("message-content-type-value")
+                                                    .test_support()
+                                                    .aria_label(content_type.to_owned())
+                                                    .min_w_0()
+                                                    .truncate()
+                                                    .tooltip(move |window, cx| Tooltip::new(tooltip_content_type.clone()).build(window, cx))
+                                                    .child(content_type.to_owned()),
+                                            ),
                                         ),
-                                    ),
-                            )
-                        }),
+                                )
+                            },
+                        ),
                 )
                 .child(
                     div()

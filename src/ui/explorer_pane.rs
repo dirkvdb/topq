@@ -466,6 +466,7 @@ mod tests {
                             content_type.is_some_and(|content_type| content_type.trim().to_ascii_lowercase().starts_with("image/"));
                         if is_image {
                             assert_eq!(explorer.payload_format, "Image");
+                            assert!(window.try_find("message-content-type").is_none());
                             let badge = window.find("payload-format");
                             assert_eq!(badge.label(), content_type);
                             assert!(badge.visible());
