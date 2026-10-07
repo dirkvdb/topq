@@ -7,7 +7,7 @@ description = "A minimal MQTT explorer built with GPUI Kit"
 [package.metadata.bundle]
 name = "TopQ"
 identifier = "app.topq"
-icon = ["dist/build/icon_512x512.png", "dist/build/icon_512x512@2x.png"]
+icon = ["dist/icon_512x512.png", "dist/icon_512x512@2x.png"]
 category = "Developer Tool"
 
 [dependencies]

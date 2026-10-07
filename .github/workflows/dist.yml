@@ -12,12 +12,12 @@ jobs:
   macos:
     runs-on: macos-latest
     timeout-minutes: 45
+    env:
+      MISE_DEFAULT_CONFIG_FILENAME: dist/mise.toml
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Install just
-        run: brew install just
 
       - name: Install Metal toolchain
         run: xcodebuild -downloadComponent MetalToolchain
@@ -27,11 +27,11 @@ jobs:
         with:
           version: 2026.10.4
           mise_dir: ${{ runner.temp }}/mise
-          working_directory: dist
+
           cache: false
 
       - name: Build macOS bundle
-        run: just dmg
+        run: mise exec -- just dmg
         env:
           MISE_BIN: ${{ runner.temp }}/mise/bin/mise
 
@@ -40,4 +40,36 @@ jobs:
         with:
           name: TopQ-macOS-${{ runner.arch }}
           path: dist/build/release/bundle/dmg/TopQ.dmg
+          if-no-files-found: error
+
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      MISE_DEFAULT_CONFIG_FILENAME: dist/mise.windows.toml
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+
+      - name: Set up MSVC compiler
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Set up mise and packaging tools
+        uses: jdx/mise-action@v4
+        with:
+          version: 2026.10.4
+          mise_dir: ${{ runner.temp }}/mise
+          cache: false
+
+      - name: Build Windows MSI
+        run: mise exec -- just msi
+
+      - name: Upload Windows MSI
+        uses: actions/upload-artifact@v4
+        with:
+          name: TopQ-Windows-${{ runner.arch }}
+          path: dist/build/release/bundle/wxsmsi/bin/Release/topq.msi
           if-no-files-found: error
