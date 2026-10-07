@@ -105,6 +105,9 @@ cargo-bundle 0.12.0's hardcoded 32-bit `ProgramFilesFolder` to
 `ProgramFiles64Folder` before WiX compilation. This avoids ICE80 while keeping
 MSI validation enabled and using the prebuilt cargo-bundle tool. The correction
 runs after each regeneration of `installer.wxs`; repeated builds are also safe.
+It updates the directory in the generated `<Fragment>`, verifies the resulting
+parent directory, and fails explicitly if the expected structure changes. A
+`TopQ MSI: x64 installation directory verified` message confirms the fix ran.
 Cargo-bundle's separate ICE69 shortcut component-reference warnings may remain.
 
 ## Linux AppImage

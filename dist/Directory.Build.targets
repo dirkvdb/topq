@@ -9,7 +9,15 @@
           Condition="'$(MSBuildProjectName)' == 'installer' and '$(MSBuildProjectExtension)' == '.wixproj'">
     <XmlPoke XmlInputPath="$(MSBuildProjectDirectory)/installer.wxs"
              Namespaces="&lt;Namespace Prefix='w' Uri='http://wixtoolset.org/schemas/v4/wxs' /&gt;"
-             Query="/w:Wix/w:Package/w:StandardDirectory[w:Directory[@Id='INSTALLFOLDER']]/@Id"
+             Query="/w:Wix/w:Fragment/w:StandardDirectory[w:Directory[@Id='INSTALLFOLDER']]/@Id"
              Value="ProgramFiles64Folder" />
+    <XmlPeek XmlInputPath="$(MSBuildProjectDirectory)/installer.wxs"
+             Namespaces="&lt;Namespace Prefix='w' Uri='http://wixtoolset.org/schemas/v4/wxs' /&gt;"
+             Query="/w:Wix/w:Fragment/w:StandardDirectory[w:Directory[@Id='INSTALLFOLDER']]/@Id">
+      <Output TaskParameter="Result" ItemName="_TopqInstallDirectory" />
+    </XmlPeek>
+    <Error Condition="'@(_TopqInstallDirectory)' != 'ProgramFiles64Folder'"
+           Text="Could not correct cargo-bundle's INSTALLFOLDER parent to ProgramFiles64Folder. Check the generated installer.wxs structure." />
+    <Message Importance="high" Text="TopQ MSI: x64 installation directory verified (ProgramFiles64Folder)." />
   </Target>
 </Project>
