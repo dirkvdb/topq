@@ -17,7 +17,8 @@ test: test_release
 run:
     cargo run --release
 
-set windows-shell := ["pwsh", "-NoLogo", "-NoProfile", "-Command"]
+[windows]
+set shell := ["pwsh", "-NoLogo", "-NoProfile", "-Command"]
 
 # mise must be installed outside devenv; MISE_BIN can select an absolute executable.
 mise_bin := env("MISE_BIN", "mise")
@@ -43,6 +44,12 @@ dmg:
 msi:
     mise exec -- cargo build --release --locked --bin topq
     mise exec -- cargo bundle --release --format wxsmsi --binary-path dist/build/release/topq.exe
+
+# Linux: select dist/mise.linux.toml via MISE_DEFAULT_CONFIG_FILENAME.
+appimage:
+    mise exec -- cargo build --release --locked --bin topq
+    mise exec -- cargo bundle --release --format appimage --binary-path dist/build/release/topq
+    chmod +x dist/build/release/bundle/appimage/*.AppImage
 
 # Refresh bundled themes from the source revision of gpui-kit in Cargo.lock.
 sync-themes:

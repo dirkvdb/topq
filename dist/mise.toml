@@ -1,6 +1,11 @@
 # Native macOS packaging tools; devenv remains the development environment.
+[settings]
+cargo.binstall = true
+cargo.binstall_quickinstall = true
+
 [tools]
-just = "1.51.0"
+cargo-binstall = "1.25.2"
+just = "1.56.0"
 rust = { version = "1.95.0", profile = "minimal" }
 "cargo:cargo-bundle" = { version = "0.12.0", locked = true }
 

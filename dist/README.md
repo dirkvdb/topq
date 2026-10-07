@@ -1,6 +1,7 @@
 # Packaging
 
-Packaging uses mise-managed just 1.51.0, Rust 1.95.0, and cargo-bundle 0.12.0. Cargo-bundle
+Packaging uses mise-managed just 1.56.0, Rust 1.95.0, cargo-binstall 1.25.2,
+and cargo-bundle 0.12.0. Cargo-bundle
 provides app and DMG generation; cargo-packager offers an updater but is not
 needed for this workflow. Cargo-dist is aimed at broader release automation.
 
@@ -20,7 +21,15 @@ Once installed, `mise exec -- just setup-macos` can refresh tools using the same
 configuration selection. There is no separate just installation.
 
 Build commands are directly in the justfile; there are no packaging helper
-scripts. Mise downloads the tools and may compile cargo-bundle.
+scripts. All three platform configs install cargo-binstall before Cargo-backed
+tools. Mise uses it to prefer prebuilt cargo-bundle binaries from upstream
+releases, with third-party [cargo-quickinstall](https://github.com/cargo-bins/cargo-quickinstall)
+artifacts also enabled to increase binary availability. This trusts that service's
+builds in addition to upstream releases; set `cargo.binstall_quickinstall = false`
+in the selected config to use only upstream binaries. If no compatible binary is
+available, mise falls back to `cargo install` with the lockfile. Other binstall
+errors still fail setup. Just, Rust, .NET, and cargo-binstall itself are downloaded
+rather than compiled. This speeds tool setup, not compilation of TopQ.
 
 Both recipes start mise with a clean environment, without inherited devenv/Nix
 compiler wrappers, SDK overrides, or linker flags. The packaging config is
@@ -81,15 +90,54 @@ PowerShell session at the repository root, select `dist/mise.windows.toml` using
 `MISE_DEFAULT_CONFIG_FILENAME`, trust that configuration, run `mise install`,
 and then `mise exec -- just msi`.
 
-The workflow uses mise for portable tools on both platforms. Apple's Metal SDK
-and Windows' MSVC environment remain platform-specific setup steps.
+The workflow uses mise for portable tools on all platforms. Apple's Metal SDK,
+Windows' MSVC environment, and Linux's native build libraries remain
+platform-specific setup steps.
 
 Windows uses cargo-bundle's WiX-backed `wxsmsi` format rather than its experimental
 built-in MSI database generator. Cargo-bundle downloads WiX 6.0.2 through NuGet
 when building the installer. This backend adds shortcuts and upgrade handling,
 and includes DLLs placed alongside the executable. The MSI is unsigned.
 
-Both platforms use the prepared icons in `dist/`. To regenerate them from
+`dist/Directory.Build.targets` is automatically imported by the generated WiX
+project beneath `dist/build/`. It selects the x64 installer platform and corrects
+cargo-bundle 0.12.0's hardcoded 32-bit `ProgramFilesFolder` to
+`ProgramFiles64Folder` before WiX compilation. This avoids ICE80 while keeping
+MSI validation enabled and using the prebuilt cargo-bundle tool. The correction
+runs after each regeneration of `installer.wxs`; repeated builds are also safe.
+Cargo-bundle's separate ICE69 shortcut component-reference warnings may remain.
+
+## Linux AppImage
+
+The Linux job builds on Ubuntu 22.04 (x86_64), with mise-managed just, Rust and
+cargo-bundle from `dist/mise.linux.toml`. It installs native compiler, Fontconfig,
+X11/XCB, Wayland, Vulkan and OpenSSL development packages through apt, then runs
+`mise exec -- just appimage`.
+
+The output is `dist/build/release/bundle/appimage/topq_0.1.0_x86_64.AppImage`
+(the version comes from `Cargo.toml`). For a local Linux build, select
+`dist/mise.linux.toml` using `MISE_DEFAULT_CONFIG_FILENAME`, trust the config,
+install the native dependencies listed in the workflow, run `mise install`, and
+then `mise exec -- just appimage` outside devenv.
+
+After downloading the workflow artifact, extract it and mark the AppImage
+executable before launching:
+
+```sh
+chmod +x topq_0.1.0_x86_64.AppImage
+./topq_0.1.0_x86_64.AppImage
+```
+
+Cargo-bundle downloads the official AppImage runtime and packages the executable,
+icons and desktop entry. It does not automatically collect shared libraries;
+compatible system libraries (including Fontconfig/XCB/XKB), a working Vulkan
+GPU driver, and a desktop session are still required. Building on Ubuntu 22.04
+does not guarantee compatibility with older distributions. Systems without FUSE
+can use the runtime's `--appimage-extract-and-run` option. The AppImage is unsigned.
+
+## Shared icons
+
+All platforms use the prepared icons in `dist/`. To regenerate them from
 `data/icon.png` on macOS:
 
 ```sh

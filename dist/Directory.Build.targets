@@ -1,0 +1,15 @@
+<Project>
+  <PropertyGroup Condition="'$(MSBuildProjectName)' == 'installer' and '$(MSBuildProjectExtension)' == '.wixproj'">
+    <InstallerPlatform>x64</InstallerPlatform>
+  </PropertyGroup>
+
+  <!-- cargo-bundle 0.12.0 generates a 32-bit install directory for the x64 app. -->
+  <Target Name="FixCargoBundleInstallDirectory"
+          BeforeTargets="CoreCompile"
+          Condition="'$(MSBuildProjectName)' == 'installer' and '$(MSBuildProjectExtension)' == '.wixproj'">
+    <XmlPoke XmlInputPath="$(MSBuildProjectDirectory)/installer.wxs"
+             Namespaces="&lt;Namespace Prefix='w' Uri='http://wixtoolset.org/schemas/v4/wxs' /&gt;"
+             Query="/w:Wix/w:Package/w:StandardDirectory[w:Directory[@Id='INSTALLFOLDER']]/@Id"
+             Value="ProgramFiles64Folder" />
+  </Target>
+</Project>

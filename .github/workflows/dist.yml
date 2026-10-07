@@ -72,3 +72,33 @@ jobs:
           name: TopQ-Windows-${{ runner.arch }}
           path: dist/build/release/bundle/wxsmsi/bin/Release/topq.msi
           if-no-files-found: error
+
+  linux:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    env:
+      MISE_DEFAULT_CONFIG_FILENAME: dist/mise.linux.toml
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends build-essential clang libclang-dev pkg-config libssl-dev libfontconfig1-dev libfreetype6-dev libx11-dev libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcb-xkb-dev libxcb-randr0-dev libxcb-sync-dev libwayland-dev libvulkan-dev
+
+      - name: Set up mise and packaging tools
+        uses: jdx/mise-action@v4
+        with:
+          version: 2026.10.4
+          cache: false
+
+      - name: Build Linux AppImage
+        run: mise exec -- just appimage
+
+      - name: Upload Linux AppImage
+        uses: actions/upload-artifact@v6
+        with:
+          name: TopQ-Linux-${{ runner.arch }}
+          path: dist/build/release/bundle/appimage/*.AppImage
+          if-no-files-found: error

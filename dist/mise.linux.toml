@@ -1,13 +1,11 @@
-# Native Windows packaging tools; use the runner's MSVC compiler and SDK.
+# Native Linux packaging tools; native libraries come from the host distribution.
 [settings]
 cargo.binstall = true
 cargo.binstall_quickinstall = true
-dotnet.isolated = true
 
 [tools]
 cargo-binstall = "1.25.2"
 just = "1.56.0"
-dotnet = "8"
 rust = { version = "1.95.0", profile = "minimal" }
 "cargo:cargo-bundle" = { version = "0.12.0", locked = true }
 
