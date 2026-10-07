@@ -16,7 +16,7 @@ jobs:
       MISE_DEFAULT_CONFIG_FILENAME: dist/mise.toml
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
 
       - name: Install Metal toolchain
@@ -36,7 +36,7 @@ jobs:
           MISE_BIN: ${{ runner.temp }}/mise/bin/mise
 
       - name: Upload macOS DMG
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: TopQ-macOS-${{ runner.arch }}
           path: dist/build/release/bundle/dmg/TopQ.dmg
@@ -49,7 +49,7 @@ jobs:
       MISE_DEFAULT_CONFIG_FILENAME: dist/mise.windows.toml
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
 
       - name: Set up MSVC compiler
@@ -61,14 +61,13 @@ jobs:
         uses: jdx/mise-action@v4
         with:
           version: 2026.10.4
-          mise_dir: ${{ runner.temp }}/mise
           cache: false
 
       - name: Build Windows MSI
         run: mise exec -- just msi
 
       - name: Upload Windows MSI
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: TopQ-Windows-${{ runner.arch }}
           path: dist/build/release/bundle/wxsmsi/bin/Release/topq.msi
