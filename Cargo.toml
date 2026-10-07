@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2024"
 description = "A minimal MQTT explorer built with GPUI Kit"
 
+[package.metadata.bundle]
+name = "TopQ"
+identifier = "app.topq"
+icon = ["dist/build/icon_512x512.png", "dist/build/icon_512x512@2x.png"]
+category = "Developer Tool"
+
 [dependencies]
 anyhow = "1"
 anstyle-parse = "1"

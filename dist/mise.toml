@@ -1,0 +1,12 @@
+# Native macOS packaging tools; devenv remains the development environment.
+[tools]
+rust = { version = "1.95.0", profile = "minimal" }
+"cargo:cargo-bundle" = { version = "0.12.0", locked = true }
+
+[env]
+# Keep mise's rustup installation and Cargo config/cache separate from user tools.
+RUSTUP_HOME = "{{config_root}}/build/rustup-home"
+CARGO_HOME = "{{config_root}}/build/cargo-home"
+CARGO_TARGET_DIR = "{{config_root}}/build"
+CC = "/usr/bin/clang"
+CXX = "/usr/bin/clang++"
