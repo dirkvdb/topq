@@ -7,7 +7,8 @@ cargo.binstall_quickinstall = true
 cargo-binstall = "1.25.2"
 just = "1.56.0"
 rust = { version = "1.95.0", profile = "minimal" }
-"cargo:cargo-bundle" = { version = "0.12.0", locked = true }
+# 0.12.0's AppImage writer emits a SquashFS root with mode 000.
+"cargo:cargo-bundle" = { version = "0.11.0", locked = true }
 
 [env]
 RUSTUP_HOME = "{{config_root}}/build/rustup-home"

@@ -86,7 +86,7 @@ jobs:
       - name: Install native build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends build-essential clang libclang-dev pkg-config libssl-dev libfontconfig1-dev libfreetype6-dev libx11-dev libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcb-xkb-dev libxcb-randr0-dev libxcb-sync-dev libwayland-dev libvulkan-dev
+          sudo apt-get install --yes --no-install-recommends build-essential clang libclang-dev pkg-config squashfs-tools libssl-dev libfontconfig1-dev libfreetype6-dev libx11-dev libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcb-xkb-dev libxcb-randr0-dev libxcb-sync-dev libwayland-dev libvulkan-dev
 
       - name: Set up mise and packaging tools
         uses: jdx/mise-action@v4
@@ -96,6 +96,15 @@ jobs:
 
       - name: Build Linux AppImage
         run: mise exec -- just appimage
+
+      - name: Verify AppImage root permissions
+        run: |
+          for image in dist/build/release/bundle/appimage/*.AppImage; do
+            test -f "$image"
+            offset=$("$image" --appimage-offset)
+            root=$(unsquashfs -ll -offset "$offset" "$image" | sed -n '1p')
+            [[ "$root" == "drwxr-xr-x "*" squashfs-root" ]] || { echo "Invalid AppImage root permissions: $root" >&2; exit 1; }
+          done
 
       - name: Upload Linux AppImage
         uses: actions/upload-artifact@v6

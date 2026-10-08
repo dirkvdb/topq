@@ -1,7 +1,7 @@
 # Packaging
 
 Packaging uses mise-managed just 1.56.0, Rust 1.95.0, cargo-binstall 1.25.2,
-and cargo-bundle 0.12.0. Cargo-bundle
+and cargo-bundle (0.12.0 for macOS/Windows, 0.11.0 for Linux). Cargo-bundle
 provides app and DMG generation; cargo-packager offers an updater but is not
 needed for this workflow. Cargo-dist is aimed at broader release automation.
 
@@ -114,28 +114,33 @@ Cargo-bundle's separate ICE69 shortcut component-reference warnings may remain.
 ## Linux AppImage
 
 The Linux job builds on Ubuntu 22.04 (x86_64), with mise-managed just, Rust and
-cargo-bundle from `dist/mise.linux.toml`. It installs native compiler, Fontconfig,
-X11/XCB, Wayland, Vulkan and OpenSSL development packages through apt, then runs
-`mise exec -- just appimage`.
+cargo-bundle 0.11.0 from `dist/mise.linux.toml`. It installs native compiler, Fontconfig,
+X11/XCB, Wayland, Vulkan and OpenSSL development packages and `squashfs-tools`
+through apt, then runs `mise exec -- just appimage`.
 
 The output is `dist/build/release/bundle/appimage/topq_0.1.0_x86_64.AppImage`
 (the version comes from `Cargo.toml`). For a local Linux build, select
 `dist/mise.linux.toml` using `MISE_DEFAULT_CONFIG_FILENAME`, trust the config,
-install the native dependencies listed in the workflow, run `mise install`, and
-then `mise exec -- just appimage` outside devenv.
+install the native dependencies (including `squashfs-tools`) listed in the workflow,
+run `mise install`, and then `mise exec -- just appimage` outside devenv.
 
-After downloading the workflow artifact, extract it and mark the AppImage
-executable before launching:
+After downloading the workflow artifact, extract it. GitHub's artifact ZIP may
+lose the *outer file's* executable bit, so for direct execution use:
 
 ```sh
 chmod +x topq_0.1.0_x86_64.AppImage
 ./topq_0.1.0_x86_64.AppImage
 ```
 
-Cargo-bundle downloads the official AppImage runtime and packages the executable,
-icons and desktop entry. It does not automatically collect shared libraries;
-compatible system libraries (including Fontconfig/XCB/XKB), a working Vulkan
-GPU driver, and a desktop session are still required. Building on Ubuntu 22.04
+`appimage-run topq_0.1.0_x86_64.AppImage` works without that outer-file
+`chmod`; the build fixes the embedded permissions independently.
+
+Cargo-bundle 0.11.0 creates the AppImage with `mksquashfs`; 0.12.0's new
+pure-Rust writer instead records mode `000` for the SquashFS root, preventing
+launch. CI checks the packaged root permissions before uploading. Version 0.11.0
+does not automatically collect shared libraries: compatible system libraries
+(including Fontconfig/XCB/XKB), a working Vulkan GPU driver, and a desktop
+session are still required. Building on Ubuntu 22.04
 does not guarantee compatibility with older distributions. Systems without FUSE
 can use the runtime's `--appimage-extract-and-run` option. The AppImage is unsigned.
 

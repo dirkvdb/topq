@@ -46,10 +46,10 @@ msi:
     mise exec -- cargo bundle --release --format wxsmsi --binary-path dist/build/release/topq.exe
 
 # Linux: select dist/mise.linux.toml via MISE_DEFAULT_CONFIG_FILENAME.
+# cargo-bundle 0.11 locates the binary via CARGO_TARGET_DIR (no --binary-path flag).
 appimage:
     mise exec -- cargo build --release --locked --bin topq
-    mise exec -- cargo bundle --release --format appimage --binary-path dist/build/release/topq
-    chmod +x dist/build/release/bundle/appimage/*.AppImage
+    CARGO_BUNDLE_SKIP_BUILD=1 mise exec -- cargo bundle --release --format appimage
 
 # Refresh bundled themes from the source revision of gpui-kit in Cargo.lock.
 sync-themes:
