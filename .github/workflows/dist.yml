@@ -53,7 +53,7 @@ jobs:
 
 
       - name: Set up MSVC compiler
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: TheMrMilchmann/setup-msvc-dev@v4
         with:
           arch: x64
 
@@ -66,11 +66,12 @@ jobs:
       - name: Build Windows MSI
         run: mise exec -- just msi
 
+
       - name: Upload Windows MSI
         uses: actions/upload-artifact@v6
         with:
           name: TopQ-Windows-${{ runner.arch }}
-          path: dist/build/release/bundle/wxsmsi/bin/Release/topq.msi
+          path: dist/build/release/bundle/wxsmsi/bin/x64/Release/topq.msi
           if-no-files-found: error
 
   linux:

@@ -82,7 +82,8 @@ The distribution workflow also runs on `windows-latest`, with an x64 MSVC
 environment and mise-managed just, Rust, cargo-bundle, and .NET 8 from
 `dist/mise.windows.toml`. The .NET SDK uses isolated mode so other installed SDKs
 do not override the selected version. It runs
-`mise exec -- just msi` and uploads `dist/build/release/bundle/wxsmsi/bin/Release/topq.msi`.
+`mise exec -- just msi` and uploads the MSI generated under
+`dist/build/release/bundle/wxsmsi/bin` (currently `bin/x64/Release/topq.msi`).
 
 For a local Windows build, install mise and Visual Studio's C++ build tools.
 Mise installs just, Rust, cargo-bundle, and the .NET 8 SDK for you. From a Developer
