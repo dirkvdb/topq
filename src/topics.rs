@@ -113,21 +113,6 @@ impl TopicValue {
             }
         }
     }
-
-    pub fn preview(&self) -> String {
-        match std::str::from_utf8(&self.payload) {
-            Ok(text) => text.chars().take(100).map(|ch| if ch.is_control() { ' ' } else { ch }).collect(),
-            Err(_) => format!("<{} binary bytes>", self.payload.len()),
-        }
-    }
-
-    pub fn format_label(&self) -> &'static str {
-        match std::str::from_utf8(&self.payload) {
-            Ok(text) if serde_json::from_str::<serde_json::Value>(text).is_ok() => "JSON",
-            Ok(_) => "Text",
-            Err(_) => "Binary · hex",
-        }
-    }
 }
 
 #[derive(Default)]

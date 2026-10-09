@@ -12,7 +12,7 @@ use gpui_kit::{AppContext, Bounds, WindowBounds, WindowOptions, px, size};
 fn init_logging() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
     if let Err(error) = tracing_subscriber::fmt().with_env_filter(filter).try_init() {
-        eprintln!("Could not initialize console logging: {error}");
+        eprintln!("app.logging.init_failed: {error}");
     }
 }
 
@@ -42,7 +42,7 @@ fn main() {
                 cx.new(|cx| ui::Explorer::new(window, cx))
             },
         ) {
-            tracing::error!(error = %format_args!("{error:#}"), "Could not open the TopQ window");
+            tracing::error!(error = %format_args!("{error:#}"), "app.window.open_failed");
             cx.quit();
             return;
         }

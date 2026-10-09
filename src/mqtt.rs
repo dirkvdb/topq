@@ -3,6 +3,7 @@
 use std::{
     cell::RefCell,
     collections::{HashSet, VecDeque},
+    fmt,
     rc::Rc,
     sync::{
         Arc,
@@ -11,7 +12,6 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result, ensure};
 use chrono::Local;
 
 use rumqttc::tokio_rustls::rustls::{
@@ -21,7 +21,7 @@ use rumqttc::tokio_rustls::rustls::{
     pki_types::{CertificateDer, ServerName, UnixTime},
 };
 use rumqttc::v5::{
-    AsyncClient, Event, MqttOptions,
+    AsyncClient, ClientError, ConnectionError, Event, MqttOptions, StateError,
     mqttbytes::{
         QoS,
         v5::{
@@ -31,20 +31,329 @@ use rumqttc::v5::{
     },
 };
 use rumqttc::{Outgoing, Transport};
+use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
-    config::ConnectionConfig,
+    config::{ConnectionConfig, ConnectionValidationError},
     topics::{Message, MessageProperties},
 };
+
+/// MQTT failures carry data for localization; `Display` is a stable diagnostic code only.
+/// `Debug` includes only allowlisted metadata, never payloads, topics, broker prose or raw sources.
+/// Retained dependency sources and broker reason strings are sensitive: do not log or display them.
+pub enum MqttError {
+    Validation(ConnectionValidationError),
+    MissingPassword,
+    TopicEmpty,
+    TopicWildcard,
+    TopicTooLong {
+        length: usize,
+        limit: usize,
+    },
+    TopicNull,
+    ContentTypeTooLong {
+        length: usize,
+        limit: usize,
+    },
+    ContentTypeNull,
+    PublishQosUnsupported {
+        requested: u8,
+        maximum: u8,
+    },
+    RetainUnsupported,
+    PublishPacketTooLarge {
+        size: usize,
+        limit: u32,
+    },
+    SubscriptionPacketTooLarge {
+        size: usize,
+        limit: u32,
+    },
+    CommandQueueFull,
+    WorkerStopped,
+    RuntimeCreation {
+        source: std::io::Error,
+    },
+    WorkerStart {
+        source: std::io::Error,
+    },
+    TestRuntimeCreation {
+        source: std::io::Error,
+    },
+    TestWorkerStart {
+        source: std::io::Error,
+    },
+    ConnectionTestTimeout {
+        seconds: u64,
+    },
+    TrustedCertificatesUnavailable,
+    TlsConfiguration {
+        source: rustls::Error,
+    },
+    PublishQueue {
+        source: Box<ClientError>,
+    },
+    DeletionQueue {
+        source: Box<ClientError>,
+    },
+    SubscriptionQueue {
+        source: Box<ClientError>,
+    },
+    PublishDisconnected,
+    DeletionDisconnected,
+    PublishInterrupted,
+    DeletionInterrupted,
+    UnexpectedTopicAlias {
+        alias: u16,
+        maximum: u16,
+    },
+    IncomingTopicUtf8 {
+        source: std::str::Utf8Error,
+    },
+    IncomingTopicInvalid {
+        source: Box<MqttError>,
+    },
+    ConnectionRejected {
+        reason_code: u8,
+    },
+    BrokerDisconnected {
+        reason_code: u8,
+        diagnostic_reason: Option<String>,
+    },
+    PublishRejected {
+        packet_id: u16,
+        acknowledgement: PublishAcknowledgement,
+        reason_code: u8,
+        diagnostic_reason: Option<String>,
+    },
+    SubscriptionsRejected {
+        results: Vec<SubscriptionResult>,
+        diagnostic_reason: Option<String>,
+    },
+    SubscriptionAcknowledgementCount {
+        expected: usize,
+        received: usize,
+    },
+    SessionReset,
+    ConnectionFailed {
+        source: Box<ConnectionError>,
+    },
+    Reconnecting {
+        source: Box<MqttError>,
+        retry_after_seconds: u64,
+    },
+}
+
+#[expect(
+    clippy::enum_variant_names,
+    reason = "Variants identify standard MQTT acknowledgement packet names"
+)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PublishAcknowledgement {
+    PubAck,
+    PubRec,
+    PubComp,
+}
+
+/// A SUBACK result paired with its requested filter, if the broker returned a matching entry.
+#[derive(Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SubscriptionResult {
+    pub topic_filter: Option<String>,
+    pub reason_code: u8,
+}
+
+impl MqttError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Validation(_) => "mqtt.connection_validation",
+            Self::MissingPassword => "mqtt.missing_password",
+            Self::TopicEmpty => "mqtt.topic_empty",
+            Self::TopicWildcard => "mqtt.topic_wildcard",
+            Self::TopicTooLong { .. } => "mqtt.topic_too_long",
+            Self::TopicNull => "mqtt.topic_null",
+            Self::ContentTypeTooLong { .. } => "mqtt.content_type_too_long",
+            Self::ContentTypeNull => "mqtt.content_type_null",
+            Self::PublishQosUnsupported { .. } => "mqtt.publish_qos_unsupported",
+            Self::RetainUnsupported => "mqtt.retain_unsupported",
+            Self::PublishPacketTooLarge { .. } => "mqtt.publish_packet_too_large",
+            Self::SubscriptionPacketTooLarge { .. } => "mqtt.subscription_packet_too_large",
+            Self::CommandQueueFull => "mqtt.command_queue_full",
+            Self::WorkerStopped => "mqtt.worker_stopped",
+            Self::RuntimeCreation { .. } => "mqtt.runtime_creation",
+            Self::WorkerStart { .. } => "mqtt.worker_start",
+            Self::TestRuntimeCreation { .. } => "mqtt.test_runtime_creation",
+            Self::TestWorkerStart { .. } => "mqtt.test_worker_start",
+            Self::ConnectionTestTimeout { .. } => "mqtt.connection_test_timeout",
+            Self::TrustedCertificatesUnavailable => "mqtt.trusted_certificates_unavailable",
+            Self::TlsConfiguration { .. } => "mqtt.tls_configuration",
+            Self::PublishQueue { .. } => "mqtt.publish_queue",
+            Self::DeletionQueue { .. } => "mqtt.deletion_queue",
+            Self::SubscriptionQueue { .. } => "mqtt.subscription_queue",
+            Self::PublishDisconnected => "mqtt.publish_disconnected",
+            Self::DeletionDisconnected => "mqtt.deletion_disconnected",
+            Self::PublishInterrupted => "mqtt.publish_interrupted",
+            Self::DeletionInterrupted => "mqtt.deletion_interrupted",
+            Self::UnexpectedTopicAlias { .. } => "mqtt.unexpected_topic_alias",
+            Self::IncomingTopicUtf8 { .. } => "mqtt.incoming_topic_utf8",
+            Self::IncomingTopicInvalid { .. } => "mqtt.incoming_topic_invalid",
+            Self::ConnectionRejected { .. } => "mqtt.connection_rejected",
+            Self::BrokerDisconnected { .. } => "mqtt.broker_disconnected",
+            Self::PublishRejected { .. } => "mqtt.publish_rejected",
+            Self::SubscriptionsRejected { .. } => "mqtt.subscriptions_rejected",
+            Self::SubscriptionAcknowledgementCount { .. } => "mqtt.subscription_acknowledgement_count",
+            Self::SessionReset => "mqtt.session_reset",
+            Self::ConnectionFailed { .. } => "mqtt.connection_failed",
+            Self::Reconnecting { .. } => "mqtt.reconnecting",
+        }
+    }
+}
+
+impl fmt::Debug for MqttError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Dependency Debug can contain MQTT payloads, credentials, URLs and broker-provided prose.
+        let mut details = formatter.debug_struct("MqttError");
+        details.field("code", &self.code());
+        match self {
+            Self::TopicTooLong { length, limit } | Self::ContentTypeTooLong { length, limit } => {
+                details.field("length", length).field("limit", limit);
+            }
+            Self::PublishQosUnsupported { requested, maximum } => {
+                details.field("requested", requested).field("maximum", maximum);
+            }
+            Self::PublishPacketTooLarge { size, limit } | Self::SubscriptionPacketTooLarge { size, limit } => {
+                details.field("size", size).field("limit", limit);
+            }
+            Self::ConnectionTestTimeout { seconds } => {
+                details.field("seconds", seconds);
+            }
+            Self::UnexpectedTopicAlias { alias, maximum } => {
+                details.field("alias", alias).field("maximum", maximum);
+            }
+            Self::ConnectionRejected { reason_code } => {
+                details.field("reason_code", reason_code);
+            }
+            Self::BrokerDisconnected {
+                reason_code,
+                diagnostic_reason,
+            } => {
+                details
+                    .field("reason_code", reason_code)
+                    .field("has_broker_reason", &diagnostic_reason.is_some());
+            }
+            Self::PublishRejected {
+                packet_id,
+                acknowledgement,
+                reason_code,
+                diagnostic_reason,
+            } => {
+                details
+                    .field("packet_id", packet_id)
+                    .field("acknowledgement", acknowledgement)
+                    .field("reason_code", reason_code)
+                    .field("has_broker_reason", &diagnostic_reason.is_some());
+            }
+            Self::SubscriptionsRejected {
+                results,
+                diagnostic_reason,
+            } => {
+                details
+                    .field("subscription_count", &results.len())
+                    .field(
+                        "rejected_count",
+                        &results.iter().filter(|result| result.reason_code >= 0x80).count(),
+                    )
+                    .field(
+                        "first_rejection_reason",
+                        &results
+                            .iter()
+                            .find(|result| result.reason_code >= 0x80)
+                            .map(|result| result.reason_code),
+                    )
+                    .field("has_broker_reason", &diagnostic_reason.is_some());
+            }
+            Self::SubscriptionAcknowledgementCount { expected, received } => {
+                details.field("expected", expected).field("received", received);
+            }
+            Self::IncomingTopicInvalid { source } => {
+                details.field("cause", source);
+            }
+            Self::Reconnecting {
+                source,
+                retry_after_seconds,
+            } => {
+                details.field("cause", source).field("retry_after_seconds", retry_after_seconds);
+            }
+            Self::RuntimeCreation { source }
+            | Self::WorkerStart { source }
+            | Self::TestRuntimeCreation { source }
+            | Self::TestWorkerStart { source } => {
+                details.field("io_kind", &source.kind());
+            }
+            _ => {}
+        }
+        details.finish()
+    }
+}
+
+impl fmt::Display for MqttError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.code())
+    }
+}
+
+impl std::error::Error for MqttError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Validation(source) => Some(source),
+            Self::RuntimeCreation { source }
+            | Self::WorkerStart { source }
+            | Self::TestRuntimeCreation { source }
+            | Self::TestWorkerStart { source } => Some(source),
+            Self::TlsConfiguration { source } => Some(source),
+            Self::PublishQueue { source } | Self::DeletionQueue { source } | Self::SubscriptionQueue { source } => Some(source.as_ref()),
+            Self::IncomingTopicUtf8 { source } => Some(source),
+            Self::IncomingTopicInvalid { source } | Self::Reconnecting { source, .. } => Some(source.as_ref()),
+            Self::ConnectionFailed { source } => Some(source.as_ref()),
+            _ => None,
+        }
+    }
+}
+
+impl From<ConnectionValidationError> for MqttError {
+    fn from(error: ConnectionValidationError) -> Self {
+        Self::Validation(error)
+    }
+}
+
+impl From<ConnectionError> for MqttError {
+    fn from(error: ConnectionError) -> Self {
+        match error {
+            ConnectionError::ConnectionRefused(reason) | ConnectionError::MqttState(StateError::ConnFail { reason }) => {
+                Self::ConnectionRejected {
+                    reason_code: connect_reason_code(reason),
+                }
+            }
+            ConnectionError::MqttState(StateError::ServerDisconnect {
+                reason_code,
+                reason_string,
+            }) => Self::BrokerDisconnected {
+                reason_code: reason_code as u8,
+                diagnostic_reason: reason_string,
+            },
+            source => Self::ConnectionFailed { source: Box::new(source) },
+        }
+    }
+}
 
 pub enum BrokerEvent {
     Connecting,
     Connected,
-    Status(String),
-    OperationError(String),
+    Status(MqttError),
+    OperationError(MqttError),
     PublishQueued,
-    PublishError(String),
+    PublishError(MqttError),
     Message(Message),
 }
 
@@ -61,16 +370,66 @@ enum SessionState {
     Disconnected,
 }
 
-/// Quality of service for an MQTT publish.
+/// Quality of service for MQTT publishes and topic subscriptions.
+/// Serialized as the numeric MQTT level to preserve saved connection settings.
+/// Unrecognized numeric levels deserialize as QoS 0.
 #[expect(
     clippy::enum_variant_names,
     reason = "Variants use the standard MQTT delivery-guarantee terminology"
 )]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(into = "u8")]
 pub enum Qos {
     AtMostOnce,
     AtLeastOnce,
     ExactlyOnce,
+}
+
+impl<'de> Deserialize<'de> for Qos {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct QosVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for QosVisitor {
+            type Value = Qos;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("mqtt.qos.number")
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Qos, E> {
+                Ok(match value {
+                    1 => Qos::AtLeastOnce,
+                    2 => Qos::ExactlyOnce,
+                    _ => Qos::AtMostOnce,
+                })
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Qos, E> {
+                self.visit_u64(u64::try_from(value).unwrap_or_default())
+            }
+
+            fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<Qos, E> {
+                Ok(if value == 1.0 {
+                    Qos::AtLeastOnce
+                } else if value == 2.0 {
+                    Qos::ExactlyOnce
+                } else {
+                    Qos::AtMostOnce
+                })
+            }
+        }
+
+        deserializer.deserialize_any(QosVisitor)
+    }
+}
+
+impl From<Qos> for u8 {
+    fn from(qos: Qos) -> Self {
+        QoS::from(qos) as u8
+    }
 }
 
 impl From<Qos> for QoS {
@@ -105,17 +464,27 @@ impl PublishCapabilities {
         }
     }
 
-    fn validate_publish(&self, topic: &str, payload_len: usize, qos: QoS, retain: bool, content_type: Option<&str>) -> Result<()> {
-        ensure!(
-            qos as u8 <= self.max_qos,
-            "Broker supports a maximum publish QoS of {}.",
-            self.max_qos
-        );
-        ensure!(!retain || self.retain_available, "Broker does not support retained publishes.");
+    fn validate_publish(
+        &self,
+        topic: &str,
+        payload_len: usize,
+        qos: QoS,
+        retain: bool,
+        content_type: Option<&str>,
+    ) -> Result<(), MqttError> {
+        if qos as u8 > self.max_qos {
+            return Err(MqttError::PublishQosUnsupported {
+                requested: qos as u8,
+                maximum: self.max_qos,
+            });
+        }
+        if retain && !self.retain_available {
+            return Err(MqttError::RetainUnsupported);
+        }
         ensure_publish_packet_size(topic, payload_len, qos, content_type, self.max_packet_size)
     }
 
-    fn validate_command(&self, command: &Command) -> Result<()> {
+    fn validate_command(&self, command: &Command) -> Result<(), MqttError> {
         match command {
             Command::Publish(command) => self.validate_publish(
                 &command.topic,
@@ -159,7 +528,7 @@ enum OperationKind {
 }
 
 impl OperationKind {
-    fn error(self, message: String) -> BrokerEvent {
+    fn error(self, message: MqttError) -> BrokerEvent {
         match self {
             Self::DeleteTopics => BrokerEvent::OperationError(message),
             Self::Publish => BrokerEvent::PublishError(message),
@@ -176,26 +545,35 @@ impl Command {
     }
 }
 
-fn ensure_valid_topic(topic: &str) -> Result<()> {
-    ensure!(!topic.is_empty(), "MQTT topic names must not be empty.");
-    ensure!(
-        !topic.contains(['#', '+']),
-        "Publishing requires an exact topic name, not MQTT wildcards."
-    );
-    ensure!(
-        topic.len() <= u16::MAX as usize,
-        "MQTT topic names must not exceed 65535 UTF-8 bytes."
-    );
-    ensure!(!topic.contains('\0'), "MQTT topic names must not contain a null character.");
+fn ensure_valid_topic(topic: &str) -> Result<(), MqttError> {
+    if topic.is_empty() {
+        return Err(MqttError::TopicEmpty);
+    }
+    if topic.contains(['#', '+']) {
+        return Err(MqttError::TopicWildcard);
+    }
+    if topic.len() > usize::from(u16::MAX) {
+        return Err(MqttError::TopicTooLong {
+            length: topic.len(),
+            limit: usize::from(u16::MAX),
+        });
+    }
+    if topic.contains('\0') {
+        return Err(MqttError::TopicNull);
+    }
     Ok(())
 }
 
-fn ensure_valid_content_type(content_type: &str) -> Result<()> {
-    ensure!(
-        content_type.len() <= u16::MAX as usize,
-        "MQTT content type must not exceed 65535 UTF-8 bytes."
-    );
-    ensure!(!content_type.contains('\0'), "MQTT content type must not contain a null character.");
+fn ensure_valid_content_type(content_type: &str) -> Result<(), MqttError> {
+    if content_type.len() > usize::from(u16::MAX) {
+        return Err(MqttError::ContentTypeTooLong {
+            length: content_type.len(),
+            limit: usize::from(u16::MAX),
+        });
+    }
+    if content_type.contains('\0') {
+        return Err(MqttError::ContentTypeNull);
+    }
     Ok(())
 }
 
@@ -208,7 +586,13 @@ fn variable_integer_len(mut length: usize) -> usize {
     length_bytes
 }
 
-fn ensure_publish_packet_size(topic: &str, payload_len: usize, qos: QoS, content_type: Option<&str>, max_packet_size: u32) -> Result<()> {
+fn ensure_publish_packet_size(
+    topic: &str,
+    payload_len: usize,
+    qos: QoS,
+    content_type: Option<&str>,
+    max_packet_size: u32,
+) -> Result<(), MqttError> {
     // Content type includes its property ID and two-byte UTF-8 string length.
     let properties_length = content_type.map_or(0, |value| 1 + 2 + value.len());
     let remaining_length = 2
@@ -217,10 +601,13 @@ fn ensure_publish_packet_size(topic: &str, payload_len: usize, qos: QoS, content
         + variable_integer_len(properties_length)
         + properties_length
         + payload_len;
-    ensure!(
-        1 + variable_integer_len(remaining_length) + remaining_length <= max_packet_size as usize,
-        "MQTT publish packet exceeds the maximum packet size of {max_packet_size} bytes."
-    );
+    let size = 1 + variable_integer_len(remaining_length) + remaining_length;
+    if size > max_packet_size as usize {
+        return Err(MqttError::PublishPacketTooLarge {
+            size,
+            limit: max_packet_size,
+        });
+    }
     Ok(())
 }
 
@@ -237,7 +624,7 @@ impl Connection {
     /// accepted into the command queue, not delivered. The worker reports
     /// `BrokerEvent::PublishQueued` or `BrokerEvent::PublishError`; a disconnect
     /// can produce an error even after `PublishQueued`.
-    pub fn publish(&self, topic: String, payload: Vec<u8>, qos: Qos, retain: bool) -> Result<()> {
+    pub fn publish(&self, topic: String, payload: Vec<u8>, qos: Qos, retain: bool) -> Result<(), MqttError> {
         self.publish_with_content_type(topic, payload, qos, retain, None)
     }
 
@@ -253,7 +640,7 @@ impl Connection {
         qos: Qos,
         retain: bool,
         content_type: Option<String>,
-    ) -> Result<()> {
+    ) -> Result<(), MqttError> {
         ensure_valid_topic(&topic)?;
         if let Some(content_type) = content_type.as_deref() {
             ensure_valid_content_type(content_type)?;
@@ -268,14 +655,14 @@ impl Connection {
                 retain,
                 content_type,
             }))
-            .context("Could not queue publish (queue full or worker stopped).")
+            .map_err(command_queue_error)
     }
 
     /// Queues retained-message deletion for exact MQTT topic names.
     /// Invalid topics and full/closed queues fail immediately; an empty batch
     /// does nothing. `Ok(())` means queued, not deleted. The worker reports
     /// failures, including disconnection, via `BrokerEvent::OperationError`.
-    pub fn delete_topics(&self, topics: Vec<String>) -> Result<()> {
+    pub fn delete_topics(&self, topics: Vec<String>) -> Result<(), MqttError> {
         if topics.is_empty() {
             return Ok(());
         }
@@ -286,7 +673,14 @@ impl Connection {
 
         self.commands
             .try_send(Command::DeleteTopics(DeleteTopicsData { topics }))
-            .context("Could not queue topic deletion (queue full or worker stopped).")
+            .map_err(command_queue_error)
+    }
+}
+
+fn command_queue_error(error: mpsc::error::TrySendError<Command>) -> MqttError {
+    match error {
+        mpsc::error::TrySendError::Full(_) => MqttError::CommandQueueFull,
+        mpsc::error::TrySendError::Closed(_) => MqttError::WorkerStopped,
     }
 }
 
@@ -299,13 +693,15 @@ impl Drop for Connection {
 }
 
 /// Starts a worker for a validated connection, returning setup failures to the caller.
-pub fn connect(config: ConnectionConfig) -> Result<Connection> {
+pub fn connect(config: ConnectionConfig) -> Result<Connection, MqttError> {
     config.validate()?;
-    ensure!(!config.missing_password(), "No password is configured for this connection.");
+    if config.missing_password() {
+        return Err(MqttError::MissingPassword);
+    }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .context("Could not create the MQTT runtime.")?;
+        .map_err(|source| MqttError::RuntimeCreation { source })?;
     // A bounded queue applies backpressure during retained-message bursts.
     let (sender, events) = mpsc::channel(2048);
     let (stop, stopped) = oneshot::channel();
@@ -320,12 +716,12 @@ pub fn connect(config: ConnectionConfig) -> Result<Connection> {
                     result = run(config, &sender, command_receiver) => result,
                 };
                 if let Err(error) = result {
-                    tracing::error!(error = %format_args!("{error:#}"), "MQTT worker stopped");
-                    let _ = sender.send(BrokerEvent::Status(format!("{error:#}"))).await;
+                    tracing::error!(error_code = error.code(), details = ?error, "mqtt.worker_stopped");
+                    let _ = sender.send(BrokerEvent::Status(error)).await;
                 }
             });
         })
-        .context("Could not start the MQTT worker thread.")?;
+        .map_err(|source| MqttError::WorkerStart { source })?;
     Ok(Connection {
         events: Some(events),
         stop: Some(stop),
@@ -340,14 +736,16 @@ fn test_client_id() -> String {
 }
 
 /// Starts a short-lived MQTT handshake and resolves after the broker accepts or rejects it.
-pub fn test_connection(mut config: ConnectionConfig) -> Result<oneshot::Receiver<Result<(), String>>> {
+pub fn test_connection(mut config: ConnectionConfig) -> Result<oneshot::Receiver<Result<(), MqttError>>, MqttError> {
     config.validate_broker_connection()?;
-    ensure!(!config.missing_password(), "No password is configured for this connection.");
+    if config.missing_password() {
+        return Err(MqttError::MissingPassword);
+    }
     config.client_id = test_client_id();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .context("Could not create the MQTT test runtime.")?;
+        .map_err(|source| MqttError::TestRuntimeCreation { source })?;
     let (result_sender, result_receiver) = oneshot::channel();
 
     std::thread::Builder::new()
@@ -358,22 +756,22 @@ pub fn test_connection(mut config: ConnectionConfig) -> Result<oneshot::Receiver
                 let (_client, mut event_loop) = AsyncClient::new(options, 1);
                 tokio::time::timeout(Duration::from_secs(10), async {
                     loop {
-                        if let Event::Incoming(Packet::ConnAck(ack)) = event_loop.poll().await? {
-                            ensure!(
-                                ack.code == ConnectReturnCode::Success,
-                                "Broker rejected the connection: {:?}.",
-                                ack.code
-                            );
+                        if let Event::Incoming(Packet::ConnAck(ack)) = event_loop.poll().await.map_err(MqttError::from)? {
+                            if ack.code != ConnectReturnCode::Success {
+                                return Err(MqttError::ConnectionRejected {
+                                    reason_code: connect_reason_code(ack.code),
+                                });
+                            }
                             return Ok(());
                         }
                     }
                 })
                 .await
-                .context("Timed out waiting for the broker to accept the connection.")?
+                .map_err(|_| MqttError::ConnectionTestTimeout { seconds: 10 })?
             });
-            let _ = result_sender.send(result.map_err(|error: anyhow::Error| format!("{error:#}")));
+            let _ = result_sender.send(result);
         })
-        .context("Could not start the MQTT connection test thread.")?;
+        .map_err(|source| MqttError::TestWorkerStart { source })?;
     Ok(result_receiver)
 }
 
@@ -418,14 +816,14 @@ impl ServerCertVerifier for UncheckedServerCertVerifier {
     }
 }
 
-fn tls_transport(roots: RootCertStore, validate_certificate: bool, websocket: bool) -> Result<Transport> {
-    if validate_certificate {
-        ensure!(!roots.is_empty(), "Could not load trusted system certificates for TLS.");
+fn tls_transport(roots: RootCertStore, validate_certificate: bool, websocket: bool) -> Result<Transport, MqttError> {
+    if validate_certificate && roots.is_empty() {
+        return Err(MqttError::TrustedCertificatesUnavailable);
     }
     let provider = Arc::new(aws_lc_rs::default_provider());
     let builder = ClientConfig::builder_with_provider(Arc::clone(&provider))
         .with_safe_default_protocol_versions()
-        .context("Could not configure the TLS protocol versions.")?;
+        .map_err(|source| MqttError::TlsConfiguration { source })?;
     let config = if validate_certificate {
         builder.with_root_certificates(roots).with_no_client_auth()
     } else {
@@ -441,7 +839,7 @@ fn tls_transport(roots: RootCertStore, validate_certificate: bool, websocket: bo
     })
 }
 
-fn mqtt_options(config: &ConnectionConfig) -> Result<MqttOptions> {
+fn mqtt_options(config: &ConnectionConfig) -> Result<MqttOptions, MqttError> {
     // rumqttc requires the full URL for WebSocket and reads its port from that URL.
     let host = if config.websocket {
         let scheme = if config.tls { "wss" } else { "ws" };
@@ -480,14 +878,18 @@ fn mqtt_options(config: &ConnectionConfig) -> Result<MqttOptions> {
     Ok(options)
 }
 
-async fn publish_clear_retained(client: AsyncClient, topics: Vec<String>, queued: Rc<RefCell<VecDeque<OperationKind>>>) -> Result<()> {
+async fn publish_clear_retained(
+    client: AsyncClient,
+    topics: Vec<String>,
+    queued: Rc<RefCell<VecDeque<OperationKind>>>,
+) -> Result<(), MqttError> {
     for topic in topics {
         // Register before awaiting: a full flume queue can hand the request to
         // poll before the sending future is resumed.
         queued.borrow_mut().push_back(OperationKind::DeleteTopics);
         if let Err(error) = client.publish(topic, QoS::AtMostOnce, true, Vec::new()).await {
             queued.borrow_mut().pop_back();
-            return Err(error).context("Could not queue a retained-topic deletion publish.");
+            return Err(MqttError::DeletionQueue { source: Box::new(error) });
         }
     }
     Ok(())
@@ -498,7 +900,7 @@ async fn queue_command(
     command: Command,
     queued: Rc<RefCell<VecDeque<OperationKind>>>,
     capabilities: PublishCapabilities,
-) -> Result<()> {
+) -> Result<(), MqttError> {
     capabilities.validate_command(&command)?;
     match command {
         Command::DeleteTopics(command) => publish_clear_retained(client, command.topics, queued).await,
@@ -518,7 +920,7 @@ async fn queue_command(
             };
             if let Err(error) = result {
                 queued.borrow_mut().pop_back();
-                return Err(error).context("Could not queue publish to rumqttc.");
+                return Err(MqttError::PublishQueue { source: Box::new(error) });
             }
             Ok(())
         }
@@ -526,69 +928,145 @@ async fn queue_command(
 }
 
 fn disconnected_error(kind: OperationKind) -> BrokerEvent {
-    let message = match kind {
-        OperationKind::DeleteTopics => "Retained-topic deletion cancelled while disconnected. Retry while connected.",
-        OperationKind::Publish => "Publish cancelled while disconnected. Publish again while connected.",
-    };
-    kind.error(message.into())
+    kind.error(match kind {
+        OperationKind::DeleteTopics => MqttError::DeletionDisconnected,
+        OperationKind::Publish => MqttError::PublishDisconnected,
+    })
 }
 
-fn validate_incoming_event(event: Event) -> Result<Event> {
+fn validate_incoming_event(event: Event) -> Result<Event, MqttError> {
     match &event {
         Event::Incoming(Packet::Publish(publish)) => {
-            ensure!(
-                publish.properties.as_ref().and_then(|properties| properties.topic_alias).is_none(),
-                "Broker sent a topic alias although the negotiated alias maximum is zero."
-            );
-            let topic = std::str::from_utf8(&publish.topic).context("Broker sent a non-UTF-8 MQTT topic.")?;
-            ensure_valid_topic(topic).context("Broker sent an invalid MQTT topic.")?;
+            if let Some(alias) = publish.properties.as_ref().and_then(|properties| properties.topic_alias) {
+                return Err(MqttError::UnexpectedTopicAlias { alias, maximum: 0 });
+            }
+            let topic = std::str::from_utf8(&publish.topic).map_err(|source| MqttError::IncomingTopicUtf8 { source })?;
+            ensure_valid_topic(topic).map_err(|source| MqttError::IncomingTopicInvalid { source: Box::new(source) })?;
         }
         // rumqttc normally turns DISCONNECT into StateError::ServerDisconnect.
         // Handle a delivered packet too, rather than leaving the session connected.
         Event::Incoming(Packet::Disconnect(disconnect)) => {
-            anyhow::bail!(
-                "Broker disconnected: {:?}{}",
-                disconnect.reason_code,
-                disconnect
+            return Err(MqttError::BrokerDisconnected {
+                reason_code: disconnect.reason_code as u8,
+                diagnostic_reason: disconnect
                     .properties
                     .as_ref()
-                    .and_then(|properties| properties.reason_string.as_deref())
-                    .map(|reason| format!(" · {reason}"))
-                    .unwrap_or_default()
-            );
+                    .and_then(|properties| properties.reason_string.clone()),
+            });
         }
         _ => {}
     }
     Ok(event)
 }
 
-fn publish_rejection(packet: &Packet) -> Option<(u16, String)> {
-    let (pkid, acknowledgement, reason, detail) = match packet {
+// rumqttc's CONNACK, SUBACK, PUBACK and PUBREC enum discriminants are not wire codes.
+fn connect_reason_code(reason: ConnectReturnCode) -> u8 {
+    match reason {
+        ConnectReturnCode::Success => 0x00,
+        ConnectReturnCode::RefusedProtocolVersion => 0x01,
+        ConnectReturnCode::BadClientId => 0x02,
+        ConnectReturnCode::ServiceUnavailable => 0x03,
+        ConnectReturnCode::UnspecifiedError => 0x80,
+        ConnectReturnCode::MalformedPacket => 0x81,
+        ConnectReturnCode::ProtocolError => 0x82,
+        ConnectReturnCode::ImplementationSpecificError => 0x83,
+        ConnectReturnCode::UnsupportedProtocolVersion => 0x84,
+        ConnectReturnCode::ClientIdentifierNotValid => 0x85,
+        ConnectReturnCode::BadUserNamePassword => 0x86,
+        ConnectReturnCode::NotAuthorized => 0x87,
+        ConnectReturnCode::ServerUnavailable => 0x88,
+        ConnectReturnCode::ServerBusy => 0x89,
+        ConnectReturnCode::Banned => 0x8a,
+        ConnectReturnCode::BadAuthenticationMethod => 0x8c,
+        ConnectReturnCode::TopicNameInvalid => 0x90,
+        ConnectReturnCode::PacketTooLarge => 0x95,
+        ConnectReturnCode::QuotaExceeded => 0x97,
+        ConnectReturnCode::PayloadFormatInvalid => 0x99,
+        ConnectReturnCode::RetainNotSupported => 0x9a,
+        ConnectReturnCode::QoSNotSupported => 0x9b,
+        ConnectReturnCode::UseAnotherServer => 0x9c,
+        ConnectReturnCode::ServerMoved => 0x9d,
+        ConnectReturnCode::ConnectionRateExceeded => 0x9f,
+    }
+}
+
+fn subscription_reason_code(reason: SubscribeReasonCode) -> u8 {
+    match reason {
+        SubscribeReasonCode::Success(qos) => qos as u8,
+        SubscribeReasonCode::Failure | SubscribeReasonCode::Unspecified => 0x80,
+        SubscribeReasonCode::ImplementationSpecific => 0x83,
+        SubscribeReasonCode::NotAuthorized => 0x87,
+        SubscribeReasonCode::TopicFilterInvalid => 0x8f,
+        SubscribeReasonCode::PkidInUse => 0x91,
+        SubscribeReasonCode::QuotaExceeded => 0x97,
+        SubscribeReasonCode::SharedSubscriptionsNotSupported => 0x9e,
+        SubscribeReasonCode::SubscriptionIdNotSupported => 0xa1,
+        SubscribeReasonCode::WildcardSubscriptionsNotSupported => 0xa2,
+    }
+}
+
+fn puback_reason_code(reason: PubAckReason) -> u8 {
+    match reason {
+        PubAckReason::Success => 0x00,
+        PubAckReason::NoMatchingSubscribers => 0x10,
+        PubAckReason::UnspecifiedError => 0x80,
+        PubAckReason::ImplementationSpecificError => 0x83,
+        PubAckReason::NotAuthorized => 0x87,
+        PubAckReason::TopicNameInvalid => 0x90,
+        PubAckReason::PacketIdentifierInUse => 0x91,
+        PubAckReason::QuotaExceeded => 0x97,
+        PubAckReason::PayloadFormatInvalid => 0x99,
+    }
+}
+
+fn pubrec_reason_code(reason: PubRecReason) -> u8 {
+    match reason {
+        PubRecReason::Success => 0x00,
+        PubRecReason::NoMatchingSubscribers => 0x10,
+        PubRecReason::UnspecifiedError => 0x80,
+        PubRecReason::ImplementationSpecificError => 0x83,
+        PubRecReason::NotAuthorized => 0x87,
+        PubRecReason::TopicNameInvalid => 0x90,
+        PubRecReason::PacketIdentifierInUse => 0x91,
+        PubRecReason::QuotaExceeded => 0x97,
+        PubRecReason::PayloadFormatInvalid => 0x99,
+    }
+}
+
+fn publish_rejection(packet: &Packet) -> Option<(u16, MqttError)> {
+    let (pkid, acknowledgement, reason_code, detail) = match packet {
         Packet::PubAck(ack) if !matches!(ack.reason, PubAckReason::Success | PubAckReason::NoMatchingSubscribers) => (
             ack.pkid,
-            "PUBACK",
-            format!("{:?}", ack.reason),
+            PublishAcknowledgement::PubAck,
+            puback_reason_code(ack.reason),
             ack.properties.as_ref().and_then(|properties| properties.reason_string.as_deref()),
         ),
         Packet::PubRec(ack) if !matches!(ack.reason, PubRecReason::Success | PubRecReason::NoMatchingSubscribers) => (
             ack.pkid,
-            "PUBREC",
-            format!("{:?}", ack.reason),
+            PublishAcknowledgement::PubRec,
+            pubrec_reason_code(ack.reason),
             ack.properties.as_ref().and_then(|properties| properties.reason_string.as_deref()),
         ),
         Packet::PubComp(ack) if ack.reason != PubCompReason::Success => (
             ack.pkid,
-            "PUBCOMP",
-            format!("{:?}", ack.reason),
+            PublishAcknowledgement::PubComp,
+            0x92,
             ack.properties.as_ref().and_then(|properties| properties.reason_string.as_deref()),
         ),
         _ => return None,
     };
-    let detail = detail.map(|reason| format!(" · {reason}")).unwrap_or_default();
-    Some((pkid, format!("Broker rejected publish ({acknowledgement}: {reason}){detail}.")))
+    Some((
+        pkid,
+        MqttError::PublishRejected {
+            packet_id: pkid,
+            acknowledgement,
+            reason_code,
+            diagnostic_reason: detail.map(str::to_owned),
+        },
+    ))
 }
 
-async fn run(config: ConnectionConfig, sender: &mpsc::Sender<BrokerEvent>, mut commands: mpsc::Receiver<Command>) -> Result<()> {
+async fn run(config: ConnectionConfig, sender: &mpsc::Sender<BrokerEvent>, mut commands: mpsc::Receiver<Command>) -> Result<(), MqttError> {
     let options = mqtt_options(&config)?;
     let mut session = SessionState::Disconnected;
     let mut capabilities = PublishCapabilities::from_connack(None);
@@ -629,7 +1107,7 @@ async fn run(config: ConnectionConfig, sender: &mpsc::Sender<BrokerEvent>, mut c
                     } => {
                         if let Some((kind, _)) = operation.take() {
                             let event = match result {
-                                Err(error) => kind.error(format!("{error:#}")),
+                                Err(error) => kind.error(error),
                                 Ok(()) if kind == OperationKind::Publish => BrokerEvent::PublishQueued,
                                 Ok(()) => continue,
                             };
@@ -641,7 +1119,7 @@ async fn run(config: ConnectionConfig, sender: &mpsc::Sender<BrokerEvent>, mut c
                 }
             }
         };
-        let mut result = result.map_err(anyhow::Error::from).and_then(validate_incoming_event);
+        let mut result = result.map_err(MqttError::from).and_then(validate_incoming_event);
         if let Ok(Event::Incoming(packet)) = &result
             && let Some((pkid, error)) = publish_rejection(packet)
         {
@@ -654,7 +1132,7 @@ async fn run(config: ConnectionConfig, sender: &mpsc::Sender<BrokerEvent>, mut c
             if matches!(packet, Packet::PubRec(_) | Packet::PubComp(_))
                 || event_loop.state.collision.as_ref().is_some_and(|publish| publish.pkid == pkid)
             {
-                result = Err(anyhow::anyhow!("MQTT publish rejected; resetting the session."));
+                result = Err(MqttError::SessionReset);
             }
         }
         let event = match result {
@@ -667,25 +1145,23 @@ async fn run(config: ConnectionConfig, sender: &mpsc::Sender<BrokerEvent>, mut c
                     event_loop.options.set_keep_alive(options.keep_alive());
                 }
                 pending_subscription = None;
-                let filters = config.topics.iter().map(|subscription| {
-                    let qos = match subscription.qos {
-                        0 => QoS::AtMostOnce,
-                        1 => QoS::AtLeastOnce,
-                        _ => QoS::ExactlyOnce, // connect validates the QoS range before starting the worker.
-                    };
-                    Filter::new(subscription.topic.clone(), qos)
-                });
+                let filters = config
+                    .topics
+                    .iter()
+                    .map(|subscription| Filter::new(subscription.topic.clone(), subscription.qos.into()));
                 // One request avoids filling the bounded queue while poll is paused,
                 // even when there are more filters than the request queue's capacity.
                 let subscribe = Subscribe::new_many(filters, None);
-                ensure!(
-                    subscribe.size() <= MAX_PACKET_SIZE as usize,
-                    "MQTT subscription packet must not exceed 16 MiB."
-                );
+                if subscribe.size() > MAX_PACKET_SIZE as usize {
+                    return Err(MqttError::SubscriptionPacketTooLarge {
+                        size: subscribe.size(),
+                        limit: MAX_PACKET_SIZE,
+                    });
+                }
                 client
                     .subscribe_many(subscribe.filters)
                     .await
-                    .context("Could not subscribe to topics.")?;
+                    .map_err(|source| MqttError::SubscriptionQueue { source: Box::new(source) })?;
                 continue;
             }
             Ok(Event::Outgoing(Outgoing::Subscribe(pkid))) => {
@@ -698,19 +1174,24 @@ async fn run(config: ConnectionConfig, sender: &mpsc::Sender<BrokerEvent>, mut c
                 }
                 pending_subscription = None;
                 if ack.return_codes.iter().any(|code| !matches!(code, SubscribeReasonCode::Success(_))) {
-                    tracing::warn!(broker = %config.host, "Broker refused one or more topic subscriptions");
-                    let detail = ack
-                        .properties
-                        .as_ref()
-                        .and_then(|properties| properties.reason_string.as_deref())
-                        .map(|reason| format!(" · {reason}"))
-                        .unwrap_or_default();
-                    BrokerEvent::Status(format!(
-                        "Broker refused one or more topic subscriptions: {:?}{detail}. Check access permissions and broker capabilities.",
-                        ack.return_codes
-                    ))
+                    tracing::warn!(port = config.port, "mqtt.subscriptions_rejected");
+                    BrokerEvent::Status(MqttError::SubscriptionsRejected {
+                        results: ack
+                            .return_codes
+                            .iter()
+                            .enumerate()
+                            .map(|(index, code)| SubscriptionResult {
+                                topic_filter: config.topics.get(index).map(|subscription| subscription.topic.clone()),
+                                reason_code: subscription_reason_code(*code),
+                            })
+                            .collect(),
+                        diagnostic_reason: ack.properties.as_ref().and_then(|properties| properties.reason_string.clone()),
+                    })
                 } else if ack.return_codes.len() != config.topics.len() {
-                    BrokerEvent::Status("Broker did not acknowledge all topic subscriptions.".into())
+                    BrokerEvent::Status(MqttError::SubscriptionAcknowledgementCount {
+                        expected: config.topics.len(),
+                        received: ack.return_codes.len(),
+                    })
                 } else {
                     session = SessionState::Connected;
                     BrokerEvent::Connected
@@ -732,7 +1213,7 @@ async fn run(config: ConnectionConfig, sender: &mpsc::Sender<BrokerEvent>, mut c
             }
             Ok(Event::Incoming(Packet::Publish(publish))) => BrokerEvent::Message(Message {
                 topic: std::str::from_utf8(&publish.topic)
-                    .context("Broker sent a non-UTF-8 MQTT topic.")?
+                    .map_err(|source| MqttError::IncomingTopicUtf8 { source })?
                     .to_owned(),
                 payload: publish.payload,
                 qos: publish.qos as u8,
@@ -742,7 +1223,7 @@ async fn run(config: ConnectionConfig, sender: &mpsc::Sender<BrokerEvent>, mut c
             }),
             Ok(_) => continue,
             Err(error) => {
-                tracing::error!(broker = %config.host, port = config.port, error = %error, "MQTT connection failed; retrying");
+                tracing::error!(port = config.port, error_code = error.code(), details = ?error, "mqtt.connection_retry");
                 pending_subscription = None;
                 session = SessionState::Disconnected;
                 capabilities = PublishCapabilities::from_connack(None);
@@ -767,24 +1248,21 @@ async fn run(config: ConnectionConfig, sender: &mpsc::Sender<BrokerEvent>, mut c
                     interrupted == Some(OperationKind::Publish) || pending_publishes || !inflight_publishes.is_empty();
                 inflight_publishes.clear();
                 if (interrupted == Some(OperationKind::DeleteTopics) || pending_deletions)
-                    && sender.send(BrokerEvent::OperationError(
-                        "Retained-topic deletion interrupted by disconnect; some topics may already have been cleared. It will not be retried.".into(),
-                    )).await.is_err()
-                {
-                    return Ok(());
-                }
-                if interrupted_publish
                     && sender
-                        .send(BrokerEvent::PublishError(
-                            "Publish interrupted by disconnect; it may already have reached the broker. It will not be retried.".into(),
-                        ))
+                        .send(BrokerEvent::OperationError(MqttError::DeletionInterrupted))
                         .await
                         .is_err()
                 {
                     return Ok(());
                 }
+                if interrupted_publish && sender.send(BrokerEvent::PublishError(MqttError::PublishInterrupted)).await.is_err() {
+                    return Ok(());
+                }
                 if sender
-                    .send(BrokerEvent::Status(format!("{error} · retrying in 2 seconds")))
+                    .send(BrokerEvent::Status(MqttError::Reconnecting {
+                        source: Box::new(error),
+                        retry_after_seconds: 2,
+                    }))
                     .await
                     .is_err()
                 {
@@ -963,7 +1441,7 @@ mod tests {
         for subscription in topics {
             expected.extend_from_slice(&(subscription.topic.len() as u16).to_be_bytes());
             expected.extend_from_slice(subscription.topic.as_bytes());
-            expected.push(subscription.qos);
+            expected.push(subscription.qos.into());
         }
         assert_eq!(body[2], 0, "SUBSCRIBE properties must be empty");
         assert_eq!(&body[3..], expected.as_slice(), "all filters and their QoS must be in one packet");
@@ -1002,6 +1480,256 @@ mod tests {
         })
     }
 
+    #[test]
+    fn mqtt_error_debug_redacts_payloads_metadata_broker_prose_and_dependency_sources() {
+        use rumqttc::v5::{Request, mqttbytes::v5::Publish};
+
+        let publish = || {
+            Publish::new(
+                "private-topic",
+                QoS::AtMostOnce,
+                b"private-payload".to_vec(),
+                Some(PublishProperties {
+                    content_type: Some("private-content-type".into()),
+                    user_properties: vec![("private-property".into(), "private-value".into())],
+                    ..Default::default()
+                }),
+            )
+        };
+        let cases = [
+            MqttError::PublishQueue {
+                source: Box::new(ClientError::Request(Request::Publish(publish()))),
+            },
+            MqttError::DeletionQueue {
+                source: Box::new(ClientError::TryRequest(Request::Publish(publish()))),
+            },
+            MqttError::SubscriptionQueue {
+                source: Box::new(ClientError::Request(Request::Publish(publish()))),
+            },
+            MqttError::ConnectionFailed {
+                source: Box::new(ConnectionError::NotConnAck(Box::new(Packet::Publish(publish())))),
+            },
+            MqttError::ConnectionFailed {
+                source: Box::new(ConnectionError::Io(std::io::Error::other(
+                    "mqtt://private-user:private-password@private-host",
+                ))),
+            },
+            MqttError::TlsConfiguration {
+                source: rustls::Error::General("private-certificate".into()),
+            },
+            MqttError::RuntimeCreation {
+                source: std::io::Error::other("private-path"),
+            },
+            MqttError::BrokerDisconnected {
+                reason_code: 0x8b,
+                diagnostic_reason: Some("private-broker-reason".into()),
+            },
+            MqttError::PublishRejected {
+                packet_id: 17,
+                acknowledgement: PublishAcknowledgement::PubAck,
+                reason_code: 0x87,
+                diagnostic_reason: Some("private-broker-reason".into()),
+            },
+            MqttError::SubscriptionsRejected {
+                results: vec![SubscriptionResult {
+                    topic_filter: Some("private-filter".into()),
+                    reason_code: 0x87,
+                }],
+                diagnostic_reason: Some("private-broker-reason".into()),
+            },
+        ];
+        for error in cases {
+            let cause_code = error.code();
+            let reconnecting = MqttError::Reconnecting {
+                source: Box::new(error),
+                retry_after_seconds: 2,
+            };
+            for formatted in [format!("{reconnecting:?}"), format!("{reconnecting:#?}")] {
+                assert!(
+                    !formatted.contains("private-"),
+                    "sensitive data must not appear in MQTT error Debug"
+                );
+                assert!(formatted.contains(cause_code));
+            }
+        }
+    }
+
+    #[test]
+    fn mqtt_error_debug_preserves_safe_structured_diagnostics() {
+        let error = MqttError::SubscriptionsRejected {
+            results: vec![
+                SubscriptionResult {
+                    topic_filter: Some("private-filter".into()),
+                    reason_code: 0,
+                },
+                SubscriptionResult {
+                    topic_filter: Some("private-filter".into()),
+                    reason_code: 0x87,
+                },
+            ],
+            diagnostic_reason: Some("private-reason".into()),
+        };
+        assert_eq!(
+            format!("{error:?}"),
+            "MqttError { code: \"mqtt.subscriptions_rejected\", subscription_count: 2, rejected_count: 1, first_rejection_reason: Some(135), has_broker_reason: true }"
+        );
+        assert_eq!(
+            format!("{:?}", MqttError::SubscriptionPacketTooLarge { size: 21, limit: 20 }),
+            "MqttError { code: \"mqtt.subscription_packet_too_large\", size: 21, limit: 20 }"
+        );
+    }
+
+    #[test]
+    fn mqtt_errors_are_send_sync_and_display_stable_codes_only() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<MqttError>();
+        assert!(
+            std::mem::size_of::<MqttError>() <= 128,
+            "diagnostic sources must not inflate MQTT results"
+        );
+        let io_error = || std::io::Error::other("private dependency prose");
+        let invalid_utf8 = vec![0xff];
+        let utf8_error = std::str::from_utf8(&invalid_utf8).unwrap_err();
+        let validation = ConnectionConfig {
+            host: String::new(),
+            ..Default::default()
+        }
+        .validate()
+        .unwrap_err();
+        let cases = [
+            (MqttError::Validation(validation), "mqtt.connection_validation"),
+            (MqttError::MissingPassword, "mqtt.missing_password"),
+            (MqttError::TopicEmpty, "mqtt.topic_empty"),
+            (MqttError::TopicWildcard, "mqtt.topic_wildcard"),
+            (
+                MqttError::TopicTooLong {
+                    length: 65536,
+                    limit: 65535,
+                },
+                "mqtt.topic_too_long",
+            ),
+            (MqttError::TopicNull, "mqtt.topic_null"),
+            (
+                MqttError::ContentTypeTooLong {
+                    length: 65536,
+                    limit: 65535,
+                },
+                "mqtt.content_type_too_long",
+            ),
+            (MqttError::ContentTypeNull, "mqtt.content_type_null"),
+            (
+                MqttError::PublishQosUnsupported { requested: 2, maximum: 1 },
+                "mqtt.publish_qos_unsupported",
+            ),
+            (MqttError::RetainUnsupported, "mqtt.retain_unsupported"),
+            (
+                MqttError::PublishPacketTooLarge { size: 21, limit: 20 },
+                "mqtt.publish_packet_too_large",
+            ),
+            (
+                MqttError::SubscriptionPacketTooLarge { size: 21, limit: 20 },
+                "mqtt.subscription_packet_too_large",
+            ),
+            (MqttError::CommandQueueFull, "mqtt.command_queue_full"),
+            (MqttError::WorkerStopped, "mqtt.worker_stopped"),
+            (MqttError::RuntimeCreation { source: io_error() }, "mqtt.runtime_creation"),
+            (MqttError::WorkerStart { source: io_error() }, "mqtt.worker_start"),
+            (MqttError::TestRuntimeCreation { source: io_error() }, "mqtt.test_runtime_creation"),
+            (MqttError::TestWorkerStart { source: io_error() }, "mqtt.test_worker_start"),
+            (MqttError::ConnectionTestTimeout { seconds: 10 }, "mqtt.connection_test_timeout"),
+            (MqttError::TrustedCertificatesUnavailable, "mqtt.trusted_certificates_unavailable"),
+            (
+                MqttError::TlsConfiguration {
+                    source: rustls::Error::General("private dependency prose".into()),
+                },
+                "mqtt.tls_configuration",
+            ),
+            (
+                MqttError::PublishQueue {
+                    source: Box::new(ClientError::Request(rumqttc::v5::Request::Disconnect)),
+                },
+                "mqtt.publish_queue",
+            ),
+            (
+                MqttError::DeletionQueue {
+                    source: Box::new(ClientError::Request(rumqttc::v5::Request::Disconnect)),
+                },
+                "mqtt.deletion_queue",
+            ),
+            (
+                MqttError::SubscriptionQueue {
+                    source: Box::new(ClientError::Request(rumqttc::v5::Request::Disconnect)),
+                },
+                "mqtt.subscription_queue",
+            ),
+            (MqttError::PublishDisconnected, "mqtt.publish_disconnected"),
+            (MqttError::DeletionDisconnected, "mqtt.deletion_disconnected"),
+            (MqttError::PublishInterrupted, "mqtt.publish_interrupted"),
+            (MqttError::DeletionInterrupted, "mqtt.deletion_interrupted"),
+            (
+                MqttError::UnexpectedTopicAlias { alias: 1, maximum: 0 },
+                "mqtt.unexpected_topic_alias",
+            ),
+            (MqttError::IncomingTopicUtf8 { source: utf8_error }, "mqtt.incoming_topic_utf8"),
+            (
+                MqttError::IncomingTopicInvalid {
+                    source: Box::new(MqttError::TopicEmpty),
+                },
+                "mqtt.incoming_topic_invalid",
+            ),
+            (MqttError::ConnectionRejected { reason_code: 0x87 }, "mqtt.connection_rejected"),
+            (
+                MqttError::BrokerDisconnected {
+                    reason_code: 0x8b,
+                    diagnostic_reason: Some("private broker prose".into()),
+                },
+                "mqtt.broker_disconnected",
+            ),
+            (
+                MqttError::PublishRejected {
+                    packet_id: 1,
+                    acknowledgement: PublishAcknowledgement::PubAck,
+                    reason_code: 0x87,
+                    diagnostic_reason: Some("private broker prose".into()),
+                },
+                "mqtt.publish_rejected",
+            ),
+            (
+                MqttError::SubscriptionsRejected {
+                    results: vec![SubscriptionResult {
+                        topic_filter: Some("home/#".into()),
+                        reason_code: 0x87,
+                    }],
+                    diagnostic_reason: Some("private broker prose".into()),
+                },
+                "mqtt.subscriptions_rejected",
+            ),
+            (
+                MqttError::SubscriptionAcknowledgementCount { expected: 2, received: 1 },
+                "mqtt.subscription_acknowledgement_count",
+            ),
+            (MqttError::SessionReset, "mqtt.session_reset"),
+            (
+                MqttError::ConnectionFailed {
+                    source: Box::new(ConnectionError::Io(io_error())),
+                },
+                "mqtt.connection_failed",
+            ),
+            (
+                MqttError::Reconnecting {
+                    source: Box::new(MqttError::SessionReset),
+                    retry_after_seconds: 2,
+                },
+                "mqtt.reconnecting",
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(error.code(), expected);
+            assert_eq!(error.to_string(), expected);
+            assert_eq!(format!("{error:#}"), expected);
+        }
+    }
+
     fn runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
     }
@@ -1016,7 +1744,14 @@ mod tests {
         })
     }
 
-    fn assert_capability_rejections(properties: Vec<u8>, allowed_qos: Qos, rejected: Vec<(Command, &str)>) {
+    #[derive(Debug)]
+    enum CapabilityRejection {
+        Qos { requested: u8, maximum: u8 },
+        Retain,
+        Packet { limit: u32 },
+    }
+
+    fn assert_capability_rejections(properties: Vec<u8>, allowed_qos: Qos, rejected: Vec<(Command, CapabilityRejection)>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let (started, received) = std::sync::mpsc::channel();
@@ -1056,7 +1791,23 @@ mod tests {
             assert!(connection.commands.try_send(command).is_ok());
             match (kind, next_event(&runtime, &mut connection)) {
                 (OperationKind::Publish, BrokerEvent::PublishError(error))
-                | (OperationKind::DeleteTopics, BrokerEvent::OperationError(error)) => assert!(error.contains(expected), "{error}"),
+                | (OperationKind::DeleteTopics, BrokerEvent::OperationError(error)) => match (error, expected) {
+                    (
+                        MqttError::PublishQosUnsupported { requested, maximum },
+                        CapabilityRejection::Qos {
+                            requested: expected_qos,
+                            maximum: expected_maximum,
+                        },
+                    ) => {
+                        assert_eq!((requested, maximum), (expected_qos, expected_maximum));
+                    }
+                    (MqttError::RetainUnsupported, CapabilityRejection::Retain) => {}
+                    (MqttError::PublishPacketTooLarge { size, limit }, CapabilityRejection::Packet { limit: expected }) => {
+                        assert_eq!(limit, expected);
+                        assert!(size > limit as usize);
+                    }
+                    (error, expected) => panic!("unexpected capability error: {error:?}, expected {expected:?}"),
+                },
                 _ => panic!("unsupported command must report only its own operation error"),
             }
         }
@@ -1077,7 +1828,15 @@ mod tests {
             let rejected = [QoS::AtLeastOnce, QoS::ExactlyOnce]
                 .into_iter()
                 .filter(|qos| *qos as u8 > maximum)
-                .map(|qos| (publish_command(qos, false, 0), "maximum publish QoS"))
+                .map(|qos| {
+                    (
+                        publish_command(qos, false, 0),
+                        CapabilityRejection::Qos {
+                            requested: qos as u8,
+                            maximum,
+                        },
+                    )
+                })
                 .collect();
             let allowed = if maximum == 0 { Qos::AtMostOnce } else { Qos::AtLeastOnce };
             assert_capability_rejections(vec![0x24, maximum], allowed, rejected);
@@ -1090,13 +1849,13 @@ mod tests {
             vec![0x25, 0],
             Qos::AtLeastOnce,
             vec![
-                (publish_command(QoS::AtMostOnce, true, 0), "retained publishes"),
-                (publish_command(QoS::AtLeastOnce, true, 0), "retained publishes"),
+                (publish_command(QoS::AtMostOnce, true, 0), CapabilityRejection::Retain),
+                (publish_command(QoS::AtLeastOnce, true, 0), CapabilityRejection::Retain),
                 (
                     Command::DeleteTopics(DeleteTopicsData {
                         topics: vec!["test/value".into()],
                     }),
-                    "retained publishes",
+                    CapabilityRejection::Retain,
                 ),
             ],
         );
@@ -1108,13 +1867,19 @@ mod tests {
             vec![0x27, 0, 0, 0, 20],
             Qos::AtLeastOnce,
             vec![
-                (publish_command(QoS::AtMostOnce, false, 6), "maximum packet size of 20 bytes"),
-                (publish_command(QoS::AtLeastOnce, false, 4), "maximum packet size of 20 bytes"),
+                (
+                    publish_command(QoS::AtMostOnce, false, 6),
+                    CapabilityRejection::Packet { limit: 20 },
+                ),
+                (
+                    publish_command(QoS::AtLeastOnce, false, 4),
+                    CapabilityRejection::Packet { limit: 20 },
+                ),
                 (
                     Command::DeleteTopics(DeleteTopicsData {
                         topics: vec!["ok".into(), "a".repeat(16)],
                     }),
-                    "maximum packet size of 20 bytes",
+                    CapabilityRejection::Packet { limit: 20 },
                 ),
             ],
         );
@@ -1136,7 +1901,7 @@ mod tests {
                         retain: false,
                         content_type: Some(content_type),
                     }),
-                    "maximum packet size",
+                    CapabilityRejection::Packet { limit },
                 )],
             );
         }
@@ -1155,11 +1920,13 @@ mod tests {
         };
         let capabilities = PublishCapabilities::from_connack(ack.properties.as_ref());
         assert_eq!(capabilities.max_packet_size, MAX_PACKET_SIZE);
-        assert!(
-            capabilities
-                .validate_publish("test/value", MAX_PACKET_SIZE as usize, QoS::AtMostOnce, false, None)
-                .is_err()
-        );
+        assert!(matches!(
+            capabilities.validate_publish("test/value", MAX_PACKET_SIZE as usize, QoS::AtMostOnce, false, None),
+            Err(MqttError::PublishPacketTooLarge {
+                limit: MAX_PACKET_SIZE,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -1340,14 +2107,8 @@ mod tests {
             username: "mqtt-user".into(),
             ..Default::default()
         };
-        assert_eq!(
-            connect(config.clone()).err().unwrap().to_string(),
-            "No password is configured for this connection."
-        );
-        assert_eq!(
-            test_connection(config).err().unwrap().to_string(),
-            "No password is configured for this connection."
-        );
+        assert_eq!(connect(config.clone()).err().unwrap().code(), "mqtt.missing_password");
+        assert_eq!(test_connection(config).err().unwrap().code(), "mqtt.missing_password");
     }
 
     #[test]
@@ -1561,7 +2322,7 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        assert_eq!(runtime.block_on(result).unwrap(), Ok(()));
+        assert!(runtime.block_on(result).unwrap().is_ok());
         broker.join().unwrap();
     }
 
@@ -1584,7 +2345,10 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        assert!(runtime.block_on(result).unwrap().is_err());
+        assert!(matches!(
+            runtime.block_on(result).unwrap(),
+            Err(MqttError::ConnectionRejected { reason_code: 0x87 })
+        ));
         broker.join().unwrap();
     }
 
@@ -1681,12 +2445,12 @@ mod tests {
         let topics: Vec<_> = (0..24)
             .map(|index| TopicSubscription {
                 topic: format!("home/{index}/+"),
-                qos: (index % 3) as u8,
+                qos: [Qos::AtMostOnce, Qos::AtLeastOnce, Qos::ExactlyOnce][index % 3],
             })
             .collect();
         let expected = topics.clone();
         let broker = std::thread::spawn(move || {
-            let granted: Vec<_> = expected.iter().map(|subscription| subscription.qos).collect();
+            let granted: Vec<_> = expected.iter().map(|subscription| u8::from(subscription.qos)).collect();
             for _ in 0..2 {
                 let _stream = handshake_with_subscriptions(&listener, &expected, &granted);
                 received.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -1716,15 +2480,15 @@ mod tests {
             let topics = vec![
                 TopicSubscription {
                     topic: "home/#".into(),
-                    qos: 0,
+                    qos: Qos::AtMostOnce,
                 },
                 TopicSubscription {
                     topic: "office/#".into(),
-                    qos: 1,
+                    qos: Qos::AtLeastOnce,
                 },
                 TopicSubscription {
                     topic: "$SYS/#".into(),
-                    qos: 2,
+                    qos: Qos::ExactlyOnce,
                 },
             ];
             let expected = topics.clone();
@@ -1741,7 +2505,7 @@ mod tests {
             })
             .unwrap();
             let event = next_matching_event(&runtime, &mut connection, |event| match event {
-                BrokerEvent::Status(status) => status.contains("refused"),
+                BrokerEvent::Status(status) => matches!(status, MqttError::SubscriptionsRejected { .. }),
                 BrokerEvent::Connected => true,
                 BrokerEvent::Message(_)
                 | BrokerEvent::Connecting
@@ -1749,7 +2513,26 @@ mod tests {
                 | BrokerEvent::PublishQueued
                 | BrokerEvent::PublishError(_) => false,
             });
-            assert!(matches!(event, BrokerEvent::Status(_)), "a refused subscription is not connected");
+            let BrokerEvent::Status(MqttError::SubscriptionsRejected { results, .. }) = event else {
+                panic!("a refused subscription is not connected");
+            };
+            assert_eq!(
+                results,
+                vec![
+                    SubscriptionResult {
+                        topic_filter: Some("home/#".into()),
+                        reason_code: 0
+                    },
+                    SubscriptionResult {
+                        topic_filter: Some("office/#".into()),
+                        reason_code: rejected
+                    },
+                    SubscriptionResult {
+                        topic_filter: Some("$SYS/#".into()),
+                        reason_code: 2
+                    },
+                ]
+            );
             drop(connection);
             broker.join().unwrap();
         }
@@ -1763,14 +2546,15 @@ mod tests {
             let topics = vec![
                 TopicSubscription {
                     topic: "home/#".into(),
-                    qos: 0,
+                    qos: Qos::AtMostOnce,
                 },
                 TopicSubscription {
                     topic: "office/#".into(),
-                    qos: 1,
+                    qos: Qos::AtLeastOnce,
                 },
             ];
             let expected = topics.clone();
+            let received = granted.len();
             let broker = std::thread::spawn(move || {
                 let mut stream = handshake_with_subscriptions(&listener, &expected, &granted);
                 assert_eq!(stream.read(&mut [0]).unwrap(), 0);
@@ -1784,7 +2568,7 @@ mod tests {
             })
             .unwrap();
             let event = next_matching_event(&runtime, &mut connection, |event| match event {
-                BrokerEvent::Status(status) => status.contains("acknowledge all"),
+                BrokerEvent::Status(status) => matches!(status, MqttError::SubscriptionAcknowledgementCount { .. }),
                 BrokerEvent::Connected => true,
                 BrokerEvent::Message(_)
                 | BrokerEvent::Connecting
@@ -1792,7 +2576,10 @@ mod tests {
                 | BrokerEvent::PublishQueued
                 | BrokerEvent::PublishError(_) => false,
             });
-            assert!(matches!(event, BrokerEvent::Status(_)), "an incomplete SUBACK is not connected");
+            assert!(
+                matches!(event, BrokerEvent::Status(MqttError::SubscriptionAcknowledgementCount { expected: 2, received: actual }) if actual == received),
+                "an incomplete SUBACK is not connected"
+            );
             drop(connection);
             broker.join().unwrap();
         }
@@ -1835,11 +2622,30 @@ mod tests {
     #[test]
     fn publish_validates_exact_topics_before_queueing() {
         let (connection, mut commands, _) = command_connection();
-        for invalid in ["", "#", "a/+", "a#b", "a+b", "a\0b"] {
-            assert!(connection.publish(invalid.into(), Vec::new(), Qos::AtMostOnce, false).is_err());
+        for (invalid, expected) in [
+            ("", "mqtt.topic_empty"),
+            ("#", "mqtt.topic_wildcard"),
+            ("a/+", "mqtt.topic_wildcard"),
+            ("a#b", "mqtt.topic_wildcard"),
+            ("a+b", "mqtt.topic_wildcard"),
+            ("a\0b", "mqtt.topic_null"),
+        ] {
+            assert_eq!(
+                connection
+                    .publish(invalid.into(), Vec::new(), Qos::AtMostOnce, false)
+                    .unwrap_err()
+                    .code(),
+                expected
+            );
         }
         for invalid in ["a".repeat(65536), "é".repeat(32768)] {
-            assert!(connection.publish(invalid, Vec::new(), Qos::AtMostOnce, false).is_err());
+            assert!(matches!(
+                connection.publish(invalid, Vec::new(), Qos::AtMostOnce, false),
+                Err(MqttError::TopicTooLong {
+                    length: 65536,
+                    limit: 65535
+                })
+            ));
         }
         assert!(matches!(commands.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
     }
@@ -1851,7 +2657,9 @@ mod tests {
             let overhead = 1 + 4 + 2 + "test/é".len() + usize::from(qos != QoS::AtMostOnce) * 2 + 1;
             let maximum_payload = MAX_PACKET_SIZE as usize - overhead;
             assert!(ensure_publish_packet_size("test/é", maximum_payload, qos, None, MAX_PACKET_SIZE).is_ok());
-            assert!(ensure_publish_packet_size("test/é", maximum_payload + 1, qos, None, MAX_PACKET_SIZE).is_err());
+            assert!(
+                matches!(ensure_publish_packet_size("test/é", maximum_payload + 1, qos, None, MAX_PACKET_SIZE), Err(MqttError::PublishPacketTooLarge { size, limit: MAX_PACKET_SIZE }) if size == MAX_PACKET_SIZE as usize + 1)
+            );
         }
     }
 
@@ -1875,7 +2683,9 @@ mod tests {
                     publish.write(&mut wire).unwrap();
                     let size = wire.len() as u32;
                     assert!(ensure_publish_packet_size("test/é", payload_len, qos, content_type.as_deref(), size).is_ok());
-                    assert!(ensure_publish_packet_size("test/é", payload_len, qos, content_type.as_deref(), size - 1).is_err());
+                    assert!(
+                        matches!(ensure_publish_packet_size("test/é", payload_len, qos, content_type.as_deref(), size - 1), Err(MqttError::PublishPacketTooLarge { size: actual, limit }) if actual == size as usize && limit == size - 1)
+                    );
                 }
             }
         }
@@ -1890,7 +2700,7 @@ mod tests {
         let error = connection
             .publish_with_content_type("test/é".into(), payload.clone(), Qos::AtMostOnce, false, Some("image/png".into()))
             .unwrap_err();
-        assert!(error.to_string().contains("maximum packet size"));
+        assert!(matches!(error, MqttError::PublishPacketTooLarge { size, limit: MAX_PACKET_SIZE } if size == MAX_PACKET_SIZE as usize + 1));
         assert!(matches!(commands.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
         connection.publish("test/é".into(), payload, Qos::AtMostOnce, false).unwrap();
         commands.try_recv().unwrap();
@@ -1962,14 +2772,17 @@ mod tests {
     fn publish_with_content_type_rejects_null_and_oversized_utf8_strings_before_queueing() {
         let (connection, mut commands, _) = command_connection();
         for (content_type, expected) in [
-            ("image/\0png".into(), "null character"),
-            ("x".repeat(65536), "65535 UTF-8 bytes"),
-            ("é".repeat(32768), "65535 UTF-8 bytes"),
+            ("image/\0png".into(), "mqtt.content_type_null"),
+            ("x".repeat(65536), "mqtt.content_type_too_long"),
+            ("é".repeat(32768), "mqtt.content_type_too_long"),
         ] {
             let error = connection
                 .publish_with_content_type("test/value".into(), Vec::new(), Qos::AtMostOnce, false, Some(content_type))
                 .unwrap_err();
-            assert!(error.to_string().contains(expected), "{error}");
+            assert_eq!(error.code(), expected);
+            if let MqttError::ContentTypeTooLong { length, limit } = error {
+                assert_eq!((length, limit), (65536, 65535));
+            }
         }
         assert!(matches!(commands.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
     }
@@ -2008,11 +2821,11 @@ mod tests {
         connection.publish("test/value".into(), Vec::new(), Qos::AtMostOnce, false).unwrap();
         connection.delete_topics(vec!["test/value".into()]).unwrap();
         match next_event(&runtime, &mut connection) {
-            BrokerEvent::PublishError(error) => assert!(error.contains("disconnected")),
+            BrokerEvent::PublishError(error) => assert!(matches!(error, MqttError::PublishDisconnected)),
             _ => panic!("publish before connection must report a publish error"),
         }
         match next_event(&runtime, &mut connection) {
-            BrokerEvent::OperationError(error) => assert!(error.contains("disconnected")),
+            BrokerEvent::OperationError(error) => assert!(matches!(error, MqttError::DeletionDisconnected)),
             _ => panic!("deletion before connection must report an operation error"),
         }
     }
@@ -2043,12 +2856,12 @@ mod tests {
         connection.delete_topics(vec!["test/value".into()]).unwrap();
         for _ in 0..2 {
             match next_event(&runtime, &mut connection) {
-                BrokerEvent::PublishError(error) => assert!(error.contains("disconnected")),
+                BrokerEvent::PublishError(error) => assert!(matches!(error, MqttError::PublishDisconnected)),
                 _ => panic!("publish during reconnect must report a publish error"),
             }
         }
         match next_event(&runtime, &mut connection) {
-            BrokerEvent::OperationError(error) => assert!(error.contains("disconnected")),
+            BrokerEvent::OperationError(error) => assert!(matches!(error, MqttError::DeletionDisconnected)),
             _ => panic!("deletion during reconnect must report an operation error"),
         }
         drop(connection);
@@ -2061,16 +2874,25 @@ mod tests {
         for _ in 0..COMMAND_CAPACITY {
             connection.delete_topics(vec!["test/value".into()]).unwrap();
         }
-        assert!(connection.publish("test/value".into(), Vec::new(), Qos::AtMostOnce, false).is_err());
+        assert!(matches!(
+            connection.publish("test/value".into(), Vec::new(), Qos::AtMostOnce, false),
+            Err(MqttError::CommandQueueFull)
+        ));
         for _ in 0..COMMAND_CAPACITY {
             commands.try_recv().unwrap();
         }
         for _ in 0..COMMAND_CAPACITY {
             connection.publish("test/value".into(), Vec::new(), Qos::AtMostOnce, false).unwrap();
         }
-        assert!(connection.delete_topics(vec!["test/value".into()]).is_err());
+        assert!(matches!(
+            connection.delete_topics(vec!["test/value".into()]),
+            Err(MqttError::CommandQueueFull)
+        ));
         drop(commands);
-        assert!(connection.publish("test/value".into(), Vec::new(), Qos::AtMostOnce, false).is_err());
+        assert!(matches!(
+            connection.publish("test/value".into(), Vec::new(), Qos::AtMostOnce, false),
+            Err(MqttError::WorkerStopped)
+        ));
     }
 
     #[test]
@@ -2262,9 +3084,16 @@ mod tests {
             acknowledge.send(()).unwrap();
             if pass == 0 {
                 match next_event(&runtime, &mut connection) {
-                    BrokerEvent::PublishError(error) => {
-                        assert!(error.contains("PUBACK: NotAuthorized"));
-                        assert!(error.contains("publish permission denied"));
+                    BrokerEvent::PublishError(MqttError::PublishRejected {
+                        packet_id,
+                        acknowledgement,
+                        reason_code,
+                        diagnostic_reason,
+                    }) => {
+                        assert_ne!(packet_id, 0);
+                        assert_eq!(acknowledgement, PublishAcknowledgement::PubAck);
+                        assert_eq!(reason_code, 0x87);
+                        assert_eq!(diagnostic_reason.as_deref(), Some("publish permission denied"));
                     }
                     _ => panic!("a rejected QoS 1 publish must report a publish error"),
                 }
@@ -2311,15 +3140,28 @@ mod tests {
             assert!(matches!(next_event(&runtime, &mut connection), BrokerEvent::PublishQueued));
             acknowledge.send(()).unwrap();
             match next_event(&runtime, &mut connection) {
-                BrokerEvent::PublishError(error) => assert!(error.contains(if acknowledgement == 0x50 {
-                    "PUBREC: NotAuthorized"
-                } else {
-                    "PUBCOMP: PacketIdentifierNotFound"
-                })),
+                BrokerEvent::PublishError(MqttError::PublishRejected {
+                    acknowledgement: actual,
+                    reason_code,
+                    ..
+                }) => {
+                    let expected = if acknowledgement == 0x50 {
+                        (PublishAcknowledgement::PubRec, 0x87)
+                    } else {
+                        (PublishAcknowledgement::PubComp, 0x92)
+                    };
+                    assert_eq!((actual, reason_code), expected);
+                }
                 _ => panic!("a rejected QoS 2 publish must report a publish error"),
             }
             match next_event(&runtime, &mut connection) {
-                BrokerEvent::Status(status) => assert!(status.contains("resetting the session")),
+                BrokerEvent::Status(MqttError::Reconnecting {
+                    source,
+                    retry_after_seconds,
+                }) => {
+                    assert!(matches!(*source, MqttError::SessionReset));
+                    assert_eq!(retry_after_seconds, 2);
+                }
                 _ => panic!("negative QoS 2 acknowledgement must reset the stalled rumqttc session"),
             }
             assert!(matches!(next_event(&runtime, &mut connection), BrokerEvent::Connecting));
@@ -2363,9 +3205,20 @@ mod tests {
         disconnect.send(()).unwrap();
         assert!(matches!(next_event(&runtime, &mut connection), BrokerEvent::PublishError(_)));
         match next_event(&runtime, &mut connection) {
-            BrokerEvent::Status(status) => {
-                assert!(status.contains("ServerShuttingDown"));
-                assert!(status.contains("maintenance"));
+            BrokerEvent::Status(MqttError::Reconnecting {
+                source,
+                retry_after_seconds,
+            }) => {
+                let MqttError::BrokerDisconnected {
+                    reason_code,
+                    diagnostic_reason,
+                } = *source
+                else {
+                    panic!("broker DISCONNECT must report its reason");
+                };
+                assert_eq!(reason_code, 0x8b);
+                assert_eq!(diagnostic_reason.as_deref(), Some("maintenance"));
+                assert_eq!(retry_after_seconds, 2);
             }
             _ => panic!("broker DISCONNECT must report its reason"),
         }
@@ -2378,9 +3231,9 @@ mod tests {
     #[test]
     fn invalid_utf8_topics_and_unnegotiated_aliases_reconnect_without_delivering_messages() {
         for (body, expected) in [
-            (vec![0, 1, 0xff, 0, b'x'], "non-UTF-8"),
-            (vec![0, 1, b'x', 3, 0x23, 0, 1], "topic alias"),
-            (vec![0, 0, 3, 0x23, 0, 1], "topic alias"),
+            (vec![0, 1, 0xff, 0, b'x'], "mqtt.incoming_topic_utf8"),
+            (vec![0, 1, b'x', 3, 0x23, 0, 1], "mqtt.unexpected_topic_alias"),
+            (vec![0, 0, 3, 0x23, 0, 1], "mqtt.unexpected_topic_alias"),
         ] {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let port = listener.local_addr().unwrap().port();
@@ -2403,7 +3256,7 @@ mod tests {
             assert!(matches!(next_event(&runtime, &mut connection), BrokerEvent::Connected));
             publish.send(()).unwrap();
             match next_event(&runtime, &mut connection) {
-                BrokerEvent::Status(status) => assert!(status.contains(expected), "{status}"),
+                BrokerEvent::Status(MqttError::Reconnecting { source, .. }) => assert_eq!(source.code(), expected),
                 _ => panic!("invalid topic must not be delivered as a message"),
             }
             assert!(matches!(next_event(&runtime, &mut connection), BrokerEvent::Connecting));
@@ -2446,7 +3299,7 @@ mod tests {
                 .is_ok()
         );
         match next_event(&runtime, &mut connection) {
-            BrokerEvent::PublishError(error) => assert!(error.contains("Could not queue publish")),
+            BrokerEvent::PublishError(error) => assert!(matches!(error, MqttError::PublishQueue { .. })),
             _ => panic!("publishing failure must not report a deletion or status error"),
         }
         connection
@@ -2493,7 +3346,7 @@ mod tests {
             assert!(matches!(next_event(&runtime, &mut connection), BrokerEvent::PublishQueued));
             disconnect.send(()).unwrap();
             match next_event(&runtime, &mut connection) {
-                BrokerEvent::PublishError(error) => assert!(error.contains("will not be retried")),
+                BrokerEvent::PublishError(error) => assert!(matches!(error, MqttError::PublishInterrupted)),
                 _ => panic!("a disconnected publish must report a publish error, not a deletion error"),
             }
             assert!(matches!(next_event(&runtime, &mut connection), BrokerEvent::Status(_)));
@@ -2507,7 +3360,7 @@ mod tests {
     #[test]
     fn delete_topics_queues_for_the_current_connection_and_validates_topics() {
         let (connection, mut commands, _) = command_connection();
-        assert!(connection.delete_topics(vec!["#".into()]).is_err());
+        assert!(matches!(connection.delete_topics(vec!["#".into()]), Err(MqttError::TopicWildcard)));
         assert!(matches!(commands.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
         connection.delete_topics(vec!["test/value".into()]).unwrap();
         let Command::DeleteTopics(command) = commands.try_recv().unwrap() else {
@@ -2529,13 +3382,29 @@ mod tests {
     #[test]
     fn delete_topics_validates_the_entire_batch_before_queueing() {
         let (connection, mut commands, _) = command_connection();
-        for invalid in ["", "#", "a/+", "a#b", "a+b", "a\0b"] {
-            assert!(connection.delete_topics(vec!["valid".into(), invalid.into()]).is_err());
+        for (invalid, expected) in [
+            ("", "mqtt.topic_empty"),
+            ("#", "mqtt.topic_wildcard"),
+            ("a/+", "mqtt.topic_wildcard"),
+            ("a#b", "mqtt.topic_wildcard"),
+            ("a+b", "mqtt.topic_wildcard"),
+            ("a\0b", "mqtt.topic_null"),
+        ] {
+            assert_eq!(
+                connection.delete_topics(vec!["valid".into(), invalid.into()]).unwrap_err().code(),
+                expected
+            );
             assert!(matches!(commands.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
         }
         // MQTT's two-byte topic length is in UTF-8 bytes, not characters.
         for invalid in ["a".repeat(65536), "é".repeat(32768)] {
-            assert!(connection.delete_topics(vec![invalid]).is_err());
+            assert!(matches!(
+                connection.delete_topics(vec![invalid]),
+                Err(MqttError::TopicTooLong {
+                    length: 65536,
+                    limit: 65535
+                })
+            ));
             assert!(matches!(commands.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
         }
     }
@@ -2557,12 +3426,18 @@ mod tests {
         for _ in 0..COMMAND_CAPACITY {
             connection.delete_topics(vec!["test/value".into()]).unwrap();
         }
-        assert!(connection.delete_topics(vec!["test/value".into()]).is_err());
+        assert!(matches!(
+            connection.delete_topics(vec!["test/value".into()]),
+            Err(MqttError::CommandQueueFull)
+        ));
         for _ in 0..COMMAND_CAPACITY {
             commands.try_recv().unwrap();
         }
         drop(commands);
-        assert!(connection.delete_topics(vec!["test/value".into()]).is_err());
+        assert!(matches!(
+            connection.delete_topics(vec!["test/value".into()]),
+            Err(MqttError::WorkerStopped)
+        ));
     }
 
     #[test]
@@ -2634,7 +3509,7 @@ mod tests {
         next_matching_event(&runtime, &mut connection, |event| matches!(event, BrokerEvent::Connected));
         connection.delete_topics(vec!["test/value".into(); 100_000]).unwrap();
         match next_event(&runtime, &mut connection) {
-            BrokerEvent::OperationError(error) => assert!(error.contains("will not be retried")),
+            BrokerEvent::OperationError(error) => assert!(matches!(error, MqttError::DeletionInterrupted)),
             _ => panic!("an interrupted batch must report an operation error"),
         }
         next_matching_event(&runtime, &mut connection, |event| matches!(event, BrokerEvent::Connected));
@@ -2669,7 +3544,7 @@ mod tests {
                 .is_ok()
         );
         match next_event(&runtime, &mut connection) {
-            BrokerEvent::OperationError(error) => assert!(error.contains("Could not queue")),
+            BrokerEvent::OperationError(error) => assert!(matches!(error, MqttError::DeletionQueue { .. })),
             _ => panic!("a publishing failure must not emit a connection status"),
         }
         connection.delete_topics(vec!["test/value".into()]).unwrap();
@@ -2728,7 +3603,7 @@ mod tests {
         let error = runtime()
             .block_on(publish_clear_retained(client, vec!["test/value".into()], Rc::default()))
             .unwrap_err();
-        assert!(error.to_string().contains("Could not queue"));
+        assert!(matches!(error, MqttError::DeletionQueue { .. }));
     }
 
     // Self-signed P-256 certificate for broker.example and its signature over TLS_TEST_MESSAGE.
@@ -2849,8 +3724,8 @@ mod tests {
             tls_transport(RootCertStore::empty(), true, true)
                 .err()
                 .expect("WSS without trusted roots must fail")
-                .to_string(),
-            "Could not load trusted system certificates for TLS."
+                .code(),
+            "mqtt.trusted_certificates_unavailable"
         );
     }
 
@@ -2860,8 +3735,8 @@ mod tests {
             tls_transport(RootCertStore::empty(), true, false)
                 .err()
                 .expect("TLS without trusted roots must fail")
-                .to_string(),
-            "Could not load trusted system certificates for TLS."
+                .code(),
+            "mqtt.trusted_certificates_unavailable"
         );
     }
 }

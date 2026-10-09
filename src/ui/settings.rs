@@ -1,10 +1,10 @@
 //! Settings pages and broker management for the explorer.
 
-use super::{ConnectionStatus, ConnectionTestStatus, Explorer, connection_label};
+use super::{ConnectionStatus, ConnectionTestStatus, Explorer, connection_label, messages::LocalizedError};
 use crate::{
     appearance::{self, Appearance, AppearanceMode, ReduceMotion},
     config::{self, ConnectionConfig, ConnectionField, SavedConnections, TopicSubscription},
-    mqtt,
+    mqtt::{self, Qos},
 };
 use gpui_kit::assets::IconName as AssetIconName;
 use gpui_kit::component::{
@@ -108,7 +108,7 @@ impl Explorer {
             selected: Some(index),
         };
         if let Err(error) = config::save_connections(&connections) {
-            self.error = Some(format!("Could not select connection: {error:#}"));
+            self.error = Some(error.localized_message());
             cx.notify();
             return;
         }
@@ -222,7 +222,7 @@ impl Explorer {
             }
         };
         if let Err(error) = config.validate_broker_connection() {
-            let message = error.to_string();
+            let message = error.localized_message();
             self.connection_test = ConnectionTestStatus::Failed;
             self.invalid_field(error.field(), message.clone(), window, cx);
             window.push_notification(Notification::error(message).autohide(true), cx);
@@ -241,7 +241,7 @@ impl Explorer {
         let receiver = match mqtt::test_connection(config) {
             Ok(receiver) => receiver,
             Err(error) => {
-                let message = format!("Could not start the broker test: {error:#}");
+                let message = error.localized_message();
                 self.connection_test = ConnectionTestStatus::Failed;
                 window.push_notification(Notification::error(message).autohide(true), cx);
                 cx.notify();
@@ -251,7 +251,10 @@ impl Explorer {
         self.connection_test = ConnectionTestStatus::Testing;
         cx.notify();
         cx.spawn_in(window, async move |view, cx| {
-            let result = receiver.await.unwrap_or_else(|_| Err("The broker test ended unexpectedly.".into()));
+            let result = receiver
+                .await
+                .map(|result| result.map_err(|error| error.localized_message()))
+                .unwrap_or_else(|_| Err("The broker test ended unexpectedly.".into()));
             let _ = view.update_in(cx, |view, window, cx| {
                 if view.connection_test_revision == revision {
                     let notification = match result {
@@ -339,7 +342,7 @@ impl Explorer {
             }
         };
         if let Err(error) = config.validate() {
-            self.invalid_field(error.field(), error.to_string(), window, cx);
+            self.invalid_field(error.field(), error.localized_message(), window, cx);
             return;
         }
         let disconnect_after_save = !connect
@@ -370,7 +373,7 @@ impl Explorer {
             connections.selected = Some(index);
         }
         if let Err(error) = config::save_connections(&connections) {
-            self.error = Some(format!("Could not save connection: {error:#}"));
+            self.error = Some(error.localized_message());
             cx.notify();
             return;
         }
@@ -449,13 +452,13 @@ impl Explorer {
         let subscription = TopicSubscription {
             topic: self.topic_input.read(cx).value().to_string(),
             qos: match self.topic_qos.read(cx).selected_value() {
-                Some(&"1") => 1,
-                Some(&"2") => 2,
-                _ => 0,
+                Some(&"1") => Qos::AtLeastOnce,
+                Some(&"2") => Qos::ExactlyOnce,
+                _ => Qos::AtMostOnce,
             },
         };
         if let Err(error) = subscription.validate() {
-            self.invalid_field(ConnectionField::Topics, error.to_string(), window, cx);
+            self.invalid_field(ConnectionField::Topics, error.localized_message(), window, cx);
             return;
         }
         if self.subscription_topics.iter().any(|saved| saved.topic == subscription.topic) {
@@ -529,7 +532,7 @@ impl Explorer {
         index: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
-        save: impl FnOnce(&SavedConnections) -> anyhow::Result<()>,
+        save: impl FnOnce(&SavedConnections) -> Result<(), config::ConfigError>,
     ) {
         let mut connections = SavedConnections {
             connections: self.saved_connections.connections.clone(),
@@ -545,7 +548,7 @@ impl Explorer {
             selected => selected,
         };
         if let Err(error) = save(&connections) {
-            self.error = Some(format!("Could not remove connection: {error:#}"));
+            self.error = Some(error.localized_message());
             cx.notify();
             return;
         }
@@ -973,9 +976,9 @@ impl Explorer {
                                 div()
                                     .id(SharedString::from(format!("topic-qos:{topic}")))
                                     .test_support()
-                                    .aria_label(format!("QoS {}", subscription.qos))
+                                    .aria_label(format!("QoS {}", u8::from(subscription.qos)))
                                     .flex_none()
-                                    .child(Tag::secondary().small().child(format!("QoS {}", subscription.qos))),
+                                    .child(Tag::secondary().small().child(format!("QoS {}", u8::from(subscription.qos)))),
                             )
                             .child(
                                 Button::new(SharedString::from(format!("remove-topic:{topic}")))
@@ -1413,7 +1416,7 @@ impl Explorer {
             .dropdown_caret(true)
             .dropdown_menu(move |menu, window, cx| {
                 if let Err(error) = appearance::load_custom_themes(cx) {
-                    tracing::error!("Could not load custom themes: {error:#}");
+                    tracing::warn!(error_code = error.code(), diagnostic = ?error, "appearance.custom_themes.load_failed");
                 }
                 let mut menu = menu
                     .min_w(rems(14.).to_pixels(window.rem_size()))
@@ -1436,14 +1439,14 @@ impl Explorer {
 
     fn select_appearance_mode(&mut self, mode: AppearanceMode, window: &mut Window, cx: &mut Context<Self>) {
         if let Err(error) = appearance::select_mode(mode, window, cx) {
-            self.error = Some(format!("{error:#}"));
+            self.error = Some(error.localized_message());
         }
         cx.notify();
     }
 
     fn set_reduce_motion(&mut self, reduce_motion: ReduceMotion, window: &mut Window, cx: &mut Context<Self>) {
         if let Err(error) = appearance::set_reduce_motion(reduce_motion, cx) {
-            self.error = Some(format!("{error:#}"));
+            self.error = Some(error.localized_message());
         }
         self.refresh_animation(window, cx);
         cx.notify();
@@ -1451,7 +1454,7 @@ impl Explorer {
 
     fn select_theme(&mut self, mode: ThemeMode, name: SharedString, window: &mut Window, cx: &mut Context<Self>) {
         if let Err(error) = appearance::select_theme(mode, name, window, cx) {
-            self.error = Some(format!("{error:#}"));
+            self.error = Some(error.localized_message());
         }
         cx.notify();
     }

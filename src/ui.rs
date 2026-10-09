@@ -34,7 +34,13 @@ use crate::{
     topics::TopicStore,
 };
 
+mod appearance_errors;
+mod config_errors;
 mod explorer_pane;
+mod messages;
+mod mqtt_errors;
+
+use messages::LocalizedError;
 mod monitor;
 mod payload;
 mod payload_ansi;
@@ -272,7 +278,7 @@ impl Explorer {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let (saved_connections, error) = match config::load_connections() {
             Ok(connections) => (connections, None),
-            Err(error) => (SavedConnections::default(), Some(format!("{error:#}"))),
+            Err(error) => (SavedConnections::default(), Some(error.localized_message())),
         };
         let layout = config::load_topics_layout().unwrap_or_default();
         let publish_layout = config::load_publish_layout().unwrap_or_default();
@@ -596,7 +602,7 @@ impl Explorer {
             }
             Err(error) => {
                 self.status = ConnectionStatus::Disconnected;
-                self.error = Some(format!("Could not start the MQTT connection: {error:#}"));
+                self.error = Some(error.localized_message());
             }
         }
         cx.notify();
@@ -661,15 +667,15 @@ impl Explorer {
                 BrokerEvent::Connected => {
                     self.status = ConnectionStatus::Connected;
                 }
-                BrokerEvent::Status(status) => self.status = ConnectionStatus::Failed(status),
-                BrokerEvent::OperationError(error) => self.error = Some(format!("Could not delete retained topics: {error}")),
+                BrokerEvent::Status(error) => self.status = ConnectionStatus::Failed(error.localized_message()),
+                BrokerEvent::OperationError(error) => self.error = Some(error.localized_message()),
                 BrokerEvent::PublishQueued => {
                     self.publish_pending = false;
                     self.publish_feedback = Some(Ok("Queued for sending · delivery not confirmed".into()));
                 }
                 BrokerEvent::PublishError(error) => {
                     self.publish_pending = false;
-                    self.publish_feedback = Some(Err(error));
+                    self.publish_feedback = Some(Err(error.localized_message()));
                 }
                 BrokerEvent::Message(message) => {
                     charts_changed |= self.monitoring.receive(&message);
@@ -837,10 +843,7 @@ impl Explorer {
             return;
         };
         self.show_confirm_topic_deletion_dialog(path, window, cx, move |view, topics| {
-            let connection = view
-                .connection
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("The broker connection has closed."))?;
+            let connection = view.connection.as_ref().ok_or(mqtt::MqttError::WorkerStopped)?;
             connection.delete_topics(topics)
         });
     }
@@ -850,7 +853,7 @@ impl Explorer {
         path: String,
         window: &mut Window,
         cx: &mut Context<Self>,
-        send: impl FnOnce(&Self, Vec<String>) -> anyhow::Result<()> + 'static,
+        send: impl FnOnce(&Self, Vec<String>) -> Result<(), mqtt::MqttError> + 'static,
     ) {
         if !self.status.is_connected() {
             return;
@@ -930,7 +933,7 @@ impl Explorer {
                     if let Some((send, topics)) = pending.borrow_mut().take() {
                         _ = view.update(cx, |view, cx| {
                             let result = send(view, topics);
-                            view.error = result.err().map(|error| format!("Could not delete retained topics: {error:#}"));
+                            view.error = result.err().map(|error| error.localized_message());
                             cx.notify();
                         });
                     }
@@ -1001,7 +1004,7 @@ impl Explorer {
         self.topics_width_rem = Some(width_rem);
         self.topics_width_fraction = Some(width_fraction);
         if let Err(error) = config::save_topics_width(width_rem, width_fraction) {
-            self.error = Some(format!("Could not save the pane layout: {error:#}"));
+            self.error = Some(error.localized_message());
         }
         cx.notify();
     }

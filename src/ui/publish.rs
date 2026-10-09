@@ -4,7 +4,7 @@ use std::{fs::File, io::Read, ops::Range, path::Path, sync::Arc};
 
 use anyhow::{Context as _, ensure};
 
-use super::{CompletePublishTopic, Explorer, GrowPublish, PublishMessage, ShrinkPublish};
+use super::{CompletePublishTopic, Explorer, GrowPublish, PublishMessage, ShrinkPublish, messages::LocalizedError};
 use crate::{
     config,
     mqtt::{self, Qos},
@@ -165,7 +165,7 @@ impl Explorer {
         self.publish_open = open;
         self.restore_publish_height = open;
         if let Err(error) = config::save_publish_open(open) {
-            self.error = Some(format!("Could not save the pane layout: {error:#}"));
+            self.error = Some(error.localized_message());
         }
         cx.notify();
     }
@@ -410,7 +410,7 @@ impl Explorer {
         self.publish_height_rem = Some(height_rem);
         self.publish_height_fraction = Some(height_fraction);
         if let Err(error) = config::save_publish_height(height_rem, height_fraction) {
-            self.error = Some(format!("Could not save the pane layout: {error:#}"));
+            self.error = Some(error.localized_message());
         }
         cx.notify();
     }
@@ -419,43 +419,39 @@ impl Explorer {
         if self.publish_pending || self.publish_file_task.is_some() {
             return;
         }
-        let result = if self.status.is_connected() {
-            self.connection
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("Connect to a broker before publishing."))
-                .and_then(|connection| {
-                    let qos = match self.publish_qos.read(cx).selected_value() {
-                        Some(&"1") => Qos::AtLeastOnce,
-                        Some(&"2") => Qos::ExactlyOnce,
-                        _ => Qos::AtMostOnce,
-                    };
-                    let topic = self.publish_topic.read(cx).value().to_string();
-                    if let Some(file) = &self.publish_file {
-                        connection.publish_with_content_type(
-                            topic,
-                            file.payload.clone(),
-                            qos,
-                            self.publish_retain,
-                            Some(file.content_type.to_owned()),
-                        )
-                    } else {
-                        connection.publish(
-                            topic,
-                            self.publish_payload.read(cx).value().as_bytes().to_vec(),
-                            qos,
-                            self.publish_retain,
-                        )
-                    }
-                })
+        let Some(connection) = self.connection.as_ref().filter(|_| self.status.is_connected()) else {
+            self.publish_feedback = Some(Err("Connect to a broker before publishing.".into()));
+            cx.notify();
+            return;
+        };
+        let qos = match self.publish_qos.read(cx).selected_value() {
+            Some(&"1") => Qos::AtLeastOnce,
+            Some(&"2") => Qos::ExactlyOnce,
+            _ => Qos::AtMostOnce,
+        };
+        let topic = self.publish_topic.read(cx).value().to_string();
+        let result = if let Some(file) = &self.publish_file {
+            connection.publish_with_content_type(
+                topic,
+                file.payload.clone(),
+                qos,
+                self.publish_retain,
+                Some(file.content_type.to_owned()),
+            )
         } else {
-            Err(anyhow::anyhow!("Connect to a broker before publishing."))
+            connection.publish(
+                topic,
+                self.publish_payload.read(cx).value().as_bytes().to_vec(),
+                qos,
+                self.publish_retain,
+            )
         };
         match result {
             Ok(()) => {
                 self.publish_pending = true;
                 self.publish_feedback = None;
             }
-            Err(error) => self.publish_feedback = Some(Err(format!("{error:#}"))),
+            Err(error) => self.publish_feedback = Some(Err(error.localized_message())),
         }
         cx.notify();
     }

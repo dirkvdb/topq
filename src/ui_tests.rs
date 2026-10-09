@@ -7,7 +7,7 @@ use gpui_kit::{
     AnyWindowHandle, App, AppContext, Bounds, Entity, Focusable, Styled, TestAppContext, Window, WindowBounds, WindowOptions, px, size,
 };
 
-use super::{ConnectionStatus, ConnectionTestStatus, Explorer};
+use super::{ConnectionStatus, ConnectionTestStatus, Explorer, messages::LocalizedError};
 use crate::{
     appearance::{Appearance, AppearanceMode, ReduceMotion},
     config::{self, ConnectionConfig, ConnectionField, SavedConnections, TopicSubscription},
@@ -2421,7 +2421,12 @@ fn publish_panel_does_not_intercept_slashes_as_topic_filter_shortcuts(cx: &mut T
 }
 
 fn subscription(topic: &str, qos: u8) -> TopicSubscription {
-    TopicSubscription { topic: topic.into(), qos }
+    use crate::mqtt::Qos;
+
+    TopicSubscription {
+        topic: topic.into(),
+        qos: [Qos::AtMostOnce, Qos::AtLeastOnce, Qos::ExactlyOnce][usize::from(qos)],
+    }
 }
 
 fn message(topic: &str) -> Message {
@@ -2745,10 +2750,14 @@ fn broker_event_channel_closure_fails_pending_publish_and_retains_connection_sta
         view.update(cx, |view, cx| view.listen_for_events(events, window, cx));
     })
     .unwrap();
-    assert!(sender.try_send(BrokerEvent::Status("Broker unavailable".into())).is_ok());
+    assert!(
+        sender
+            .try_send(BrokerEvent::Status(crate::mqtt::MqttError::TrustedCertificatesUnavailable))
+            .is_ok()
+    );
     cx.run_until_parked();
     view.update(cx, |view, _| {
-        assert_eq!(view.status.label(), "Broker unavailable");
+        assert_eq!(view.status.label(), "Could not load trusted system certificates for TLS.");
         view.publish_pending = true;
         view.publish_feedback = None;
     });
@@ -2765,10 +2774,10 @@ fn broker_event_channel_closure_fails_pending_publish_and_retains_connection_sta
             view.publish_feedback.as_ref().unwrap().as_deref().map_err(String::as_str),
             Err("Connection stopped before the message could be queued. Reconnect and try again.")
         );
-        assert!(matches!(&view.status, ConnectionStatus::Failed(status) if status == "Connection stopped · Broker unavailable"));
+        assert!(matches!(&view.status, ConnectionStatus::Failed(status) if status == "Connection stopped · Could not load trusted system certificates for TLS."));
         assert_eq!(
             window.find("connection-indicator").label(),
-            Some("Connection stopped · Broker unavailable")
+            Some("Connection stopped · Could not load trusted system certificates for TLS.")
         );
         assert!(window.find("connection-error").visible());
     })
@@ -2786,7 +2795,11 @@ fn replacing_broker_event_listener_cancels_old_channel_and_ignores_queued_events
     })
     .unwrap();
     cx.run_until_parked();
-    assert!(old_sender.try_send(BrokerEvent::Status("Stale connection failure".into())).is_ok());
+    assert!(
+        old_sender
+            .try_send(BrokerEvent::Status(crate::mqtt::MqttError::WorkerStopped))
+            .is_ok()
+    );
     assert!(old_sender.try_send(BrokerEvent::Message(message("home/stale"))).is_ok());
 
     let (sender, events) = tokio::sync::mpsc::channel(2);
@@ -3103,9 +3116,12 @@ fn publish_errors_use_dismissible_alerts_without_changing_the_draft_layout(cx: &
                     view.update(cx, |view, cx| {
                         view.publish_pending = true;
                         view.apply_broker_events(
-                            [crate::mqtt::BrokerEvent::PublishError(
-                                "Broker rejected publish: NotAuthorized".into(),
-                            )],
+                            [crate::mqtt::BrokerEvent::PublishError(crate::mqtt::MqttError::PublishRejected {
+                                packet_id: 1,
+                                acknowledgement: crate::mqtt::PublishAcknowledgement::PubAck,
+                                reason_code: 0x87,
+                                diagnostic_reason: Some("private broker diagnostic".into()),
+                            })],
                             window,
                             cx,
                         );
@@ -3117,7 +3133,10 @@ fn publish_errors_use_dismissible_alerts_without_changing_the_draft_layout(cx: &
                 window.render_frame(cx);
                 let alert = window.find("publish-error");
                 assert!(alert.visible());
-                assert_eq!(alert.label(), Some("Broker rejected publish: NotAuthorized"));
+                assert_eq!(
+                    alert.label(),
+                    Some("Broker rejected publish (PUBACK, MQTT reason 0x87). Check access permissions and broker capabilities.")
+                );
                 assert!(window.try_find("publish-feedback").is_none());
                 assert_eq!(window.find("publish-payload").bounds(), payload_bounds);
                 assert!(!view.read(cx).publish_pending);
@@ -4129,6 +4148,29 @@ fn deleting_an_inactive_connection_preserves_the_active_connections_topics(cx: &
 }
 
 #[gpui_kit::test]
+fn connection_selection_failure_renders_localized_copy_and_preserves_selection(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, false, 1200., 760.);
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.saved_connections.connections.push(ConnectionConfig {
+                name: "Invalid".into(),
+                host: String::new(),
+                ..Default::default()
+            });
+            view.select_connection(1, window, cx);
+        });
+        window.render_frame(cx);
+        let explorer = view.read(cx);
+        assert_eq!(explorer.saved_connections.selected, Some(0));
+        assert!(explorer.status.is_connected());
+        assert_eq!(explorer.topics.topics, 2);
+        assert_eq!(explorer.error.as_deref(), Some("Enter a broker hostname or IP address."));
+        assert!(window.find("application-error").visible());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
 fn confirming_connection_deletion_preserves_topics_when_saving_fails(cx: &mut TestAppContext) {
     cx.update(|cx| cx.set_reduce_motion(true));
     let (handle, view) = open(cx, false, 1200., 760.);
@@ -4164,7 +4206,7 @@ fn confirming_connection_deletion_preserves_topics_when_saving_fails(cx: &mut Te
         assert!(view.status.is_connected());
         assert!(view.active_config.is_some());
         assert_eq!(view.topics.topics, 2);
-        assert!(view.error.as_ref().unwrap().starts_with("Could not remove connection:"));
+        assert_eq!(view.error.as_deref(), Some("Enter a broker hostname or IP address."));
     });
 }
 
@@ -5583,7 +5625,7 @@ fn enter_rejects_invalid_topic_filters_inline_and_returns_focus_without_adding(c
             assert!(window.find("settings-dialog").visible());
             assert!(window.find("topic-editor").visible());
             let error = window.find("topics-error");
-            assert_eq!(error.label(), Some(expected_error.to_string().as_str()));
+            assert_eq!(error.label(), Some(expected_error.localized_message().as_str()));
             assert_eq!(window.find("topic-filter").focused(), Some(true));
             assert_eq!(window.find("topic-filter").value(), Some(filter));
             assert!(error.bounds().top() >= window.find("field:topic-filter").bounds().bottom());
@@ -6910,7 +6952,7 @@ fn failed_topic_deletion_reports_the_error_without_losing_topic_data(cx: &mut Te
     cx.update_window(handle, |_, window, cx| {
         view.update(cx, |view, cx| {
             view.select_topic("home/a", window, cx);
-            view.show_confirm_topic_deletion_dialog("home/a".into(), window, cx, |_, _| anyhow::bail!("queue full"));
+            view.show_confirm_topic_deletion_dialog("home/a".into(), window, cx, |_, _| Err(crate::mqtt::MqttError::CommandQueueFull));
         });
     })
     .unwrap();
@@ -6922,7 +6964,7 @@ fn failed_topic_deletion_reports_the_error_without_losing_topic_data(cx: &mut Te
     click_topic_deletion_button(cx, handle, "ok");
     cx.update(|cx| {
         let view = view.read(cx);
-        assert!(view.error.as_ref().unwrap().contains("queue full"));
+        assert_eq!(view.error.as_deref(), Some("The MQTT command queue is full. Wait and try again."));
         assert!(view.status.is_connected());
         assert_eq!(view.topics.topics, 2);
         assert_eq!(view.payload.read(cx).value().as_str(), "42");
