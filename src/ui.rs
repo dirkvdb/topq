@@ -1498,7 +1498,6 @@ impl Explorer {
                                         Tag::secondary()
                                             .small()
                                             .outline()
-                                            .rounded(cx.theme().radius_full())
                                             .text_xs()
                                             .child(relative_received_age(&value.received_at)),
                                     ),
