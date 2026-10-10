@@ -271,6 +271,7 @@ pub struct Explorer {
     event_task: Option<Task<()>>,
     received_age_task: Option<Task<()>>,
     animation_scheduled: bool,
+    ui_state_saved_on_close: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -280,13 +281,19 @@ impl Explorer {
             Ok(connections) => (connections, None),
             Err(error) => (SavedConnections::default(), Some(error.localized_message())),
         };
-        let layout = config::load_topics_layout().unwrap_or_default();
-        let publish_layout = config::load_publish_layout().unwrap_or_default();
-        let mut view = Self::with_connections(saved_connections, error, layout.width_rem, layout.width_fraction, window, cx);
-        view.publish_open = publish_layout.open;
-        view.publish_height_rem = publish_layout.height_rem;
-        view.publish_height_fraction = publish_layout.height_fraction;
-        view.restore_publish_height = publish_layout.height_rem.is_some() || publish_layout.height_fraction.is_some();
+        let state = config::load_ui_state();
+        let mut view = Self::with_connections(
+            saved_connections,
+            error,
+            state.topics_width_rem,
+            state.topics_width_fraction,
+            window,
+            cx,
+        );
+        view.publish_open = state.publish_open;
+        view.publish_height_rem = state.publish_height_rem;
+        view.publish_height_fraction = state.publish_height_fraction;
+        view.restore_publish_height = state.publish_height_rem.is_some() || state.publish_height_fraction.is_some();
         view
     }
 
@@ -474,13 +481,20 @@ impl Explorer {
             }
         }));
         subscriptions.push(cx.subscribe_in(&panes, window, |view, state, _: &ResizablePanelEvent, window, cx| {
-            view.persist_split(state, window, cx);
+            view.cache_topics_split(state, window, cx);
         }));
         subscriptions.push(
             cx.subscribe_in(&publish_panes, window, |view, state, _: &ResizablePanelEvent, window, cx| {
-                view.persist_publish_split(state, window, cx);
+                view.cache_publish_split(state, window, cx);
             }),
         );
+
+        // Closing the window releases the view; quitting directly can happen before release.
+        subscriptions.push(cx.on_release(|view, _| view.save_ui_state_on_close()));
+        subscriptions.push(cx.on_app_quit(|view, _| {
+            view.save_ui_state_on_close();
+            async {}
+        }));
 
         let mut view = Self {
             name,
@@ -561,6 +575,7 @@ impl Explorer {
             event_task: None,
             received_age_task: None,
             animation_scheduled: false,
+            ui_state_saved_on_close: false,
             _subscriptions: subscriptions,
         };
         if let Some(config) = saved_config {
@@ -843,7 +858,7 @@ impl Explorer {
             return;
         };
         self.show_confirm_topic_deletion_dialog(path, window, cx, move |view, topics| {
-            let connection = view.connection.as_ref().ok_or(mqtt::MqttError::WorkerStopped)?;
+            let connection = view.connection.as_ref().ok_or(crate::error::mqtt::MqttError::WorkerStopped)?;
             connection.delete_topics(topics)
         });
     }
@@ -853,7 +868,7 @@ impl Explorer {
         path: String,
         window: &mut Window,
         cx: &mut Context<Self>,
-        send: impl FnOnce(&Self, Vec<String>) -> Result<(), mqtt::MqttError> + 'static,
+        send: impl FnOnce(&Self, Vec<String>) -> Result<(), crate::error::mqtt::MqttError> + 'static,
     ) {
         if !self.status.is_connected() {
             return;
@@ -992,7 +1007,25 @@ impl Explorer {
             .update(cx, |state, cx| state.resize_panel(0, current + delta, window, cx));
     }
 
-    fn persist_split(&mut self, state: &Entity<ResizableState>, window: &Window, cx: &mut Context<Self>) {
+    fn ui_state(&self) -> config::UiState {
+        config::UiState {
+            topics_width_rem: self.topics_width_rem,
+            topics_width_fraction: self.topics_width_fraction,
+            publish_height_rem: self.publish_height_rem,
+            publish_height_fraction: self.publish_height_fraction,
+            publish_open: self.publish_open,
+        }
+    }
+
+    fn save_ui_state_on_close(&mut self) {
+        if self.ui_state_saved_on_close {
+            return;
+        }
+        self.ui_state_saved_on_close = true;
+        config::save_ui_state(&self.ui_state());
+    }
+
+    fn cache_topics_split(&mut self, state: &Entity<ResizableState>, window: &Window, cx: &mut Context<Self>) {
         let state = state.read(cx);
         let Some(width) = state.sizes().first() else { return };
         let container_size = state.container_size();
@@ -1003,9 +1036,6 @@ impl Explorer {
         let width_fraction = (*width / container_size).clamp(0., 1.);
         self.topics_width_rem = Some(width_rem);
         self.topics_width_fraction = Some(width_fraction);
-        if let Err(error) = config::save_topics_width(width_rem, width_fraction) {
-            self.error = Some(error.localized_message());
-        }
         cx.notify();
     }
 

@@ -2,7 +2,7 @@
 
 use std::{
     collections::{HashSet, hash_map::RandomState},
-    fmt, fs,
+    fs,
     hash::{BuildHasher, Hash, Hasher},
     io::Write,
     path::{Path, PathBuf},
@@ -15,7 +15,10 @@ use keyring::{Entry, Error as KeyringError};
 use serde::{Deserialize, Serialize, ser::SerializeStruct};
 use url::Url;
 
-use crate::mqtt::Qos;
+use crate::{
+    error::config::{ConfigError, ConnectionValidationCode, ConnectionValidationError, LayoutDiagnostic, LayoutError, credential_error},
+    mqtt::Qos,
+};
 
 /// An MQTT topic filter and its requested maximum delivery QoS.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,17 +42,17 @@ impl TopicSubscription {
     /// QoS validity is enforced by its type; unknown numeric levels load as QoS 0.
     pub fn validate(&self) -> Result<(), ConnectionValidationError> {
         if self.topic.len() > usize::from(u16::MAX) || self.topic.contains('\0') || !rumqttc::valid_filter(&self.topic) {
-            return Err(ConnectionValidationError {
-                field: ConnectionField::Topics,
-                code: ConnectionValidationCode::InvalidTopicFilter,
-            });
+            return Err(ConnectionValidationError::new(
+                ConnectionField::Topics,
+                ConnectionValidationCode::InvalidTopicFilter,
+            ));
         }
         Ok(())
     }
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, from = "DeserializedConnectionConfig")]
+#[serde(default)]
 #[non_exhaustive]
 pub struct ConnectionConfig {
     pub name: String,
@@ -58,6 +61,7 @@ pub struct ConnectionConfig {
     pub client_id: String,
     pub topics: Vec<TopicSubscription>,
     pub username: String,
+    /// Runtime-only password from user input or the credential store; never read from or written to configuration.
     #[serde(skip)]
     pub password: String,
     pub tls: bool,
@@ -78,546 +82,6 @@ pub(crate) enum ConnectionField {
     Username,
 }
 
-/// Stable validation reasons; their Display values are translation keys, never UI copy.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ConnectionValidationCode {
-    MissingHost,
-    HostContainsSchemeOrPath,
-    InvalidPort,
-    InvalidClientId,
-    InvalidTopicFilter,
-    MissingTopics,
-    DuplicateTopicFilter,
-    PasswordWithoutUsername,
-}
-
-impl ConnectionValidationCode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::MissingHost => "config.validation.host_required",
-            Self::HostContainsSchemeOrPath => "config.validation.host_scheme_or_path",
-            Self::InvalidPort => "config.validation.port_invalid",
-            Self::InvalidClientId => "config.validation.client_id_invalid",
-            Self::InvalidTopicFilter => "config.validation.topic_filter_invalid",
-            Self::MissingTopics => "config.validation.topics_required",
-            Self::DuplicateTopicFilter => "config.validation.topic_filter_duplicate",
-            Self::PasswordWithoutUsername => "config.validation.username_required",
-        }
-    }
-}
-
-impl fmt::Display for ConnectionValidationCode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ConnectionValidationError {
-    field: ConnectionField,
-    code: ConnectionValidationCode,
-}
-
-impl ConnectionValidationError {
-    /// Returns the translation-independent reason validation failed.
-    pub fn code(&self) -> ConnectionValidationCode {
-        self.code
-    }
-
-    pub(crate) fn field(&self) -> ConnectionField {
-        self.field
-    }
-}
-
-impl fmt::Display for ConnectionValidationError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.code.fmt(f)
-    }
-}
-
-impl std::error::Error for ConnectionValidationError {}
-
-/// Stable URI failures that can survive Serde's string-only custom-error boundary.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ConnectionUriCode {
-    FormatFailed,
-    UsernameEncodingFailed,
-    Invalid,
-    InvalidComponents,
-    UnsupportedScheme,
-    MissingHost,
-    UsernameNotUtf8,
-}
-
-impl ConnectionUriCode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::FormatFailed => "config.connection_uri.format_failed",
-            Self::UsernameEncodingFailed => "config.connection_uri.username_encode_failed",
-            Self::Invalid => "config.connection_uri.invalid",
-            Self::InvalidComponents => "config.connection_uri.components_invalid",
-            Self::UnsupportedScheme => "config.connection_uri.scheme_invalid",
-            Self::MissingHost => "config.connection_uri.host_required",
-            Self::UsernameNotUtf8 => "config.connection_uri.username_utf8_invalid",
-        }
-    }
-
-    fn from_serde_message(message: &str) -> Option<Self> {
-        [
-            Self::FormatFailed,
-            Self::UsernameEncodingFailed,
-            Self::Invalid,
-            Self::InvalidComponents,
-            Self::UnsupportedScheme,
-            Self::MissingHost,
-            Self::UsernameNotUtf8,
-        ]
-        .into_iter()
-        .find(|code| code.as_str() == message)
-    }
-}
-
-impl fmt::Display for ConnectionUriCode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-/// Parser diagnostics without input values, snippets, or arbitrary serializer messages.
-/// Raw Serde/TOML errors can echo plaintext credentials, including ignored legacy fields.
-#[derive(Clone)]
-pub enum ConfigDiagnostic {
-    Json {
-        category: serde_json::error::Category,
-        line: usize,
-        column: usize,
-    },
-    ConnectionUri {
-        code: ConnectionUriCode,
-        line: usize,
-        column: usize,
-    },
-    Toml {
-        span: Option<std::ops::Range<usize>>,
-    },
-    TomlSerialization,
-}
-
-impl From<serde_json::Error> for ConfigDiagnostic {
-    fn from(error: serde_json::Error) -> Self {
-        let line = error.line();
-        let column = error.column();
-        if error.classify() == serde_json::error::Category::Data {
-            // Serde erases custom error types. Recover only our exact allowlisted codes,
-            // optionally followed by Serde's location suffix; never retain its raw message.
-            let message = error.to_string();
-            let suffix = format!(" at line {line} column {column}");
-            let message = message.strip_suffix(&suffix).unwrap_or(&message);
-            if let Some(code) = ConnectionUriCode::from_serde_message(message) {
-                return Self::ConnectionUri { code, line, column };
-            }
-        }
-        Self::Json {
-            category: error.classify(),
-            line,
-            column,
-        }
-    }
-}
-
-impl From<toml::de::Error> for ConfigDiagnostic {
-    fn from(error: toml::de::Error) -> Self {
-        Self::Toml { span: error.span() }
-    }
-}
-
-impl fmt::Debug for ConfigDiagnostic {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Json { category, line, column } => f
-                .debug_struct("Json")
-                .field("category", category)
-                .field("line", line)
-                .field("column", column)
-                .finish(),
-            Self::ConnectionUri { code, line, column } => f
-                .debug_struct("ConnectionUri")
-                .field("code", code)
-                .field("line", line)
-                .field("column", column)
-                .finish(),
-            Self::Toml { span } => f.debug_struct("Toml").field("span", span).finish(),
-            Self::TomlSerialization => f.write_str("TomlSerialization"),
-        }
-    }
-}
-
-impl fmt::Display for ConfigDiagnostic {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Json { category, .. } => match category {
-                serde_json::error::Category::Io => "config.diagnostic.json_io",
-                serde_json::error::Category::Syntax => "config.diagnostic.json_syntax",
-                serde_json::error::Category::Data => "config.diagnostic.json_data",
-                serde_json::error::Category::Eof => "config.diagnostic.json_eof",
-            },
-            Self::ConnectionUri { code, .. } => code.as_str(),
-            Self::Toml { .. } => "config.diagnostic.toml_parse",
-            Self::TomlSerialization => "config.diagnostic.toml_serialize",
-        })
-    }
-}
-
-impl std::error::Error for ConfigDiagnostic {}
-
-/// Typed persistence failures. Display is code-only; presentation belongs to the UI.
-/// Paths and safe sources retain diagnostic context, but credentials and raw config
-/// contents are never stored in errors.
-pub enum ConfigError {
-    ConfigDirectoryUnavailable,
-    HomeDirectoryUnavailable,
-    InvalidConfigPath {
-        path: PathBuf,
-    },
-    InvalidStatePath {
-        path: PathBuf,
-    },
-    ReadConfig {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-    ParseConfig {
-        path: PathBuf,
-        source: ConfigDiagnostic,
-    },
-    ParseConnections {
-        path: PathBuf,
-        source: ConfigDiagnostic,
-    },
-    SerializeConfig {
-        path: PathBuf,
-        source: ConfigDiagnostic,
-    },
-    ConfigObjectRequired,
-    InspectConfig {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-    ConfigNotWritable {
-        path: PathBuf,
-        alternative_path: Option<PathBuf>,
-    },
-    WriteApplicationConfig {
-        path: PathBuf,
-        alternative_path: Option<PathBuf>,
-        source: Box<ConfigError>,
-    },
-    ReadState {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-    StateNotUtf8 {
-        path: PathBuf,
-        source: std::str::Utf8Error,
-    },
-    ParseState {
-        path: PathBuf,
-        source: ConfigDiagnostic,
-    },
-    SerializeState {
-        path: PathBuf,
-        source: ConfigDiagnostic,
-    },
-    CreateConfigDirectory {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-    OpenTemporaryConfig {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-    WriteConfig {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-    FlushConfig {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-    SaveConfig {
-        path: PathBuf,
-        temporary_path: PathBuf,
-        source: std::io::Error,
-    },
-    CreateStateDirectory {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-    OpenTemporaryState {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-    WriteState {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-    FlushState {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-    SaveState {
-        path: PathBuf,
-        temporary_path: PathBuf,
-        source: std::io::Error,
-    },
-    Validation(ConnectionValidationError),
-    SelectedConnectionOutOfRange {
-        selected: usize,
-        connection_count: usize,
-    },
-    DuplicateConnectionAccount,
-    FormatConnectionUri {
-        source: url::ParseError,
-    },
-    EncodeConnectionUsername,
-    InvalidConnectionUri {
-        source: url::ParseError,
-    },
-    ConnectionUriComponents,
-    ConnectionUriScheme,
-    ConnectionUriHostRequired,
-    ConnectionUriUsernameNotUtf8 {
-        source: std::str::Utf8Error,
-    },
-    OpenCredentialStore {
-        source: Box<ConfigError>,
-    },
-    RetrievePassword {
-        source: Box<ConfigError>,
-    },
-    InspectPassword {
-        source: Box<ConfigError>,
-    },
-    UpdatePassword {
-        source: Box<ConfigError>,
-    },
-    CredentialMissing,
-    CredentialAccessDenied,
-    CredentialStoreUnavailable,
-    CredentialNotDecodable,
-    CredentialOperationFailed,
-    RollbackCredentials {
-        failures: Vec<ConfigError>,
-    },
-    SaveRollbackFailed {
-        source: Box<ConfigError>,
-        rollback: Box<ConfigError>,
-    },
-}
-
-impl ConfigError {
-    /// The affected filesystem path, or the original failure's path after a failed rollback.
-    /// For directory and temporary-file operations this is the directory or temporary file.
-    pub fn path(&self) -> Option<&Path> {
-        match self {
-            Self::InvalidConfigPath { path }
-            | Self::InvalidStatePath { path }
-            | Self::ReadConfig { path, .. }
-            | Self::ParseConfig { path, .. }
-            | Self::ParseConnections { path, .. }
-            | Self::SerializeConfig { path, .. }
-            | Self::InspectConfig { path, .. }
-            | Self::ConfigNotWritable { path, .. }
-            | Self::WriteApplicationConfig { path, .. }
-            | Self::ReadState { path, .. }
-            | Self::StateNotUtf8 { path, .. }
-            | Self::ParseState { path, .. }
-            | Self::SerializeState { path, .. }
-            | Self::CreateConfigDirectory { path, .. }
-            | Self::OpenTemporaryConfig { path, .. }
-            | Self::WriteConfig { path, .. }
-            | Self::FlushConfig { path, .. }
-            | Self::SaveConfig { path, .. }
-            | Self::CreateStateDirectory { path, .. }
-            | Self::OpenTemporaryState { path, .. }
-            | Self::WriteState { path, .. }
-            | Self::FlushState { path, .. }
-            | Self::SaveState { path, .. } => Some(path),
-            Self::SaveRollbackFailed { source, .. } => source.path(),
-            _ => None,
-        }
-    }
-
-    /// The temporary file involved in an open, write, flush, or rename failure.
-    pub fn temporary_path(&self) -> Option<&Path> {
-        match self {
-            Self::SaveConfig { temporary_path, .. } | Self::SaveState { temporary_path, .. } => Some(temporary_path),
-            Self::OpenTemporaryConfig { path, .. }
-            | Self::WriteConfig { path, .. }
-            | Self::FlushConfig { path, .. }
-            | Self::OpenTemporaryState { path, .. }
-            | Self::WriteState { path, .. }
-            | Self::FlushState { path, .. } => Some(path),
-            Self::WriteApplicationConfig { source, .. } | Self::SaveRollbackFailed { source, .. } => source.temporary_path(),
-            _ => None,
-        }
-    }
-
-    /// The other configuration destination considered when writing failed.
-    pub fn alternative_path(&self) -> Option<&Path> {
-        match self {
-            Self::ConfigNotWritable { alternative_path, .. } | Self::WriteApplicationConfig { alternative_path, .. } => {
-                alternative_path.as_deref()
-            }
-            Self::SaveRollbackFailed { source, .. } => source.alternative_path(),
-            _ => None,
-        }
-    }
-
-    /// The rejected zero-based selection and the number of saved connections.
-    pub fn invalid_selection(&self) -> Option<(usize, usize)> {
-        match self {
-            Self::SelectedConnectionOutOfRange {
-                selected,
-                connection_count,
-            } => Some((*selected, *connection_count)),
-            _ => None,
-        }
-    }
-
-    pub fn code(&self) -> &'static str {
-        match self {
-            Self::ConfigDirectoryUnavailable => "config.directory_unavailable",
-            Self::HomeDirectoryUnavailable => "config.home_directory_unavailable",
-            Self::InvalidConfigPath { .. } => "config.path_invalid",
-            Self::InvalidStatePath { .. } => "config.state.path_invalid",
-            Self::ReadConfig { .. } => "config.read_failed",
-            Self::ParseConfig { .. } => "config.parse_failed",
-            Self::ParseConnections { .. } => "config.connections.parse_failed",
-            Self::SerializeConfig { .. } => "config.serialize_failed",
-            Self::ConfigObjectRequired => "config.json_object_required",
-            Self::InspectConfig { .. } => "config.inspect_failed",
-            Self::ConfigNotWritable { .. } => "config.not_writable",
-            Self::WriteApplicationConfig { .. } => "config.application.write_failed",
-            Self::ReadState { .. } => "config.state.read_failed",
-            Self::StateNotUtf8 { .. } => "config.state.utf8_invalid",
-            Self::ParseState { .. } => "config.state.parse_failed",
-            Self::SerializeState { .. } => "config.state.serialize_failed",
-            Self::CreateConfigDirectory { .. } => "config.directory_create_failed",
-            Self::OpenTemporaryConfig { .. } => "config.temporary_open_failed",
-            Self::WriteConfig { .. } => "config.write_failed",
-            Self::FlushConfig { .. } => "config.flush_failed",
-            Self::SaveConfig { .. } => "config.save_failed",
-            Self::CreateStateDirectory { .. } => "config.state.directory_create_failed",
-            Self::OpenTemporaryState { .. } => "config.state.temporary_open_failed",
-            Self::WriteState { .. } => "config.state.write_failed",
-            Self::FlushState { .. } => "config.state.flush_failed",
-            Self::SaveState { .. } => "config.state.save_failed",
-            Self::Validation(error) => error.code().as_str(),
-            Self::SelectedConnectionOutOfRange { .. } => "config.connections.selection_out_of_range",
-            Self::DuplicateConnectionAccount => "config.connections.account_duplicate",
-            Self::FormatConnectionUri { .. } => ConnectionUriCode::FormatFailed.as_str(),
-            Self::EncodeConnectionUsername => ConnectionUriCode::UsernameEncodingFailed.as_str(),
-            Self::InvalidConnectionUri { .. } => ConnectionUriCode::Invalid.as_str(),
-            Self::ConnectionUriComponents => ConnectionUriCode::InvalidComponents.as_str(),
-            Self::ConnectionUriScheme => ConnectionUriCode::UnsupportedScheme.as_str(),
-            Self::ConnectionUriHostRequired => ConnectionUriCode::MissingHost.as_str(),
-            Self::ConnectionUriUsernameNotUtf8 { .. } => ConnectionUriCode::UsernameNotUtf8.as_str(),
-            Self::OpenCredentialStore { .. } => "config.credentials.open_failed",
-            Self::RetrievePassword { .. } => "config.credentials.retrieve_failed",
-            Self::InspectPassword { .. } => "config.credentials.inspect_failed",
-            Self::UpdatePassword { .. } => "config.credentials.update_failed",
-            Self::CredentialMissing => "config.credentials.missing",
-            Self::CredentialAccessDenied => "config.credentials.access_denied",
-            Self::CredentialStoreUnavailable => "config.credentials.unavailable",
-            Self::CredentialNotDecodable => "config.credentials.decode_failed",
-            Self::CredentialOperationFailed => "config.credentials.operation_failed",
-            Self::RollbackCredentials { .. } => "config.credentials.rollback_failed",
-            Self::SaveRollbackFailed { .. } => "config.save_rollback_failed",
-        }
-    }
-}
-
-// Debug is the diagnostic surface: unlike Display/localization it deliberately
-// includes filesystem context, alternative destinations, selection bounds, safe sources, and every rollback failure.
-impl fmt::Debug for ConfigError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        use std::error::Error as _;
-
-        let mut debug = f.debug_struct("ConfigError");
-        debug.field("code", &self.code());
-        if let Some(path) = self.path() {
-            debug.field("path", &path);
-        }
-        if let Some(path) = self.temporary_path() {
-            debug.field("temporary_path", &path);
-        }
-        if let Some(path) = self.alternative_path() {
-            debug.field("alternative_path", &path);
-        }
-        if let Some((selected, connection_count)) = self.invalid_selection() {
-            debug.field("selected", &selected).field("connection_count", &connection_count);
-        }
-        if let Self::RollbackCredentials { failures } = self {
-            debug.field("failures", failures);
-        } else if let Some(source) = self.source() {
-            debug.field("source", &source);
-        }
-        if let Self::SaveRollbackFailed { rollback, .. } = self {
-            debug.field("rollback", rollback);
-        }
-        debug.finish()
-    }
-}
-
-impl fmt::Display for ConfigError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.code())
-    }
-}
-
-impl std::error::Error for ConfigError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::ReadConfig { source, .. }
-            | Self::InspectConfig { source, .. }
-            | Self::ReadState { source, .. }
-            | Self::CreateConfigDirectory { source, .. }
-            | Self::OpenTemporaryConfig { source, .. }
-            | Self::WriteConfig { source, .. }
-            | Self::FlushConfig { source, .. }
-            | Self::SaveConfig { source, .. }
-            | Self::CreateStateDirectory { source, .. }
-            | Self::OpenTemporaryState { source, .. }
-            | Self::WriteState { source, .. }
-            | Self::FlushState { source, .. }
-            | Self::SaveState { source, .. } => Some(source),
-            Self::ParseConfig { source, .. }
-            | Self::ParseConnections { source, .. }
-            | Self::SerializeConfig { source, .. }
-            | Self::ParseState { source, .. }
-            | Self::SerializeState { source, .. } => Some(source),
-            Self::StateNotUtf8 { source, .. } | Self::ConnectionUriUsernameNotUtf8 { source } => Some(source),
-            Self::Validation(error) => Some(error),
-            Self::FormatConnectionUri { source } | Self::InvalidConnectionUri { source } => Some(source),
-            Self::OpenCredentialStore { source }
-            | Self::RetrievePassword { source }
-            | Self::InspectPassword { source }
-            | Self::UpdatePassword { source }
-            | Self::WriteApplicationConfig { source, .. }
-            | Self::SaveRollbackFailed { source, .. } => Some(source.as_ref()),
-            Self::RollbackCredentials { failures } => failures.first().map(|error| error as _),
-            _ => None,
-        }
-    }
-}
-
-impl From<ConnectionValidationError> for ConfigError {
-    fn from(error: ConnectionValidationError) -> Self {
-        Self::Validation(error)
-    }
-}
-
 impl Default for ConnectionConfig {
     fn default() -> Self {
         Self {
@@ -631,68 +95,6 @@ impl Default for ConnectionConfig {
             tls: false,
             validate_certificate: true,
             websocket: false,
-        }
-    }
-}
-
-// Keep legacy fields confined to deserialization, and never accept a plaintext password.
-#[derive(Deserialize)]
-#[serde(default)]
-struct DeserializedConnectionConfig {
-    name: String,
-    host: String,
-    port: u16,
-    client_id: String,
-    topics: Option<Vec<TopicSubscription>>,
-    base_topic: Option<String>,
-    username: String,
-    tls: bool,
-    validate_certificate: bool,
-    websocket: bool,
-}
-
-impl Default for DeserializedConnectionConfig {
-    fn default() -> Self {
-        let config = ConnectionConfig::default();
-        Self {
-            name: config.name,
-            host: config.host,
-            port: config.port,
-            client_id: config.client_id,
-            topics: None,
-            base_topic: None,
-            username: config.username,
-            tls: config.tls,
-            validate_certificate: config.validate_certificate,
-            websocket: config.websocket,
-        }
-    }
-}
-
-impl From<DeserializedConnectionConfig> for ConnectionConfig {
-    fn from(config: DeserializedConnectionConfig) -> Self {
-        let topics = config.topics.unwrap_or_else(|| {
-            config.base_topic.map_or_else(
-                || vec![TopicSubscription::default()],
-                |topic| {
-                    vec![TopicSubscription {
-                        topic,
-                        qos: Qos::ExactlyOnce,
-                    }]
-                },
-            )
-        });
-        Self {
-            name: config.name,
-            host: config.host,
-            port: config.port,
-            client_id: config.client_id,
-            topics,
-            username: config.username,
-            password: String::new(),
-            tls: config.tls,
-            validate_certificate: config.validate_certificate,
-            websocket: config.websocket,
         }
     }
 }
@@ -725,28 +127,28 @@ impl ConnectionConfig {
 
     fn validate_broker_endpoint(&self) -> Result<(), ConnectionValidationError> {
         if self.host.trim().is_empty() {
-            return Err(ConnectionValidationError {
-                field: ConnectionField::Host,
-                code: ConnectionValidationCode::MissingHost,
-            });
+            return Err(ConnectionValidationError::new(
+                ConnectionField::Host,
+                ConnectionValidationCode::MissingHost,
+            ));
         }
         if self.host.contains("://") || self.host.contains('/') {
-            return Err(ConnectionValidationError {
-                field: ConnectionField::Host,
-                code: ConnectionValidationCode::HostContainsSchemeOrPath,
-            });
+            return Err(ConnectionValidationError::new(
+                ConnectionField::Host,
+                ConnectionValidationCode::HostContainsSchemeOrPath,
+            ));
         }
         if self.port == 0 {
-            return Err(ConnectionValidationError {
-                field: ConnectionField::Port,
-                code: ConnectionValidationCode::InvalidPort,
-            });
+            return Err(ConnectionValidationError::new(
+                ConnectionField::Port,
+                ConnectionValidationCode::InvalidPort,
+            ));
         }
         if self.client_id.trim().is_empty() || self.client_id.len() > usize::from(u16::MAX) || self.client_id.contains('\0') {
-            return Err(ConnectionValidationError {
-                field: ConnectionField::ClientId,
-                code: ConnectionValidationCode::InvalidClientId,
-            });
+            return Err(ConnectionValidationError::new(
+                ConnectionField::ClientId,
+                ConnectionValidationCode::InvalidClientId,
+            ));
         }
         Ok(())
     }
@@ -754,10 +156,10 @@ impl ConnectionConfig {
     pub(crate) fn validate_broker_connection(&self) -> Result<(), ConnectionValidationError> {
         self.validate_broker_endpoint()?;
         if self.username.is_empty() && !self.password.is_empty() {
-            return Err(ConnectionValidationError {
-                field: ConnectionField::Username,
-                code: ConnectionValidationCode::PasswordWithoutUsername,
-            });
+            return Err(ConnectionValidationError::new(
+                ConnectionField::Username,
+                ConnectionValidationCode::PasswordWithoutUsername,
+            ));
         }
         Ok(())
     }
@@ -765,26 +167,26 @@ impl ConnectionConfig {
     pub fn validate(&self) -> Result<(), ConnectionValidationError> {
         self.validate_broker_endpoint()?;
         if self.topics.is_empty() {
-            return Err(ConnectionValidationError {
-                field: ConnectionField::Topics,
-                code: ConnectionValidationCode::MissingTopics,
-            });
+            return Err(ConnectionValidationError::new(
+                ConnectionField::Topics,
+                ConnectionValidationCode::MissingTopics,
+            ));
         }
         let mut filters = HashSet::new();
         for subscription in &self.topics {
             subscription.validate()?;
             if !filters.insert(subscription.topic.as_str()) {
-                return Err(ConnectionValidationError {
-                    field: ConnectionField::Topics,
-                    code: ConnectionValidationCode::DuplicateTopicFilter,
-                });
+                return Err(ConnectionValidationError::new(
+                    ConnectionField::Topics,
+                    ConnectionValidationCode::DuplicateTopicFilter,
+                ));
             }
         }
         if self.username.is_empty() && !self.password.is_empty() {
-            return Err(ConnectionValidationError {
-                field: ConnectionField::Username,
-                code: ConnectionValidationCode::PasswordWithoutUsername,
-            });
+            return Err(ConnectionValidationError::new(
+                ConnectionField::Username,
+                ConnectionValidationCode::PasswordWithoutUsername,
+            ));
         }
         Ok(())
     }
@@ -866,7 +268,10 @@ pub(crate) fn application_config_read_path() -> Result<PathBuf, ConfigError> {
 }
 
 fn state_config_path() -> Result<PathBuf, ConfigError> {
-    Ok(state_path()?.with_file_name("config.json"))
+    // Locating the shared state directory can only fail when the home directory is
+    // unavailable. Config fallback failures are user-facing; layout failures are log-only.
+    let path = state_path().map_err(|_| ConfigError::HomeDirectoryUnavailable)?;
+    Ok(path.with_file_name("config.json"))
 }
 
 fn prioritized_config_path(state_path: &Path, config_path: &Path) -> Result<PathBuf, ConfigError> {
@@ -972,17 +377,11 @@ fn is_io_error(error: &ConfigError) -> bool {
     match error {
         ConfigError::ReadConfig { .. }
         | ConfigError::InspectConfig { .. }
-        | ConfigError::ReadState { .. }
         | ConfigError::CreateConfigDirectory { .. }
         | ConfigError::OpenTemporaryConfig { .. }
         | ConfigError::WriteConfig { .. }
         | ConfigError::FlushConfig { .. }
-        | ConfigError::SaveConfig { .. }
-        | ConfigError::CreateStateDirectory { .. }
-        | ConfigError::OpenTemporaryState { .. }
-        | ConfigError::WriteState { .. }
-        | ConfigError::FlushState { .. }
-        | ConfigError::SaveState { .. } => true,
+        | ConfigError::SaveConfig { .. } => true,
         ConfigError::WriteApplicationConfig { source, .. } => is_io_error(source),
         // A failed credential rollback must not be hidden by retrying a disk write elsewhere.
         _ => false,
@@ -1000,7 +399,7 @@ fn read_connections(path: &Path) -> Result<Option<StoredConnections>, ConfigErro
         return Ok(None);
     };
     if path.file_name().is_some_and(|name| name == "config.json") && value.get("connections").is_none() {
-        let appearance_only = ["mode", "light_theme", "dark_theme", "reduce_motion", "theme"]
+        let appearance_only = ["mode", "light_theme", "dark_theme", "reduce_motion"]
             .iter()
             .any(|key| value.get(key).is_some());
         if appearance_only || value.as_object().is_some_and(serde_json::Map::is_empty) {
@@ -1220,23 +619,49 @@ impl<'de> Deserialize<'de> for SavedConnection {
         D: serde::Deserializer<'de>,
     {
         #[derive(Deserialize)]
-        struct DeserializedSavedConnection {
-            #[serde(default)]
-            connection: Option<String>,
-            #[serde(flatten)]
-            config: ConnectionConfig,
+        #[serde(default)]
+        struct ConnectionSettings {
+            name: String,
+            client_id: String,
+            topics: Vec<TopicSubscription>,
+            validate_certificate: bool,
         }
 
-        let mut saved = DeserializedSavedConnection::deserialize(deserializer)?;
-        if let Some(connection) = saved.connection {
-            let address = parse_connection_uri(&connection).map_err(serde::de::Error::custom)?;
-            saved.config.host = address.host;
-            saved.config.port = address.port;
-            saved.config.tls = address.tls;
-            saved.config.websocket = address.websocket;
-            saved.config.username = address.username;
+        impl Default for ConnectionSettings {
+            fn default() -> Self {
+                let config = ConnectionConfig::default();
+                Self {
+                    name: config.name,
+                    client_id: config.client_id,
+                    topics: config.topics,
+                    validate_certificate: config.validate_certificate,
+                }
+            }
         }
-        Ok(Self { config: saved.config })
+
+        #[derive(Deserialize)]
+        struct DeserializedSavedConnection {
+            connection: String,
+            #[serde(flatten)]
+            settings: ConnectionSettings,
+        }
+
+        let saved = DeserializedSavedConnection::deserialize(deserializer)?;
+        let address = parse_connection_uri(&saved.connection).map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            config: ConnectionConfig {
+                name: saved.settings.name,
+                host: address.host,
+                port: address.port,
+                client_id: saved.settings.client_id,
+                topics: saved.settings.topics,
+                username: address.username,
+                password: String::new(),
+                tls: address.tls,
+                validate_certificate: saved.settings.validate_certificate,
+                websocket: address.websocket,
+            },
+        })
     }
 }
 
@@ -1294,21 +719,14 @@ fn parse_connection_uri(connection: &str) -> Result<ConnectionAddress, ConfigErr
 }
 
 fn credential_account(config: &ConnectionConfig) -> String {
-    // Preserve legacy TCP/TLS keys; WebSocket uses a separate protocol scope.
-    let transport = if config.websocket {
-        if config.tls { "wss" } else { "ws" }
-    } else if config.tls {
-        "true"
-    } else {
-        "false"
-    };
+    let protocol = config.protocol().trim_end_matches("://");
     // Length prefixes keep host and username delimiters from colliding.
     format!(
         "{}:{}:{}:{}:{}:{}",
         config.host.len(),
         config.host,
         config.port,
-        transport,
+        protocol,
         config.username.len(),
         config.username
     )
@@ -1336,42 +754,18 @@ fn password_entry(config: &ConnectionConfig) -> Result<Entry, ConfigError> {
     })
 }
 
-fn credential_error(error: KeyringError) -> ConfigError {
-    // Keyring payloads and their sources can contain secrets. Retain only the reason.
-    match error {
-        KeyringError::NoEntry => ConfigError::CredentialMissing,
-        KeyringError::NoStorageAccess(_) => ConfigError::CredentialAccessDenied,
-        KeyringError::NoDefaultStore => ConfigError::CredentialStoreUnavailable,
-        KeyringError::BadEncoding(_) | KeyringError::BadDataFormat(_, _) => ConfigError::CredentialNotDecodable,
-        _ => ConfigError::CredentialOperationFailed,
-    }
-}
-
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
-struct LayoutPreferences {
-    topics_width_rem: Option<f32>,
-    topics_width_fraction: Option<f32>,
-    publish_height_rem: Option<f32>,
-    publish_height_fraction: Option<f32>,
-    publish_open: Option<bool>,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub(crate) struct TopicsLayout {
-    pub width_rem: Option<f32>,
-    pub width_fraction: Option<f32>,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub(crate) struct PublishLayout {
-    pub open: bool,
-    pub height_rem: Option<f32>,
-    pub height_fraction: Option<f32>,
+pub(crate) struct UiState {
+    pub(crate) topics_width_rem: Option<f32>,
+    pub(crate) topics_width_fraction: Option<f32>,
+    pub(crate) publish_height_rem: Option<f32>,
+    pub(crate) publish_height_fraction: Option<f32>,
+    pub(crate) publish_open: bool,
 }
 
 #[cfg(test)]
-fn state_path() -> Result<PathBuf, ConfigError> {
+pub(crate) fn state_path() -> Result<PathBuf, LayoutError> {
     std::thread_local! {
         static TEST_STATE_DIR: tempfile::TempDir = tempfile::tempdir()
             .expect("Could not create a temporary application state directory.");
@@ -1380,7 +774,7 @@ fn state_path() -> Result<PathBuf, ConfigError> {
 }
 
 #[cfg(not(test))]
-fn state_path() -> Result<PathBuf, ConfigError> {
+fn state_path() -> Result<PathBuf, LayoutError> {
     let state_dir = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
@@ -1388,98 +782,67 @@ fn state_path() -> Result<PathBuf, ConfigError> {
         .unwrap_or_else(|| {
             BaseDirs::new()
                 .map(|dirs| dirs.home_dir().join(".local").join("state"))
-                .ok_or(ConfigError::HomeDirectoryUnavailable)
+                .ok_or(LayoutError::HomeDirectoryUnavailable)
         })?;
     Ok(state_dir.join("topq").join("state.toml"))
 }
 
-pub(crate) fn load_topics_layout() -> Result<TopicsLayout, ConfigError> {
-    load_topics_layout_from(&state_path()?)
+/// Restores the UI state, logging failures and falling back to defaults.
+pub(crate) fn load_ui_state() -> UiState {
+    state_path().and_then(|path| load_ui_state_from(&path)).unwrap_or_else(|error| {
+        tracing::warn!(error_code = error.code(), diagnostic = ?error, "ui_state.load_failed");
+        UiState::default()
+    })
 }
 
-fn load_layout_preferences_from(path: &Path) -> Result<LayoutPreferences, ConfigError> {
+fn load_ui_state_from(path: &Path) -> Result<UiState, LayoutError> {
     let data = match fs::read(path) {
         Ok(data) => data,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(LayoutPreferences::default()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(UiState::default()),
         Err(source) => {
-            return Err(ConfigError::ReadState {
+            return Err(LayoutError::ReadState {
                 path: path.to_owned(),
                 source,
             });
         }
     };
-    let text = std::str::from_utf8(&data).map_err(|source| ConfigError::StateNotUtf8 {
+    let text = std::str::from_utf8(&data).map_err(|source| LayoutError::StateNotUtf8 {
         path: path.to_owned(),
         source,
     })?;
-    toml::from_str(text).map_err(|error| ConfigError::ParseState {
+    let mut state: UiState = toml::from_str(text).map_err(|error| LayoutError::ParseState {
         path: path.to_owned(),
         source: error.into(),
-    })
+    })?;
+    state.topics_width_rem = state.topics_width_rem.filter(|width| width.is_finite() && *width > 0.);
+    state.topics_width_fraction = state
+        .topics_width_fraction
+        .filter(|fraction| fraction.is_finite() && (0. ..=1.).contains(fraction));
+    state.publish_height_rem = state.publish_height_rem.filter(|height| height.is_finite() && *height > 0.);
+    state.publish_height_fraction = state
+        .publish_height_fraction
+        .filter(|fraction| fraction.is_finite() && (0. ..=1.).contains(fraction));
+    Ok(state)
 }
 
-fn load_topics_layout_from(path: &Path) -> Result<TopicsLayout, ConfigError> {
-    let preferences = load_layout_preferences_from(path)?;
-    Ok(TopicsLayout {
-        width_rem: preferences.topics_width_rem.filter(|width| width.is_finite() && *width > 0.),
-        width_fraction: preferences
-            .topics_width_fraction
-            .filter(|fraction| fraction.is_finite() && (0. ..=1.).contains(fraction)),
-    })
+/// Best-effort save of the entire UI snapshot; failures are logged without replacing unreadable state.
+pub(crate) fn save_ui_state(state: &UiState) {
+    if let Err(error) = state_path().and_then(|path| save_ui_state_to(&path, state)) {
+        tracing::warn!(error_code = error.code(), diagnostic = ?error, "ui_state.save_failed");
+    }
 }
 
-pub(crate) fn load_publish_layout() -> Result<PublishLayout, ConfigError> {
-    load_publish_layout_from(&state_path()?)
+fn save_ui_state_to(path: &Path, state: &UiState) -> Result<(), LayoutError> {
+    // Validate existing state before replacing it, without merging it into the supplied snapshot.
+    load_ui_state_from(path)?;
+    write_toml(path, state)
 }
 
-fn load_publish_layout_from(path: &Path) -> Result<PublishLayout, ConfigError> {
-    let preferences = load_layout_preferences_from(path)?;
-    Ok(PublishLayout {
-        open: preferences.publish_open.unwrap_or_default(),
-        height_rem: preferences.publish_height_rem.filter(|height| height.is_finite() && *height > 0.),
-        height_fraction: preferences
-            .publish_height_fraction
-            .filter(|fraction| fraction.is_finite() && (0. ..=1.).contains(fraction)),
-    })
-}
-
-pub(crate) fn save_topics_width(width: f32, fraction: f32) -> Result<(), ConfigError> {
-    save_topics_width_to(&state_path()?, width, fraction)
-}
-
-fn save_topics_width_to(path: &Path, width: f32, fraction: f32) -> Result<(), ConfigError> {
-    let mut preferences = load_layout_preferences_from(path)?;
-    preferences.topics_width_rem = Some(width);
-    preferences.topics_width_fraction = Some(fraction);
-    write_toml(path, &preferences)
-}
-
-pub(crate) fn save_publish_height(height_rem: f32, fraction: f32) -> Result<(), ConfigError> {
-    save_publish_height_to(&state_path()?, height_rem, fraction)
-}
-
-fn save_publish_height_to(path: &Path, height_rem: f32, fraction: f32) -> Result<(), ConfigError> {
-    let mut preferences = load_layout_preferences_from(path)?;
-    preferences.publish_height_rem = Some(height_rem);
-    preferences.publish_height_fraction = Some(fraction);
-    write_toml(path, &preferences)
-}
-
-pub(crate) fn save_publish_open(open: bool) -> Result<(), ConfigError> {
-    save_publish_open_to(&state_path()?, open)
-}
-
-fn save_publish_open_to(path: &Path, open: bool) -> Result<(), ConfigError> {
-    let mut preferences = load_layout_preferences_from(path)?;
-    preferences.publish_open = Some(open);
-    write_toml(path, &preferences)
-}
-
-fn write_toml(path: &Path, value: &impl Serialize) -> Result<(), ConfigError> {
+fn write_toml(path: &Path, value: &impl Serialize) -> Result<(), LayoutError> {
     let parent = path
         .parent()
-        .ok_or_else(|| ConfigError::InvalidStatePath { path: path.to_owned() })?;
-    fs::create_dir_all(parent).map_err(|source| ConfigError::CreateStateDirectory {
+        .ok_or_else(|| LayoutError::InvalidStatePath { path: path.to_owned() })?;
+    fs::create_dir_all(parent).map_err(|source| LayoutError::CreateStateDirectory {
         path: parent.to_owned(),
         source,
     })?;
@@ -1491,23 +854,23 @@ fn write_toml(path: &Path, value: &impl Serialize) -> Result<(), ConfigError> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options.open(&temp).map_err(|source| ConfigError::OpenTemporaryState {
+    let mut file = options.open(&temp).map_err(|source| LayoutError::OpenTemporaryState {
         path: temp.clone(),
         source,
     })?;
-    let data = toml::to_string_pretty(value).map_err(|_| ConfigError::SerializeState {
+    let data = toml::to_string_pretty(value).map_err(|_| LayoutError::SerializeState {
         path: path.to_owned(),
-        source: ConfigDiagnostic::TomlSerialization,
+        source: LayoutDiagnostic::TomlSerialization,
     })?;
-    file.write_all(data.as_bytes()).map_err(|source| ConfigError::WriteState {
+    file.write_all(data.as_bytes()).map_err(|source| LayoutError::WriteState {
         path: temp.clone(),
         source,
     })?;
-    file.sync_all().map_err(|source| ConfigError::FlushState {
+    file.sync_all().map_err(|source| LayoutError::FlushState {
         path: temp.clone(),
         source,
     })?;
-    fs::rename(&temp, path).map_err(|source| ConfigError::SaveState {
+    fs::rename(&temp, path).map_err(|source| LayoutError::SaveState {
         path: path.to_owned(),
         temporary_path: temp.clone(),
         source,
@@ -1644,6 +1007,47 @@ mod tests {
     use keyring_core::{api::CredentialStoreApi, mock};
 
     use super::*;
+    use crate::error::config::{ConfigDiagnostic, ConnectionUriCode};
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn capture_logs<T>(operation: impl FnOnce() -> T) -> (T, String) {
+        let output = CapturedLogs::default();
+        let writer = output.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let result = tracing::subscriber::with_default(subscriber, operation);
+        let logs = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+        (result, logs)
+    }
+
+    fn assert_layout_failure_logs(logs: &str, path: &Path, error_code: &str) {
+        let events = ["ui_state.load_failed", "ui_state.save_failed"];
+        assert_eq!(logs.lines().count(), events.len(), "{logs}");
+        for (line, event) in logs.lines().zip(events) {
+            assert!(line.contains("WARN"), "{line}");
+            assert!(line.contains(event), "{line}");
+            assert!(line.contains(&format!("error_code=\"{error_code}\"")), "{line}");
+            assert!(line.contains("diagnostic=LayoutError"), "{line}");
+            assert!(line.contains(&format!("path: {path:?}")), "{line}");
+        }
+    }
 
     fn mock_entries() -> impl Fn(&ConnectionConfig) -> Result<Entry, ConfigError> {
         let store = mock::Store::new().unwrap();
@@ -1710,7 +1114,7 @@ mod tests {
     }
 
     #[test]
-    fn topics_default_to_all_topics_at_qos_zero_for_new_and_existing_connections() {
+    fn topics_default_to_all_topics_at_qos_zero_when_omitted() {
         let expected = vec![TopicSubscription {
             topic: "#".into(),
             qos: Qos::AtMostOnce,
@@ -1761,6 +1165,30 @@ mod tests {
     }
 
     #[test]
+    fn saved_connections_require_a_string_connection_uri_before_accessing_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let entries = |_: &ConnectionConfig| -> Result<Entry, ConfigError> { panic!("invalid saved entries must not access credentials") };
+        for connection in [None, Some(serde_json::Value::Null), Some(serde_json::json!(42))] {
+            let mut saved = serde_json::json!({"name": "Home"});
+            if let Some(connection) = connection {
+                saved["connection"] = connection;
+            }
+            let original = serde_json::json!({"connections": [saved], "active_connection": "Home"}).to_string();
+            fs::write(&path, &original).unwrap();
+            assert!(matches!(
+                load_connections_from(&path, &entries),
+                Err(ConfigError::ParseConnections { .. })
+            ));
+            assert!(matches!(
+                save_connections_to(&path, &SavedConnections::default(), &entries),
+                Err(ConfigError::ParseConnections { .. })
+            ));
+            assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        }
+    }
+
+    #[test]
     fn saved_connection_uris_restore_and_encode_usernames() {
         let saved: SavedConnection = serde_json::from_str(r#"{"connection":"mqtts://alice%40home%3Aname@broker.example:8883"}"#).unwrap();
         assert_eq!(saved.config.username, "alice@home:name");
@@ -1796,7 +1224,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_configs_default_to_non_websocket_without_changing_tls() {
+    fn omitted_websocket_defaults_to_tcp_without_changing_tls() {
         for (json, expected) in [("{}", "mqtt://"), (r#"{"tls":false}"#, "mqtt://"), (r#"{"tls":true}"#, "mqtts://")] {
             let config: ConnectionConfig = serde_json::from_str(json).unwrap();
             assert!(!config.websocket);
@@ -1806,7 +1234,7 @@ mod tests {
     }
 
     #[test]
-    fn certificate_validation_defaults_to_true_for_new_and_legacy_connections() {
+    fn certificate_validation_defaults_to_true_when_omitted() {
         assert!(ConnectionConfig::default().validate_certificate);
         for json in ["{}", r#"{"tls":false}"#, r#"{"tls":true}"#, r#"{"websocket":true}"#] {
             let config: ConnectionConfig = serde_json::from_str(json).unwrap();
@@ -1847,66 +1275,71 @@ mod tests {
     }
 
     #[test]
-    fn generated_client_ids_are_unique_and_legacy_configs_receive_a_default() {
+    fn generated_client_ids_are_unique_and_omitted_ids_receive_a_default() {
         let first = ConnectionConfig::default().client_id;
         let second = ConnectionConfig::default().client_id;
         assert!(first.starts_with("topq-"));
         assert_ne!(first, second);
         assert_eq!(first.len(), 21);
 
-        let legacy: ConnectionConfig = serde_json::from_str(r#"{"host":"broker.example"}"#).unwrap();
-        assert!(legacy.client_id.starts_with("topq-"));
+        let defaulted: ConnectionConfig = serde_json::from_str(r#"{"host":"broker.example"}"#).unwrap();
+        assert!(defaulted.client_id.starts_with("topq-"));
         let configured: ConnectionConfig = serde_json::from_str(r#"{"client_id":"custom-client"}"#).unwrap();
         assert_eq!(configured.client_id, "custom-client");
     }
 
     #[test]
-    fn legacy_base_topic_migrates_to_a_single_qos_two_subscription() {
-        let config: ConnectionConfig = serde_json::from_str(r#"{"base_topic":"home/#"}"#).unwrap();
-        assert_eq!(
-            config.topics,
-            vec![TopicSubscription {
-                topic: "home/#".into(),
-                qos: Qos::ExactlyOnce
-            }]
-        );
-        assert!(config.validate().is_ok());
-        let json = serde_json::to_value(config).unwrap();
-        assert!(json.get("base_topic").is_none());
-        assert_eq!(json["topics"], serde_json::json!([{"topic":"home/#","qos":2}]));
-    }
-
-    #[test]
-    fn explicit_topics_take_precedence_over_legacy_base_topic_including_an_empty_list() {
-        let config: ConnectionConfig = serde_json::from_str(r#"{"base_topic":"old/#","topics":[{"topic":"new/#","qos":1}]}"#).unwrap();
-        assert_eq!(
-            config.topics,
-            vec![TopicSubscription {
-                topic: "new/#".into(),
-                qos: Qos::AtLeastOnce
-            }]
-        );
-        let config: ConnectionConfig = serde_json::from_str(r#"{"base_topic":"old/#","topics":[]}"#).unwrap();
-        assert!(config.topics.is_empty());
-        assert_eq!(config.validate().unwrap_err().field(), ConnectionField::Topics);
-    }
-
-    #[test]
-    fn invalid_legacy_filters_are_not_silently_replaced_with_defaults() {
-        for json in [r#"{"base_topic":""}"#, r#"{"base_topic":"home/#/value"}"#] {
-            let config: ConnectionConfig = serde_json::from_str(json).unwrap();
-            assert_eq!(config.validate().unwrap_err().field(), ConnectionField::Topics);
+    fn deserialization_ignores_plaintext_passwords_regardless_of_value_type() {
+        for password in [r#""plaintext-secret""#, "null", "true", "42", "[]", "{}"] {
+            let json = format!(r#"{{"username":"mqtt-user","password":{password},"topics":[{{"topic":"home/#","qos":0}}]}}"#);
+            let config: ConnectionConfig = serde_json::from_str(&json).unwrap();
+            assert!(config.password.is_empty());
         }
     }
 
     #[test]
-    fn deserialization_ignores_plaintext_passwords_in_both_configuration_shapes() {
-        for json in [
-            r#"{"username":"mqtt-user","password":"plaintext-secret","base_topic":"home/#"}"#,
-            r##"{"username":"mqtt-user","password":"plaintext-secret","topics":[{"topic":"#","qos":0}]}"##,
-        ] {
-            let config: ConnectionConfig = serde_json::from_str(json).unwrap();
-            assert!(config.password.is_empty());
+    fn saved_connection_deserialization_ignores_plaintext_passwords_regardless_of_value_type() {
+        for password in [r#""plaintext-secret""#, "null", "true", "42", "[]", "{}"] {
+            let json = format!(r#"{{"connection":"mqtt://mqtt-user@localhost:1883","password":{password}}}"#);
+            let saved: SavedConnection = serde_json::from_str(&json).unwrap();
+            assert!(saved.config.password.is_empty());
+            let serialized = serde_json::to_string(&saved).unwrap();
+            assert!(!serialized.contains("plaintext-secret"));
+            assert!(
+                serde_json::from_str::<serde_json::Value>(&serialized)
+                    .unwrap()
+                    .get("password")
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn topics_require_an_array_when_present() {
+        for topics in ["null", "true", "42", r#""home/#""#, "{}"] {
+            let json = format!(r#"{{"topics":{topics}}}"#);
+            assert!(serde_json::from_str::<ConnectionConfig>(&json).is_err());
+            let saved_json = format!(r#"{{"connection":"mqtt://localhost:1883","topics":{topics}}}"#);
+            assert!(serde_json::from_str::<SavedConnection>(&saved_json).is_err());
+        }
+    }
+
+    #[test]
+    fn explicit_empty_topics_are_not_replaced_with_defaults() {
+        let config: ConnectionConfig = serde_json::from_str(r#"{"topics":[]}"#).unwrap();
+        assert!(config.topics.is_empty());
+        assert_eq!(config.validate().unwrap_err().code(), ConnectionValidationCode::MissingTopics);
+    }
+
+    #[test]
+    fn deserialized_invalid_topic_filters_are_not_replaced_with_defaults() {
+        for topic in ["", "home/#/value"] {
+            let config: ConnectionConfig = serde_json::from_value(serde_json::json!({
+                "topics": [{"topic": topic, "qos": 0}]
+            }))
+            .unwrap();
+            assert_eq!(config.topics[0].topic, topic);
+            assert_eq!(config.validate().unwrap_err().code(), ConnectionValidationCode::InvalidTopicFilter);
         }
     }
 
@@ -2002,9 +1435,9 @@ mod tests {
     }
 
     #[test]
-    fn connection_config_deserialization_rejects_non_numeric_qos_without_using_legacy_defaults() {
+    fn connection_config_deserialization_rejects_non_numeric_qos() {
         for qos in [r#""1""#, r#""AtMostOnce""#, "null", "true", "[]", "{}", "1e400"] {
-            let json = format!(r#"{{"base_topic":"legacy/#","topics":[{{"topic":"home/#","qos":{qos}}}]}}"#);
+            let json = format!(r#"{{"topics":[{{"topic":"home/#","qos":{qos}}}]}}"#);
             assert!(serde_json::from_str::<ConnectionConfig>(&json).is_err(), "accepted QoS {qos}");
         }
     }
@@ -2037,7 +1470,6 @@ mod tests {
                 {"topic":"$SYS/#","qos":2},
             ])
         );
-        assert!(json.get("base_topic").is_none());
         assert!(serde_json::from_value::<ConnectionConfig>(json).unwrap() == config);
     }
 
@@ -2106,11 +1538,11 @@ mod tests {
     }
 
     #[test]
-    fn tcp_and_tls_credential_keys_keep_the_legacy_format() {
+    fn tcp_and_tls_credential_keys_identify_the_mqtt_protocol() {
         let mut config = authenticated_config();
-        assert_eq!(credential_account(&config), "9:localhost:1883:false:9:mqtt-user");
+        assert_eq!(credential_account(&config), "9:localhost:1883:mqtt:9:mqtt-user");
         config.tls = true;
-        assert_eq!(credential_account(&config), "9:localhost:1883:true:9:mqtt-user");
+        assert_eq!(credential_account(&config), "9:localhost:1883:mqtts:9:mqtt-user");
     }
 
     #[test]
@@ -2133,7 +1565,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_saved_protocols_restore_passwords_and_persist_websocket_false() {
+    fn saved_tcp_and_tls_protocols_restore_passwords_and_roundtrip_uris() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("connections.json");
         let entries = mock_entries();
@@ -2145,7 +1577,11 @@ mod tests {
         };
         entries(&tcp).unwrap().set_password(&tcp.password).unwrap();
         entries(&tls).unwrap().set_password(&tls.password).unwrap();
-        fs::write(&path, r#"{"connections":[{"host":"localhost","username":"mqtt-user","password_in_keyring":true},{"host":"localhost","username":"mqtt-user","tls":true,"password_in_keyring":true}]}"#).unwrap();
+        fs::write(
+            &path,
+            r#"{"connections":[{"connection":"mqtt://mqtt-user@localhost:1883"},{"connection":"mqtts://mqtt-user@localhost:1883"}]}"#,
+        )
+        .unwrap();
         let saved = load_connections_from(&path, &entries).unwrap();
         assert_eq!(saved.connections[0].password, tcp.password);
         assert_eq!(saved.connections[1].password, tls.password);
@@ -2166,15 +1602,15 @@ mod tests {
         assert_eq!(json["connections"][0]["connection"], "mqtt://mqtt-user@localhost:1883");
         assert_eq!(json["connections"][1]["connection"], "mqtts://mqtt-user@localhost:1883");
         assert!(json["connections"][0].get("username").is_none());
-        assert!(json["connections"][0].get("password_in_keyring").is_none());
+        assert!(json["connections"][0].get("password").is_none());
     }
 
     #[test]
-    fn legacy_saved_connections_default_to_validating_certificates() {
+    fn saved_connections_default_to_validating_certificates_when_omitted() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("connections.json");
         let entries = mock_entries();
-        fs::write(&path, r#"{"connections":[{"tls":true}]}"#).unwrap();
+        fs::write(&path, r#"{"connections":[{"connection":"mqtts://localhost:8883"}]}"#).unwrap();
         let saved = load_connections_from(&path, &entries).unwrap();
         assert!(saved.connections[0].validate_certificate);
         save_connections_to(&path, &saved, &entries).unwrap();
@@ -2677,7 +2113,7 @@ mod tests {
         update_json(&path, &serde_json::json!({"light_theme":"Ayu Light"})).unwrap();
         update_json(
             &path,
-            &serde_json::json!({"connections":[{"name":"Home"}],"active_connection":"Home"}),
+            &serde_json::json!({"connections":[{"name":"Home","connection":"mqtt://localhost:1883"}],"active_connection":"Home"}),
         )
         .unwrap();
         let saved = read_config_value(&path).unwrap().unwrap();
@@ -2748,125 +2184,112 @@ mod tests {
     }
 
     #[test]
-    fn topics_width_roundtrips_through_toml_state() {
+    fn ui_state_snapshot_roundtrips_through_flat_toml() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("topq").join("state.toml");
-        save_topics_width_to(&path, 31.5, 0.4).unwrap();
+        let state = UiState {
+            topics_width_rem: Some(31.5),
+            topics_width_fraction: Some(0.4),
+            publish_height_rem: Some(18.5),
+            publish_height_fraction: Some(0.25),
+            publish_open: true,
+        };
+        save_ui_state_to(&path, &state).unwrap();
+        assert_eq!(load_ui_state_from(&path).unwrap(), state);
         assert_eq!(
-            load_topics_layout_from(&path).unwrap(),
-            TopicsLayout {
-                width_rem: Some(31.5),
-                width_fraction: Some(0.4),
-            }
+            fs::read_to_string(&path).unwrap(),
+            "topics_width_rem = 31.5\ntopics_width_fraction = 0.4\npublish_height_rem = 18.5\npublish_height_fraction = 0.25\npublish_open = true\n"
         );
-        assert_eq!(
-            fs::read_to_string(path).unwrap(),
-            "topics_width_rem = 31.5\ntopics_width_fraction = 0.4\n"
-        );
+        assert!(!path.with_extension("toml.tmp").exists());
     }
 
     #[test]
-    fn publish_height_roundtrips_through_toml_state() {
+    fn ui_state_fraction_boundaries_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("topq").join("state.toml");
+        let path = dir.path().join("state.toml");
         for fraction in [0., 0.25, 1.] {
-            save_publish_height_to(&path, 18.5, fraction).unwrap();
-            assert_eq!(
-                load_publish_layout_from(&path).unwrap(),
-                PublishLayout {
-                    height_rem: Some(18.5),
-                    height_fraction: Some(fraction),
-                    ..PublishLayout::default()
-                }
-            );
-        }
-        let state = fs::read_to_string(path).unwrap();
-        assert_eq!(state, "publish_height_rem = 18.5\npublish_height_fraction = 1.0\n");
-    }
-
-    #[test]
-    fn publish_open_roundtrips_without_losing_pane_sizes() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("topq").join("state.toml");
-        save_topics_width_to(&path, 31.5, 0.4).unwrap();
-        save_publish_height_to(&path, 18.5, 0.25).unwrap();
-        assert!(!load_publish_layout_from(&path).unwrap().open);
-        for open in [true, false] {
-            save_publish_open_to(&path, open).unwrap();
-            assert_eq!(
-                load_publish_layout_from(&path).unwrap(),
-                PublishLayout {
-                    open,
-                    height_rem: Some(18.5),
-                    height_fraction: Some(0.25),
-                }
-            );
-            assert_eq!(
-                load_topics_layout_from(&path).unwrap(),
-                TopicsLayout {
-                    width_rem: Some(31.5),
-                    width_fraction: Some(0.4),
-                }
-            );
-            save_topics_width_to(&path, 31.5, 0.4).unwrap();
-            save_publish_height_to(&path, 18.5, 0.25).unwrap();
-            assert_eq!(load_publish_layout_from(&path).unwrap().open, open);
+            let state = UiState {
+                topics_width_fraction: Some(fraction),
+                publish_height_fraction: Some(fraction),
+                ..UiState::default()
+            };
+            save_ui_state_to(&path, &state).unwrap();
+            assert_eq!(load_ui_state_from(&path).unwrap(), state);
         }
     }
 
     #[test]
-    fn interleaved_layout_saves_preserve_both_panes() {
+    fn ui_state_visibility_roundtrips_with_both_pane_sizes() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.toml");
-        save_topics_width_to(&path, 31.5, 0.4).unwrap();
-        save_publish_height_to(&path, 18.5, 0.25).unwrap();
-        assert_eq!(
-            load_topics_layout_from(&path).unwrap(),
-            TopicsLayout {
-                width_rem: Some(31.5),
-                width_fraction: Some(0.4),
-            }
-        );
-        save_topics_width_to(&path, 28., 0.3).unwrap();
-        assert_eq!(
-            load_publish_layout_from(&path).unwrap(),
-            PublishLayout {
-                height_rem: Some(18.5),
-                height_fraction: Some(0.25),
-                ..PublishLayout::default()
-            }
-        );
-        save_publish_height_to(&path, 20., 0.5).unwrap();
-        assert_eq!(
-            load_topics_layout_from(&path).unwrap(),
-            TopicsLayout {
-                width_rem: Some(28.),
-                width_fraction: Some(0.3),
-            }
-        );
-        assert_eq!(
-            load_publish_layout_from(&path).unwrap(),
-            PublishLayout {
-                height_rem: Some(20.),
-                height_fraction: Some(0.5),
-                ..PublishLayout::default()
-            }
-        );
+        for publish_open in [true, false] {
+            let state = UiState {
+                topics_width_rem: Some(31.5),
+                topics_width_fraction: Some(0.4),
+                publish_height_rem: Some(18.5),
+                publish_height_fraction: Some(0.25),
+                publish_open,
+            };
+            save_ui_state_to(&path, &state).unwrap();
+            assert_eq!(load_ui_state_from(&path).unwrap(), state);
+        }
     }
 
     #[test]
-    fn legacy_topics_only_state_defaults_publish_layout() {
+    fn ui_state_saves_replace_the_entire_snapshot_without_merging() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.toml");
-        fs::write(&path, "topics_width_rem = 31.5\ntopics_width_fraction = 0.4\n").unwrap();
-        assert_eq!(load_publish_layout_from(&path).unwrap(), PublishLayout::default());
+        let original = UiState {
+            topics_width_rem: Some(31.5),
+            topics_width_fraction: Some(0.4),
+            publish_height_rem: Some(18.5),
+            publish_height_fraction: Some(0.25),
+            publish_open: true,
+        };
+        save_ui_state_to(&path, &original).unwrap();
+        let replacement = UiState {
+            topics_width_rem: Some(28.),
+            topics_width_fraction: Some(0.3),
+            ..UiState::default()
+        };
+        save_ui_state_to(&path, &replacement).unwrap();
+        assert_eq!(load_ui_state_from(&path).unwrap(), replacement);
         assert_eq!(
-            load_topics_layout_from(&path).unwrap(),
-            TopicsLayout {
-                width_rem: Some(31.5),
-                width_fraction: Some(0.4),
-            }
+            fs::read_to_string(&path).unwrap(),
+            "topics_width_rem = 28.0\ntopics_width_fraction = 0.3\npublish_open = false\n"
         );
+        save_ui_state_to(&path, &UiState::default()).unwrap();
+        assert_eq!(load_ui_state_from(&path).unwrap(), UiState::default());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "publish_open = false\n");
+    }
+
+    #[test]
+    fn partial_ui_state_defaults_missing_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        for (original, expected) in [
+            ("", UiState::default()),
+            (
+                "topics_width_rem = 31.5\ntopics_width_fraction = 0.4\n",
+                UiState {
+                    topics_width_rem: Some(31.5),
+                    topics_width_fraction: Some(0.4),
+                    ..UiState::default()
+                },
+            ),
+            (
+                "publish_height_rem = 18.5\npublish_open = true\n",
+                UiState {
+                    publish_height_rem: Some(18.5),
+                    publish_open: true,
+                    ..UiState::default()
+                },
+            ),
+        ] {
+            fs::write(&path, original).unwrap();
+            assert_eq!(load_ui_state_from(&path).unwrap(), expected);
+            assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        }
     }
 
     #[test]
@@ -2884,117 +2307,227 @@ mod tests {
     }
 
     #[test]
-    fn missing_layout_state_defaults_both_panes() {
+    fn missing_ui_state_defaults_without_creating_files() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.toml");
-        assert_eq!(load_topics_layout_from(&path).unwrap(), TopicsLayout::default());
-        assert_eq!(load_publish_layout_from(&path).unwrap(), PublishLayout::default());
+        assert_eq!(load_ui_state_from(&path).unwrap(), UiState::default());
         assert!(!path.exists());
     }
 
     #[test]
-    fn invalid_optional_layout_sizes_are_filtered_independently() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.toml");
-        for invalid in [0., -1., f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
-            write_toml(
-                &path,
-                &LayoutPreferences {
-                    topics_width_rem: Some(invalid),
-                    topics_width_fraction: Some(0.4),
-                    publish_height_rem: Some(invalid),
-                    publish_height_fraction: Some(0.25),
-                    ..LayoutPreferences::default()
-                },
-            )
-            .unwrap();
-            assert_eq!(
-                load_topics_layout_from(&path).unwrap(),
-                TopicsLayout {
-                    width_rem: None,
-                    width_fraction: Some(0.4),
-                }
-            );
-            assert_eq!(
-                load_publish_layout_from(&path).unwrap(),
-                PublishLayout {
-                    height_rem: None,
-                    height_fraction: Some(0.25),
-                    ..PublishLayout::default()
-                }
-            );
-        }
+    fn ui_state_facade_defaults_missing_state_without_logging_or_creating_files() {
+        let path = state_path().unwrap();
+        let (state, logs) = capture_logs(load_ui_state);
+        assert_eq!(state, UiState::default());
+        assert!(logs.is_empty(), "{logs}");
+        assert!(!path.exists());
     }
 
     #[test]
-    fn invalid_optional_layout_fractions_are_filtered_independently() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.toml");
-        for invalid in [-0.1, 1.1, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
-            write_toml(
-                &path,
-                &LayoutPreferences {
-                    topics_width_rem: Some(31.5),
-                    topics_width_fraction: Some(invalid),
-                    publish_height_rem: Some(18.5),
-                    publish_height_fraction: Some(invalid),
-                    ..LayoutPreferences::default()
-                },
-            )
-            .unwrap();
-            assert_eq!(
-                load_topics_layout_from(&path).unwrap(),
-                TopicsLayout {
-                    width_rem: Some(31.5),
-                    width_fraction: None,
-                }
-            );
-            assert_eq!(
-                load_publish_layout_from(&path).unwrap(),
-                PublishLayout {
-                    height_rem: Some(18.5),
-                    height_fraction: None,
-                    ..PublishLayout::default()
-                }
-            );
-        }
+    fn ui_state_facade_roundtrips_without_logging_and_replaces_external_settings() {
+        let path = state_path().unwrap();
+        let snapshot = UiState {
+            topics_width_rem: Some(31.5),
+            topics_width_fraction: Some(0.4),
+            publish_height_rem: Some(18.5),
+            publish_height_fraction: Some(0.25),
+            publish_open: true,
+        };
+        let (state, logs) = capture_logs(|| {
+            save_ui_state(&snapshot);
+            assert_eq!(load_ui_state(), snapshot);
+            fs::write(&path, "topics_width_rem = 28.0\ntopics_width_fraction = 0.3\npublish_height_rem = 20.0\npublish_height_fraction = 0.5\npublish_open = false\n").unwrap();
+            save_ui_state(&snapshot);
+            load_ui_state()
+        });
+        assert_eq!(state, snapshot);
+        assert!(logs.is_empty(), "{logs}");
+        assert!(!path.with_extension("toml.tmp").exists());
     }
 
     #[test]
-    fn layout_saves_leave_malformed_state_unchanged() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.toml");
-        for original in ["topics_width_rem = [", "publish_height_rem = \"invalid\""] {
+    fn ui_state_facade_logs_safe_diagnostics_defaults_loads_and_preserves_malformed_state() {
+        let path = state_path().unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        for (original, code) in [
+            (b"topics_width_rem = [ # parser-secret".as_slice(), "config.state.parse_failed"),
+            (b"publish_height_rem = \"parser-secret\"".as_slice(), "config.state.parse_failed"),
+            (b"publish_open = \"parser-secret\"".as_slice(), "config.state.parse_failed"),
+            (b"\xffparser-secret".as_slice(), "config.state.utf8_invalid"),
+        ] {
             fs::write(&path, original).unwrap();
-            assert!(save_topics_width_to(&path, 31.5, 0.4).is_err());
-            assert_eq!(fs::read_to_string(&path).unwrap(), original);
-            assert!(save_publish_height_to(&path, 18.5, 0.25).is_err());
-            assert_eq!(fs::read_to_string(&path).unwrap(), original);
-            assert!(save_publish_open_to(&path, true).is_err());
+            let (state, logs) = capture_logs(|| {
+                let state = load_ui_state();
+                save_ui_state(&UiState {
+                    topics_width_rem: Some(31.5),
+                    publish_open: true,
+                    ..UiState::default()
+                });
+                state
+            });
+            assert_eq!(state, UiState::default());
+            assert_layout_failure_logs(&logs, &path, code);
+            assert!(!logs.contains("parser-secret"), "{logs}");
+            if code == "config.state.parse_failed" {
+                assert!(logs.contains("Toml { span: Some("), "{logs}");
+            } else {
+                assert!(logs.contains("valid_up_to: 0"), "{logs}");
+            }
+            assert_eq!(fs::read(&path).unwrap(), original);
+            assert!(!path.with_extension("toml.tmp").exists());
+        }
+    }
+
+    #[test]
+    fn ui_state_facade_logs_read_errors_and_defaults_without_writing() {
+        let path = state_path().unwrap();
+        fs::create_dir_all(&path).unwrap();
+        let (state, logs) = capture_logs(|| {
+            let state = load_ui_state();
+            save_ui_state(&UiState::default());
+            state
+        });
+        assert_eq!(state, UiState::default());
+        assert_layout_failure_logs(&logs, &path, "config.state.read_failed");
+        assert!(logs.contains("io_kind:"), "{logs}");
+        assert!(path.is_dir());
+        assert!(!path.with_extension("toml.tmp").exists());
+    }
+
+    #[test]
+    fn ui_state_facade_logs_one_write_failure_without_changing_existing_snapshot() {
+        let path = state_path().unwrap();
+        let original = UiState {
+            topics_width_rem: Some(31.5),
+            topics_width_fraction: Some(0.4),
+            publish_height_rem: Some(18.5),
+            publish_height_fraction: Some(0.25),
+            publish_open: true,
+        };
+        save_ui_state_to(&path, &original).unwrap();
+        let before = fs::read(&path).unwrap();
+        let temporary_path = path.with_extension("toml.tmp");
+        fs::create_dir(&temporary_path).unwrap();
+        let ((), logs) = capture_logs(|| save_ui_state(&UiState::default()));
+        assert_eq!(logs.lines().count(), 1, "{logs}");
+        assert!(logs.contains("WARN"), "{logs}");
+        assert!(logs.contains("ui_state.save_failed"), "{logs}");
+        assert!(logs.contains("error_code=\"config.state.temporary_open_failed\""), "{logs}");
+        assert!(logs.contains(&format!("temporary_path: {temporary_path:?}")), "{logs}");
+        assert!(logs.contains("io_kind:"), "{logs}");
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(load_ui_state(), original);
+    }
+
+    #[test]
+    fn invalid_optional_ui_state_sizes_are_filtered_independently() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        let valid = UiState {
+            topics_width_rem: Some(31.5),
+            topics_width_fraction: Some(0.4),
+            publish_height_rem: Some(18.5),
+            publish_height_fraction: Some(0.25),
+            publish_open: true,
+        };
+        for invalid in [0., -1., f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            for topics_invalid in [true, false] {
+                let mut snapshot = valid;
+                let mut expected = valid;
+                if topics_invalid {
+                    snapshot.topics_width_rem = Some(invalid);
+                    expected.topics_width_rem = None;
+                } else {
+                    snapshot.publish_height_rem = Some(invalid);
+                    expected.publish_height_rem = None;
+                }
+                save_ui_state_to(&path, &snapshot).unwrap();
+                assert_eq!(load_ui_state_from(&path).unwrap(), expected, "invalid size: {invalid}");
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_optional_ui_state_fractions_are_filtered_independently() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        let valid = UiState {
+            topics_width_rem: Some(31.5),
+            topics_width_fraction: Some(0.4),
+            publish_height_rem: Some(18.5),
+            publish_height_fraction: Some(0.25),
+            publish_open: true,
+        };
+        for invalid in [-0.1, 1.1, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            for topics_invalid in [true, false] {
+                let mut snapshot = valid;
+                let mut expected = valid;
+                if topics_invalid {
+                    snapshot.topics_width_fraction = Some(invalid);
+                    expected.topics_width_fraction = None;
+                } else {
+                    snapshot.publish_height_fraction = Some(invalid);
+                    expected.publish_height_fraction = None;
+                }
+                save_ui_state_to(&path, &snapshot).unwrap();
+                assert_eq!(load_ui_state_from(&path).unwrap(), expected, "invalid fraction: {invalid}");
+            }
+        }
+    }
+
+    #[test]
+    fn ui_state_saves_leave_malformed_state_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        for original in [
+            "topics_width_rem = [",
+            "publish_height_rem = \"invalid\"",
+            "publish_open = \"invalid\"",
+        ] {
+            fs::write(&path, original).unwrap();
+            assert!(matches!(
+                save_ui_state_to(&path, &UiState::default()),
+                Err(LayoutError::ParseState { .. })
+            ));
             assert_eq!(fs::read_to_string(&path).unwrap(), original);
             assert!(!path.with_extension("toml.tmp").exists());
         }
     }
 
     #[test]
-    fn layout_saves_propagate_read_errors_without_writing() {
+    fn ui_state_saves_leave_non_utf8_state_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        let original = b"\xffparser-secret";
+        fs::write(&path, original).unwrap();
+        assert!(matches!(
+            save_ui_state_to(&path, &UiState::default()),
+            Err(LayoutError::StateNotUtf8 { .. })
+        ));
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert!(!path.with_extension("toml.tmp").exists());
+    }
+
+    #[test]
+    fn ui_state_saves_propagate_read_errors_without_writing() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.toml");
         fs::create_dir(&path).unwrap();
-        assert!(save_topics_width_to(&path, 31.5, 0.4).is_err());
-        assert!(save_publish_height_to(&path, 18.5, 0.25).is_err());
-        assert!(save_publish_open_to(&path, true).is_err());
+        assert!(matches!(
+            save_ui_state_to(&path, &UiState::default()),
+            Err(LayoutError::ReadState { .. })
+        ));
         assert!(path.is_dir());
         assert!(!path.with_extension("toml.tmp").exists());
     }
 
     #[test]
-    fn saved_connections_migrate_legacy_filters_and_ignore_plaintext_passwords() {
+    fn saved_connections_preserve_topics_and_ignore_plaintext_passwords() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("connections.json");
         fs::write(
             &path,
-            r#"{"connections":[{"name":"Legacy","host":"legacy-broker","base_topic":"home/#","password":"plaintext-secret"},{"host":"default-broker"}],"active_connection":"Legacy"}"#,
+            r#"{"connections":[{"name":"Home","connection":"mqtt://home-broker:1883","topics":[{"topic":"home/#","qos":2}],"password":"plaintext-secret"},{"connection":"mqtt://default-broker:1883"}],"active_connection":"Home"}"#,
         ).unwrap();
         let entries = mock_entries();
         let saved = load_connections_from(&path, &entries).unwrap();
@@ -3010,15 +2543,16 @@ mod tests {
         assert!(saved.connections.iter().all(|config| config.password.is_empty()));
         save_connections_to(&path, &saved, &entries).unwrap();
         let json: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(json["active_connection"], "Legacy");
+        assert_eq!(json["active_connection"], "Home");
         assert!(json.get("selected").is_none());
         assert!(
             json["connections"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .all(|config| { config.get("base_topic").is_none() && config.get("password").is_none() && config.get("topics").is_some() })
+                .all(|config| config.get("password").is_none() && config.get("topics").is_some())
         );
+        assert!(!fs::read_to_string(&path).unwrap().contains("plaintext-secret"));
         let loaded = load_connections_from(&path, &entries).unwrap();
         assert_eq!(loaded.connections[0].topics, saved.connections[0].topics);
     }
@@ -3027,7 +2561,7 @@ mod tests {
     fn single_connection_shape_is_not_accepted_as_multi_connection_storage() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("connections.json");
-        let original = br#"{"host":"localhost","port":1883,"password_in_keyring":true}"#;
+        let original = br#"{"connection":"mqtt://localhost:1883"}"#;
         fs::write(&path, original).unwrap();
         let entries = |_: &ConnectionConfig| -> Result<Entry, ConfigError> { panic!("invalid format must not access keyring") };
         assert!(load_connections_from(&path, &entries).is_err());
@@ -3042,7 +2576,7 @@ mod tests {
         let entries = |_: &ConnectionConfig| -> Result<Entry, ConfigError> { panic!("invalid QoS must not access keyring") };
         for qos in [r#""1""#, "null", "true", "[]", "{}"] {
             let original = format!(
-                r#"{{"mode":"dark","connections":[{{"name":"Invalid","host":"broker.example","topics":[{{"topic":"home/#","qos":{qos}}}]}}],"active_connection":"Invalid"}}"#,
+                r#"{{"mode":"dark","connections":[{{"name":"Invalid","connection":"mqtt://broker.example:1883","topics":[{{"topic":"home/#","qos":{qos}}}]}}],"active_connection":"Invalid"}}"#,
             );
             fs::write(&path, &original).unwrap();
             assert!(matches!(
@@ -3064,7 +2598,7 @@ mod tests {
         let entries = mock_entries();
         for qos in ["3", "255", "256", "-1", "1.5", "18446744073709551616"] {
             let original = format!(
-                r#"{{"mode":"dark","connections":[{{"name":"Recovered","host":"broker.example","topics":[{{"topic":"home/#","qos":{qos}}}]}},{{"name":"Valid","host":"other.example","topics":[{{"topic":"office/#","qos":2}}]}}],"active_connection":"Recovered"}}"#,
+                r#"{{"mode":"dark","connections":[{{"name":"Recovered","connection":"mqtt://broker.example:1883","topics":[{{"topic":"home/#","qos":{qos}}}]}},{{"name":"Valid","connection":"mqtt://other.example:1883","topics":[{{"topic":"office/#","qos":2}}]}}],"active_connection":"Recovered"}}"#,
             );
             fs::write(&path, &original).unwrap();
             let saved = load_connections_from(&path, &entries).unwrap();
@@ -3144,9 +2678,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .all(|item| item.get("password").is_none()
-                    && item.get("password_in_keyring").is_none()
-                    && item.get("base_topic").is_none())
+                .all(|item| item.get("password").is_none())
         );
         assert!(!std::str::from_utf8(&bytes).unwrap().contains(&first.password));
         assert!(!std::str::from_utf8(&bytes).unwrap().contains(&second.password));
@@ -3185,13 +2717,13 @@ mod tests {
         let entries = mock_entries();
         fs::write(
             &path,
-            r#"{"connections":[{"name":"Workshop","host":"workshop"},{"name":"Home","host":"home"}],"active_connection":"Home"}"#,
+            r#"{"connections":[{"name":"Workshop","connection":"mqtt://workshop:1883"},{"name":"Home","connection":"mqtt://home:1883"}],"active_connection":"Home"}"#,
         )
         .unwrap();
         assert_eq!(load_connections_from(&path, &entries).unwrap().selected, Some(1));
         fs::write(
             &path,
-            r#"{"connections":[{"name":"Home","host":"home"},{"name":"Workshop","host":"workshop"}],"active_connection":"Home"}"#,
+            r#"{"connections":[{"name":"Home","connection":"mqtt://home:1883"},{"name":"Workshop","connection":"mqtt://workshop:1883"}],"active_connection":"Home"}"#,
         )
         .unwrap();
         assert_eq!(load_connections_from(&path, &entries).unwrap().selected, Some(0));
@@ -3203,7 +2735,7 @@ mod tests {
         let path = dir.path().join("connections.json");
         fs::write(
             &path,
-            r#"{"connections":[{"name":"Home","host":"first-broker"},{"name":"Home","host":"second-broker"}],"active_connection":"Home"}"#,
+            r#"{"connections":[{"name":"Home","connection":"mqtt://first-broker:1883"},{"name":"Home","connection":"mqtt://second-broker:1883"}],"active_connection":"Home"}"#,
         )
         .unwrap();
 
@@ -3219,7 +2751,7 @@ mod tests {
         let path = dir.path().join("connections.json");
         fs::write(
             &path,
-            r#"{"connections":[{"name":"Home","host":"first"},{"name":"Home","host":"duplicate"},{"name":"Workshop","host":"third"}],"active_connection":"Workshop"}"#,
+            r#"{"connections":[{"name":"Home","connection":"mqtt://first:1883"},{"name":"Home","connection":"mqtt://duplicate:1883"},{"name":"Workshop","connection":"mqtt://third:1883"}],"active_connection":"Workshop"}"#,
         )
         .unwrap();
 
@@ -3234,9 +2766,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("connections.json");
         let entries = mock_entries();
-        fs::write(&path, r#"{"connections":[{"name":"Home"}],"active_connection":"Removed"}"#).unwrap();
+        fs::write(
+            &path,
+            r#"{"connections":[{"name":"Home","connection":"mqtt://localhost:1883"}],"active_connection":"Removed"}"#,
+        )
+        .unwrap();
         assert_eq!(load_connections_from(&path, &entries).unwrap().selected, Some(0));
-        fs::write(&path, r#"{"connections":[{"name":"Home"}],"active_connection":null}"#).unwrap();
+        fs::write(
+            &path,
+            r#"{"connections":[{"name":"Home","connection":"mqtt://localhost:1883"}],"active_connection":null}"#,
+        )
+        .unwrap();
         assert_eq!(load_connections_from(&path, &entries).unwrap().selected, None);
     }
 
@@ -3419,7 +2959,7 @@ mod tests {
     }
 
     #[test]
-    fn a_username_without_a_stored_password_loads_without_a_flag() {
+    fn a_username_without_a_stored_password_loads_with_an_empty_password() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("connection.json");
         fs::write(&path, r#"{"connections":[{"connection":"mqtt://mqtt-user@localhost:1883"}]}"#).unwrap();
@@ -3438,7 +2978,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_password_flag_does_not_control_keychain_lookup() {
+    fn saved_username_retrieves_only_the_credential_store_password_and_removal_deletes_it() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("connection.json");
         let entries = mock_entries();
@@ -3446,7 +2986,7 @@ mod tests {
         entries(&config).unwrap().set_password(&config.password).unwrap();
         fs::write(
             &path,
-            r#"{"connections":[{"connection":"mqtt://mqtt-user@localhost:1883","password_in_keyring":false}]}"#,
+            r#"{"connections":[{"connection":"mqtt://mqtt-user@localhost:1883","password":"plaintext-secret"}]}"#,
         )
         .unwrap();
         let loaded = load_connections_from(&path, &entries).unwrap();
@@ -3601,53 +3141,6 @@ mod tests {
     }
 
     #[test]
-    fn validation_codes_are_stable_and_preserve_fields() {
-        for (code, expected) in [
-            (ConnectionValidationCode::MissingHost, "config.validation.host_required"),
-            (
-                ConnectionValidationCode::HostContainsSchemeOrPath,
-                "config.validation.host_scheme_or_path",
-            ),
-            (ConnectionValidationCode::InvalidPort, "config.validation.port_invalid"),
-            (ConnectionValidationCode::InvalidClientId, "config.validation.client_id_invalid"),
-            (
-                ConnectionValidationCode::InvalidTopicFilter,
-                "config.validation.topic_filter_invalid",
-            ),
-            (ConnectionValidationCode::MissingTopics, "config.validation.topics_required"),
-            (
-                ConnectionValidationCode::DuplicateTopicFilter,
-                "config.validation.topic_filter_duplicate",
-            ),
-            (
-                ConnectionValidationCode::PasswordWithoutUsername,
-                "config.validation.username_required",
-            ),
-        ] {
-            assert_eq!(code.to_string(), expected);
-        }
-        let mut config = ConnectionConfig {
-            topics: vec![],
-            ..Default::default()
-        };
-        assert_eq!(config.validate().unwrap_err().code(), ConnectionValidationCode::MissingTopics);
-        config.topics = vec![TopicSubscription::default(), TopicSubscription::default()];
-        assert_eq!(
-            config.validate().unwrap_err().code(),
-            ConnectionValidationCode::DuplicateTopicFilter
-        );
-        config.topics = vec![TopicSubscription::default()];
-        config.password = "secret-password".into();
-        let error = config.validate().unwrap_err();
-        assert_eq!(error.field(), ConnectionField::Username);
-        assert_eq!(error.code(), ConnectionValidationCode::PasswordWithoutUsername);
-        assert_eq!(config.validate_broker_connection().unwrap_err(), error);
-        let error = ConfigError::from(error);
-        assert_eq!(error.to_string(), "config.validation.username_required");
-        assert!(matches!(error, ConfigError::Validation(_)));
-    }
-
-    #[test]
     fn connection_uri_errors_are_typed_and_serde_uses_codes() {
         for (uri, code) in [
             ("mqtt://user:secret-password@broker", "config.connection_uri.components_invalid"),
@@ -3677,47 +3170,6 @@ mod tests {
             serde_json::to_value(saved).unwrap_err().to_string(),
             "config.connection_uri.format_failed"
         );
-    }
-
-    #[test]
-    fn diagnostic_readers_and_debug_preserve_rename_paths_and_selection_bounds() {
-        for error in [
-            ConfigError::SaveConfig {
-                path: "config.json".into(),
-                temporary_path: "config.json.tmp".into(),
-                source: std::io::ErrorKind::PermissionDenied.into(),
-            },
-            ConfigError::SaveState {
-                path: "state.toml".into(),
-                temporary_path: "state.toml.tmp".into(),
-                source: std::io::ErrorKind::PermissionDenied.into(),
-            },
-        ] {
-            let debug = format!("{error:?}");
-            assert!(debug.contains(&format!("path: {:?}", error.path().unwrap())));
-            assert!(debug.contains(&format!("temporary_path: {:?}", error.temporary_path().unwrap())));
-            assert!(debug.contains("source:"));
-            assert_eq!(error.invalid_selection(), None);
-            assert_eq!(error.to_string(), error.code());
-        }
-        let error = ConfigError::OpenTemporaryConfig {
-            path: "config.json.tmp".into(),
-            source: std::io::ErrorKind::PermissionDenied.into(),
-        };
-        assert_eq!(error.path(), Some(Path::new("config.json.tmp")));
-        assert_eq!(error.temporary_path(), error.path());
-        let error = ConfigError::SelectedConnectionOutOfRange {
-            selected: 4,
-            connection_count: 2,
-        };
-        assert_eq!(error.invalid_selection(), Some((4, 2)));
-        assert_eq!(error.path(), None);
-        assert_eq!(error.temporary_path(), None);
-        let debug = format!("{error:?}");
-        assert!(debug.contains("selected: 4"));
-        assert!(debug.contains("connection_count: 2"));
-        let diagnostic = ConfigDiagnostic::Toml { span: Some(2..7) };
-        assert_eq!(format!("{diagnostic:?}"), "Toml { span: Some(2..7) }");
     }
 
     #[test]
@@ -3782,28 +3234,6 @@ mod tests {
     }
 
     #[test]
-    fn diagnostic_sanitization_does_not_accept_arbitrary_code_like_messages() {
-        for message in [
-            "config.connection_uri.invalid: secret-password",
-            "config.connection_uri.invalid at line 1 column 2: secret-password",
-            "invalid value: string config.connection_uri.invalid",
-            "secret-password",
-        ] {
-            let error: serde_json::Error = serde::de::Error::custom(message);
-            let diagnostic = ConfigDiagnostic::from(error);
-            assert!(matches!(
-                diagnostic,
-                ConfigDiagnostic::Json {
-                    category: serde_json::error::Category::Data,
-                    ..
-                }
-            ));
-            assert_eq!(diagnostic.to_string(), "config.diagnostic.json_data");
-            assert!(!format!("{diagnostic:?}").contains("secret-password"));
-        }
-    }
-
-    #[test]
     fn read_errors_preserve_paths_and_io_sources() {
         use std::error::Error as _;
         let dir = tempfile::tempdir().unwrap();
@@ -3811,10 +3241,7 @@ mod tests {
         assert_eq!(error.to_string(), "config.read_failed");
         assert!(error.source().unwrap().downcast_ref::<std::io::Error>().is_some());
         assert!(matches!(error, ConfigError::ReadConfig { path, .. } if path == dir.path()));
-        assert!(matches!(
-            load_layout_preferences_from(dir.path()),
-            Err(ConfigError::ReadState { .. })
-        ));
+        assert!(matches!(load_ui_state_from(dir.path()), Err(LayoutError::ReadState { .. })));
     }
 
     #[test]
@@ -3834,7 +3261,7 @@ mod tests {
         ));
         fs::write(
             &path,
-            r#"{"connections":[{"connection":"mqtt://broker","port":"secret-password"}]}"#,
+            r#"{"connections":[{"connection":"mqtt://broker","validate_certificate":"secret-password"}]}"#,
         )
         .unwrap();
         let error = read_connections(&path).err().unwrap();
@@ -3843,15 +3270,15 @@ mod tests {
         assert_eq!(error.source().unwrap().to_string(), "config.diagnostic.json_data");
         let path = dir.path().join("state.toml");
         fs::write(&path, "topics_width_rem = \"secret-password\"").unwrap();
-        let error = load_layout_preferences_from(&path).err().unwrap();
-        assert!(matches!(error, ConfigError::ParseState { .. }));
+        let error = load_ui_state_from(&path).unwrap_err();
+        assert!(matches!(error, LayoutError::ParseState { .. }));
         assert!(!format!("{error:#?}").contains("secret-password"));
         assert!(matches!(
-            error.source().unwrap().downcast_ref::<ConfigDiagnostic>(),
-            Some(ConfigDiagnostic::Toml { span: Some(_) })
+            error.source().unwrap().downcast_ref::<LayoutDiagnostic>(),
+            Some(LayoutDiagnostic::Toml { span: Some(_) })
         ));
         fs::write(&path, [0xff]).unwrap();
-        assert!(matches!(load_layout_preferences_from(&path), Err(ConfigError::StateNotUtf8 { .. })));
+        assert!(matches!(load_ui_state_from(&path), Err(LayoutError::StateNotUtf8 { .. })));
     }
 
     #[test]
@@ -3872,10 +3299,16 @@ mod tests {
         assert!(!error.source().unwrap().to_string().contains("serializer-secret"));
         let error = write_json(&path, &SecretSerializer).unwrap_err();
         assert!(matches!(error, ConfigError::SerializeConfig { .. }));
-        let error = write_toml(&dir.path().join("state.toml"), &SecretSerializer).unwrap_err();
-        assert!(matches!(error, ConfigError::SerializeState { .. }));
+        let path = dir.path().join("state.toml");
+        let original = "topics_width_rem = 31.5\npublish_open = true\n";
+        fs::write(&path, original).unwrap();
+        let error = write_toml(&path, &SecretSerializer).unwrap_err();
+        assert!(matches!(error, LayoutError::SerializeState { .. }));
+        assert_eq!(error.to_string(), "config.state.serialize_failed");
+        assert_eq!(error.path(), Some(path.as_path()));
         assert_eq!(error.source().unwrap().to_string(), "config.diagnostic.toml_serialize");
         assert!(!format!("{error:#?}").contains("serializer-secret"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
     }
 
     #[test]
@@ -3937,21 +3370,5 @@ mod tests {
         assert_eq!(failures.len(), 1);
         assert!(matches!(failures[0], ConfigError::OpenCredentialStore { .. }));
         assert_eq!(fs::read(&path).unwrap(), before);
-    }
-
-    #[test]
-    fn credential_errors_do_not_expose_secret_bytes() {
-        let secret = b"secret-in-error".to_vec();
-        for error in [
-            KeyringError::BadEncoding(secret.clone()),
-            KeyringError::BadDataFormat(secret, std::io::Error::other("secret-in-error").into()),
-        ] {
-            use std::error::Error as _;
-            let error = credential_error(error);
-            assert!(matches!(error, ConfigError::CredentialNotDecodable));
-            assert_eq!(error.to_string(), "config.credentials.decode_failed");
-            assert!(error.source().is_none());
-            assert!(!format!("{error:#?}").contains("secret-in-error"));
-        }
     }
 }

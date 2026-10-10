@@ -1,7 +1,7 @@
 //! English fallback copy for typed configuration errors, kept outside persistence logic.
 
 use crate::{
-    config::{ConfigDiagnostic, ConfigError, ConnectionUriCode, ConnectionValidationCode, ConnectionValidationError},
+    error::config::{ConfigDiagnostic, ConfigError, ConnectionUriCode, ConnectionValidationCode, ConnectionValidationError},
     ui::messages::LocalizedError,
 };
 
@@ -50,7 +50,6 @@ impl LocalizedError for ConfigError {
             Self::ConfigDirectoryUnavailable => "Could not locate your application configuration directory.",
             Self::HomeDirectoryUnavailable => "Could not locate your home directory.",
             Self::InvalidConfigPath { .. } => "Invalid configuration path.",
-            Self::InvalidStatePath { .. } => "Invalid state path.",
             Self::ReadConfig { .. } => "Could not read the configuration file.",
             Self::ParseConfig { .. } => "Could not parse the configuration file.",
             Self::ParseConnections { .. } => "Could not parse the saved connections.",
@@ -59,20 +58,12 @@ impl LocalizedError for ConfigError {
             Self::InspectConfig { .. } => "Could not inspect the configuration file.",
             Self::ConfigNotWritable { .. } => "The application configuration cannot be written. Check your directory permissions and try again.",
             Self::WriteApplicationConfig { .. } => "Could not save the application configuration. Check your directory permissions and try again.",
-            Self::ReadState { .. } => "Could not read the application state.",
-            Self::StateNotUtf8 { .. } => "Application state is not valid UTF-8.",
-            Self::ParseState { .. } => "Could not parse the application state.",
-            Self::SerializeState { .. } => "Could not serialize the application state.",
+
             Self::CreateConfigDirectory { .. } => "Could not create the configuration directory.",
             Self::OpenTemporaryConfig { .. } => "Could not open the temporary settings file.",
             Self::WriteConfig { .. } => "Could not write the settings file.",
             Self::FlushConfig { .. } => "Could not flush the settings file to disk.",
             Self::SaveConfig { .. } => "Could not save the settings file.",
-            Self::CreateStateDirectory { .. } => "Could not create the application state directory.",
-            Self::OpenTemporaryState { .. } => "Could not open the temporary state file.",
-            Self::WriteState { .. } => "Could not write the application state.",
-            Self::FlushState { .. } => "Could not flush the application state to disk.",
-            Self::SaveState { .. } => "Could not save the application state.",
             Self::Validation(error) => return error.localized_message(),
             Self::SelectedConnectionOutOfRange { .. } => "Selected connection index is out of range.",
             Self::DuplicateConnectionAccount => "Duplicate MQTT connection account; each broker and username must be unique.",
@@ -109,8 +100,6 @@ impl LocalizedError for ConfigDiagnostic {
                 serde_json::error::Category::Eof => format!("Incomplete JSON at line {line}, column {column}."),
             },
             Self::ConnectionUri { code, .. } => code.localized_message(),
-            Self::Toml { .. } => "Invalid application state format.".into(),
-            Self::TomlSerialization => "Could not encode the application state.".into(),
         }
     }
 }
@@ -120,13 +109,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unavailable_home_directory_has_code_and_side_effect_free_fallback() {
-        let error = ConfigError::HomeDirectoryUnavailable;
-        assert_eq!(error.to_string(), "config.home_directory_unavailable");
-        assert_eq!(error.localized_message(), "Could not locate your home directory.");
-        assert_eq!(error.path(), None);
-        assert_eq!(error.temporary_path(), None);
-        assert_eq!(error.invalid_selection(), None);
+    fn layout_errors_do_not_implement_localized_error() {
+        trait AmbiguousIfLocalized<A> {
+            fn assert_not_localized() {}
+        }
+        impl<T: ?Sized> AmbiguousIfLocalized<()> for T {}
+        struct IsLocalized;
+        impl<T: ?Sized + LocalizedError> AmbiguousIfLocalized<IsLocalized> for T {}
+
+        // Type inference becomes ambiguous if either log-only type gains localization.
+        let _ = <crate::error::config::LayoutError as AmbiguousIfLocalized<_>>::assert_not_localized;
+        let _ = <crate::error::config::LayoutDiagnostic as AmbiguousIfLocalized<_>>::assert_not_localized;
     }
 
     #[test]

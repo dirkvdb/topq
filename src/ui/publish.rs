@@ -5,10 +5,7 @@ use std::{fs::File, io::Read, ops::Range, path::Path, sync::Arc};
 use anyhow::{Context as _, ensure};
 
 use super::{CompletePublishTopic, Explorer, GrowPublish, PublishMessage, ShrinkPublish, messages::LocalizedError};
-use crate::{
-    config,
-    mqtt::{self, Qos},
-};
+use crate::mqtt::{self, Qos};
 use gpui_kit::assets::IconName as AssetIconName;
 use gpui_kit::base::{
     ElementExt,
@@ -164,9 +161,6 @@ impl Explorer {
         }
         self.publish_open = open;
         self.restore_publish_height = open;
-        if let Err(error) = config::save_publish_open(open) {
-            self.error = Some(error.localized_message());
-        }
         cx.notify();
     }
 
@@ -395,7 +389,7 @@ impl Explorer {
         });
     }
 
-    pub(super) fn persist_publish_split(&mut self, state: &Entity<ResizableState>, window: &Window, cx: &mut Context<Self>) {
+    pub(super) fn cache_publish_split(&mut self, state: &Entity<ResizableState>, window: &Window, cx: &mut Context<Self>) {
         if !self.publish_open {
             return;
         }
@@ -409,9 +403,6 @@ impl Explorer {
         let height_fraction = (*height / container_size).clamp(0., 1.);
         self.publish_height_rem = Some(height_rem);
         self.publish_height_fraction = Some(height_fraction);
-        if let Err(error) = config::save_publish_height(height_rem, height_fraction) {
-            self.error = Some(error.localized_message());
-        }
         cx.notify();
     }
 

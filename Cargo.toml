@@ -36,6 +36,7 @@ tempfile = "3"
 tungstenite = { version = "0.26", default-features = false, features = ["handshake"] }
 
 [lints.clippy]
+enum_variant_names = "allow"
 redundant_clone = "warn"
 needless_collect = "warn"
 

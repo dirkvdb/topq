@@ -3,7 +3,8 @@
 use gpui_kit::component::ThemeMode;
 
 use crate::{
-    appearance::{AppearanceError, AppearanceMode, ReduceMotion},
+    appearance::{AppearanceMode, ReduceMotion},
+    error::appearance::AppearanceError,
     ui::messages::LocalizedError,
 };
 
@@ -39,7 +40,6 @@ impl LocalizedError for AppearanceError {
         match self {
             Self::Config(error) => error.localized_message(),
             Self::ParseSettings { .. } => "Could not parse appearance settings.".into(),
-            Self::InvalidLegacyTheme { .. } => "Could not parse appearance settings: legacy theme must be a string or null.".into(),
             Self::LoadBundledTheme { .. } => "Could not load a bundled theme.".into(),
             Self::ReadThemesDirectory { .. } => "Could not read the themes directory.".into(),
             Self::ReadThemeEntry { .. } => "Could not read an entry in the themes directory.".into(),
@@ -61,7 +61,7 @@ impl LocalizedError for AppearanceError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ConfigDiagnostic, ConfigError};
+    use crate::error::config::{ConfigDiagnostic, ConfigError};
 
     #[test]
     fn appearance_mode_labels_preserve_the_ui_method_api() {
@@ -168,10 +168,6 @@ mod tests {
                     source: diagnostic(),
                 },
                 "Could not parse appearance settings.",
-            ),
-            (
-                AppearanceError::InvalidLegacyTheme { path: path.into() },
-                "Could not parse appearance settings: legacy theme must be a string or null.",
             ),
             (
                 AppearanceError::LoadBundledTheme {

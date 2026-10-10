@@ -1,7 +1,7 @@
 //! Application theme selection and GPUI Kit theme-set loading.
 
 use std::{
-    fmt, fs,
+    fs,
     path::{Path, PathBuf},
     rc::Rc,
 };
@@ -10,210 +10,10 @@ use gpui_kit::component::{Theme, ThemeConfig, ThemeMode, ThemeRegistry, highligh
 use gpui_kit::{App, Global, SharedString, Window};
 use serde::{Deserialize, Serialize};
 
-use crate::config;
+use crate::{config, error::appearance::AppearanceError};
 
 const DEFAULT_LIGHT_THEME: &str = "Ayu Light";
 const DEFAULT_DARK_THEME: &str = "Ayu Dark";
-
-/// Appearance failures expose stable codes, not presentation or dependency prose.
-/// Parser sources retain only safe categories and locations, never settings contents.
-pub(crate) enum AppearanceError {
-    Config(config::ConfigError),
-    ParseSettings {
-        path: PathBuf,
-        source: config::ConfigDiagnostic,
-    },
-    InvalidLegacyTheme {
-        path: PathBuf,
-    },
-    LoadBundledTheme {
-        bundle: &'static str,
-        source: Option<config::ConfigDiagnostic>,
-    },
-    ReadThemesDirectory {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-    ReadThemeEntry {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-    ReadCustomTheme {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-    LoadCustomTheme {
-        path: PathBuf,
-        source: Option<config::ConfigDiagnostic>,
-    },
-    ThemeUnavailable {
-        name: String,
-        mode: ThemeMode,
-    },
-    ThemeModeMismatch {
-        name: String,
-        expected: ThemeMode,
-        actual: ThemeMode,
-    },
-    AppearanceNotSaved {
-        source: Box<AppearanceError>,
-    },
-    ThemeNotSaved {
-        source: Box<AppearanceError>,
-    },
-    ReduceMotionNotSaved {
-        source: Box<AppearanceError>,
-    },
-}
-
-impl AppearanceError {
-    pub(crate) fn code(&self) -> &'static str {
-        match self {
-            Self::Config(error) => error.code(),
-            Self::ParseSettings { .. } => "appearance.settings.parse_failed",
-            Self::InvalidLegacyTheme { .. } => "appearance.settings.legacy_theme_invalid",
-            Self::LoadBundledTheme { .. } => "appearance.bundled_theme.load_failed",
-            Self::ReadThemesDirectory { .. } => "appearance.themes.directory_read_failed",
-            Self::ReadThemeEntry { .. } => "appearance.themes.entry_read_failed",
-            Self::ReadCustomTheme { .. } => "appearance.custom_theme.read_failed",
-            Self::LoadCustomTheme { .. } => "appearance.custom_theme.load_failed",
-            Self::ThemeUnavailable { .. } => "appearance.theme.unavailable",
-            Self::ThemeModeMismatch { .. } => "appearance.theme.mode_mismatch",
-            Self::AppearanceNotSaved { .. } => "appearance.mode.not_saved",
-            Self::ThemeNotSaved { .. } => "appearance.theme.not_saved",
-            Self::ReduceMotionNotSaved { .. } => "appearance.reduce_motion.not_saved",
-        }
-    }
-}
-
-// Diagnostic formatting deliberately excludes dependency prose, even for I/O sources.
-impl fmt::Debug for AppearanceError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut diagnostic = f.debug_struct(self.code());
-        match self {
-            Self::Config(source) => {
-                diagnostic.field("source_code", &source.code());
-                match source {
-                    config::ConfigError::InvalidConfigPath { path } => {
-                        diagnostic.field("path", path);
-                    }
-                    config::ConfigError::ConfigNotWritable { path, alternative_path } => {
-                        diagnostic.field("path", path).field("alternative_path", alternative_path);
-                    }
-                    config::ConfigError::WriteApplicationConfig {
-                        path,
-                        alternative_path,
-                        source,
-                    } => {
-                        diagnostic
-                            .field("path", path)
-                            .field("alternative_path", alternative_path)
-                            .field("source_code", &source.code());
-                        if let Some(temporary_path) = source.temporary_path() {
-                            diagnostic.field("temporary_path", &temporary_path);
-                        }
-                        let mut cause = Some(source.as_ref() as &dyn std::error::Error);
-                        while let Some(error) = cause {
-                            if let Some(source) = error.downcast_ref::<std::io::Error>() {
-                                diagnostic
-                                    .field("io_kind", &source.kind())
-                                    .field("os_error", &source.raw_os_error());
-                            } else if let Some(source) = error.downcast_ref::<config::ConfigDiagnostic>() {
-                                diagnostic.field("source", source);
-                            }
-                            cause = error.source();
-                        }
-                    }
-                    config::ConfigError::InspectConfig { path, source }
-                    | config::ConfigError::ReadConfig { path, source }
-                    | config::ConfigError::CreateConfigDirectory { path, source }
-                    | config::ConfigError::OpenTemporaryConfig { path, source }
-                    | config::ConfigError::WriteConfig { path, source }
-                    | config::ConfigError::FlushConfig { path, source } => {
-                        diagnostic
-                            .field("path", path)
-                            .field("io_kind", &source.kind())
-                            .field("os_error", &source.raw_os_error());
-                    }
-                    config::ConfigError::ParseConfig { path, source } | config::ConfigError::SerializeConfig { path, source } => {
-                        diagnostic.field("path", path).field("source", source);
-                    }
-                    config::ConfigError::SaveConfig {
-                        path,
-                        temporary_path,
-                        source,
-                    } => {
-                        diagnostic
-                            .field("path", path)
-                            .field("temporary_path", temporary_path)
-                            .field("io_kind", &source.kind())
-                            .field("os_error", &source.raw_os_error());
-                    }
-                    // Appearance only uses JSON persistence; other configuration failures
-                    // retain their code without exposing unrelated diagnostic contents.
-                    _ => {}
-                }
-            }
-            Self::ParseSettings { path, source } => {
-                diagnostic.field("path", path).field("source", source);
-            }
-            Self::InvalidLegacyTheme { path } => {
-                diagnostic.field("path", path);
-            }
-            Self::LoadBundledTheme { bundle, source } => {
-                diagnostic.field("bundle", bundle).field("source", source);
-            }
-            Self::ReadThemesDirectory { path, source } | Self::ReadThemeEntry { path, source } | Self::ReadCustomTheme { path, source } => {
-                diagnostic
-                    .field("path", path)
-                    .field("io_kind", &source.kind())
-                    .field("os_error", &source.raw_os_error());
-            }
-            Self::LoadCustomTheme { path, source } => {
-                diagnostic.field("path", path).field("source", source);
-            }
-            Self::ThemeUnavailable { name, mode } => {
-                diagnostic.field("name", name).field("mode", mode);
-            }
-            Self::ThemeModeMismatch { name, expected, actual } => {
-                diagnostic.field("name", name).field("expected", expected).field("actual", actual);
-            }
-            Self::AppearanceNotSaved { source } | Self::ThemeNotSaved { source } | Self::ReduceMotionNotSaved { source } => {
-                diagnostic.field("source", source);
-            }
-        }
-        diagnostic.finish()
-    }
-}
-
-impl fmt::Display for AppearanceError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.code())
-    }
-}
-
-impl std::error::Error for AppearanceError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Config(error) => Some(error),
-            Self::ParseSettings { source, .. } => Some(source),
-            Self::LoadBundledTheme { source, .. } | Self::LoadCustomTheme { source, .. } => source.as_ref().map(|source| source as _),
-            Self::ReadThemesDirectory { source, .. } | Self::ReadThemeEntry { source, .. } | Self::ReadCustomTheme { source, .. } => {
-                Some(source)
-            }
-            Self::AppearanceNotSaved { source } | Self::ThemeNotSaved { source } | Self::ReduceMotionNotSaved { source } => {
-                Some(source.as_ref())
-            }
-            Self::InvalidLegacyTheme { .. } | Self::ThemeUnavailable { .. } | Self::ThemeModeMismatch { .. } => None,
-        }
-    }
-}
-
-impl From<config::ConfigError> for AppearanceError {
-    fn from(error: config::ConfigError) -> Self {
-        Self::Config(error)
-    }
-}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -233,32 +33,12 @@ pub(crate) enum ReduceMotion {
     Off,
 }
 
-fn deserialize_reduce_motion<'de, D>(deserializer: D) -> Result<ReduceMotion, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Setting {
-        State(ReduceMotion),
-        Legacy(bool),
-    }
-
-    Ok(match Setting::deserialize(deserializer)? {
-        Setting::State(state) => state,
-        Setting::Legacy(true) => ReduceMotion::On,
-        // The old false setting still honored the system preference.
-        Setting::Legacy(false) => ReduceMotion::System,
-    })
-}
-
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct Appearance {
     mode: AppearanceMode,
     light_theme: String,
     dark_theme: String,
-    #[serde(default, deserialize_with = "deserialize_reduce_motion")]
     reduce_motion: ReduceMotion,
     #[serde(skip)]
     path: Option<PathBuf>,
@@ -306,14 +86,16 @@ impl Appearance {
         }
     }
 
-    fn theme_mut(&mut self, mode: ThemeMode) -> &mut String {
+    fn set_theme_for_mode(&mut self, mode: ThemeMode, name: String) {
         match mode {
-            ThemeMode::Light => &mut self.light_theme,
-            ThemeMode::Dark => &mut self.dark_theme,
+            ThemeMode::Light => self.light_theme = name,
+            ThemeMode::Dark => self.dark_theme = name,
         }
     }
 
-    fn recover_slots(&mut self, cx: &App) {
+    // Update the current preferences to use a valid theme for each mode
+    // in case of custom theme renames of removals
+    fn repair_invalid_themes(&mut self, cx: &App) {
         for mode in [ThemeMode::Light, ThemeMode::Dark] {
             if let Err(error) = theme_config(mode, self.theme(mode), cx) {
                 let name = match mode {
@@ -333,9 +115,9 @@ impl Appearance {
                     mode = ?mode,
                     theme = self.theme(mode),
                     fallback = %fallback.name,
-                    "appearance.slot_recovered"
+                    "appearance.invalid_theme_repaired"
                 );
-                *self.theme_mut(mode) = fallback.name.to_string();
+                self.set_theme_for_mode(mode, fallback.name.to_string());
             }
         }
     }
@@ -367,7 +149,7 @@ pub(crate) fn init(cx: &mut App) {
             Appearance::default()
         }
     };
-    preferences.recover_slots(cx);
+    preferences.repair_invalid_themes(cx);
     let mode = preferences.mode;
     cx.set_global(preferences);
     if let Err(error) = apply(mode, None, cx) {
@@ -377,42 +159,14 @@ pub(crate) fn init(cx: &mut App) {
 
 pub(crate) fn load(path: &Path, cx: &App) -> Result<Appearance, AppearanceError> {
     let mut preferences = match config::read_config_value(path)? {
-        Some(value) => {
-            let mut preferences: Appearance = serde_json::from_value(value.clone()).map_err(|error| AppearanceError::ParseSettings {
-                path: path.to_owned(),
-                source: error.into(),
-            })?;
-            // New settings take precedence if a file contains both schemas.
-            if !["mode", "light_theme", "dark_theme"].iter().any(|key| value.get(key).is_some()) {
-                match value.get("theme") {
-                    Some(serde_json::Value::Null) => {
-                        preferences.mode = AppearanceMode::System;
-                        preferences.dark_theme = "Ayu Dark".to_owned();
-                    }
-                    Some(serde_json::Value::String(name)) => {
-                        if let Some(theme) = ThemeRegistry::global(cx).themes().get(&SharedString::from(name.clone())) {
-                            preferences.mode = if theme.mode.is_dark() {
-                                AppearanceMode::Dark
-                            } else {
-                                AppearanceMode::Light
-                            };
-                            *preferences.theme_mut(theme.mode) = name.clone();
-                        } else {
-                            tracing::warn!(theme = name, "appearance.legacy_theme.unavailable");
-                        }
-                    }
-                    None => {}
-                    Some(_) => {
-                        return Err(AppearanceError::InvalidLegacyTheme { path: path.to_owned() });
-                    }
-                }
-            }
-            preferences
-        }
+        Some(value) => serde_json::from_value(value).map_err(|error| AppearanceError::ParseSettings {
+            path: path.to_owned(),
+            source: error.into(),
+        })?,
         None => Appearance::default(),
     };
     preferences.path = Some(path.to_path_buf());
-    preferences.recover_slots(cx);
+    preferences.repair_invalid_themes(cx);
     Ok(preferences)
 }
 
@@ -423,7 +177,7 @@ fn load_or_default(path: &Path, cx: &App) -> Appearance {
             path: Some(path.to_path_buf()),
             ..Appearance::default()
         };
-        preferences.recover_slots(cx);
+        preferences.repair_invalid_themes(cx);
         preferences
     })
 }
@@ -566,7 +320,7 @@ pub(crate) fn select_theme(mode: ThemeMode, name: SharedString, window: &mut Win
             }
         }
     });
-    *cx.global_mut::<Appearance>().theme_mut(mode) = name.to_string();
+    cx.global_mut::<Appearance>().set_theme_for_mode(mode, name.to_string());
     save(cx).map_err(|source| AppearanceError::ThemeNotSaved { source: Box::new(source) })
 }
 
@@ -598,6 +352,7 @@ mod tests {
     use gpui_kit::{AppContext, Context, IntoElement, Render, TestAppContext, div, px};
 
     use super::*;
+    use crate::error::config::{ConfigDiagnostic, ConfigError};
 
     struct TestView;
 
@@ -623,239 +378,6 @@ mod tests {
         let base = gpui_kit::base::Theme::global(cx);
         assert_eq!(base.tokens.colors.background, theme.background);
         assert_eq!(base.tokens.colors.primary, theme.primary);
-    }
-
-    #[test]
-    fn appearance_error_codes_and_display_are_stable() {
-        let path = || PathBuf::from("settings.json");
-        let diagnostic = || config::ConfigDiagnostic::Json {
-            category: serde_json::error::Category::Data,
-            line: 2,
-            column: 3,
-        };
-        let config_source = || Box::new(AppearanceError::from(config::ConfigError::ConfigDirectoryUnavailable));
-        for (error, code) in [
-            (
-                AppearanceError::from(config::ConfigError::ConfigDirectoryUnavailable),
-                "config.directory_unavailable",
-            ),
-            (
-                AppearanceError::ParseSettings {
-                    path: path(),
-                    source: diagnostic(),
-                },
-                "appearance.settings.parse_failed",
-            ),
-            (
-                AppearanceError::InvalidLegacyTheme { path: path() },
-                "appearance.settings.legacy_theme_invalid",
-            ),
-            (
-                AppearanceError::LoadBundledTheme {
-                    bundle: "ayu.json",
-                    source: Some(diagnostic()),
-                },
-                "appearance.bundled_theme.load_failed",
-            ),
-            (
-                AppearanceError::ReadThemesDirectory {
-                    path: path(),
-                    source: std::io::Error::other("dependency prose"),
-                },
-                "appearance.themes.directory_read_failed",
-            ),
-            (
-                AppearanceError::ReadThemeEntry {
-                    path: path(),
-                    source: std::io::Error::other("dependency prose"),
-                },
-                "appearance.themes.entry_read_failed",
-            ),
-            (
-                AppearanceError::ReadCustomTheme {
-                    path: path(),
-                    source: std::io::Error::other("dependency prose"),
-                },
-                "appearance.custom_theme.read_failed",
-            ),
-            (
-                AppearanceError::LoadCustomTheme {
-                    path: path(),
-                    source: Some(diagnostic()),
-                },
-                "appearance.custom_theme.load_failed",
-            ),
-            (
-                AppearanceError::ThemeUnavailable {
-                    name: "Removed".into(),
-                    mode: ThemeMode::Light,
-                },
-                "appearance.theme.unavailable",
-            ),
-            (
-                AppearanceError::ThemeModeMismatch {
-                    name: "Ayu Dark".into(),
-                    expected: ThemeMode::Light,
-                    actual: ThemeMode::Dark,
-                },
-                "appearance.theme.mode_mismatch",
-            ),
-            (
-                AppearanceError::AppearanceNotSaved { source: config_source() },
-                "appearance.mode.not_saved",
-            ),
-            (
-                AppearanceError::ThemeNotSaved { source: config_source() },
-                "appearance.theme.not_saved",
-            ),
-            (
-                AppearanceError::ReduceMotionNotSaved { source: config_source() },
-                "appearance.reduce_motion.not_saved",
-            ),
-        ] {
-            assert_eq!(error.code(), code);
-            assert_eq!(error.to_string(), code);
-            assert_eq!(format!("{error:#}"), code);
-        }
-    }
-
-    #[test]
-    fn diagnostic_formatting_keeps_paths_without_dependency_prose() {
-        for error in [
-            AppearanceError::ReadThemesDirectory {
-                path: "themes".into(),
-                source: std::io::Error::other("private dependency prose"),
-            },
-            AppearanceError::ReadThemeEntry {
-                path: "themes".into(),
-                source: std::io::Error::other("private dependency prose"),
-            },
-            AppearanceError::ReadCustomTheme {
-                path: "themes".into(),
-                source: std::io::Error::other("private dependency prose"),
-            },
-            AppearanceError::ParseSettings {
-                path: "themes".into(),
-                source: config::ConfigDiagnostic::Json {
-                    category: serde_json::error::Category::Data,
-                    line: 2,
-                    column: 3,
-                },
-            },
-            AppearanceError::InvalidLegacyTheme { path: "themes".into() },
-            AppearanceError::LoadCustomTheme {
-                path: "themes".into(),
-                source: None,
-            },
-            AppearanceError::Config(config::ConfigError::ReadConfig {
-                path: "themes".into(),
-                source: std::io::Error::other("private dependency prose"),
-            }),
-            AppearanceError::Config(config::ConfigError::WriteApplicationConfig {
-                path: "themes".into(),
-                alternative_path: Some("fallback.json".into()),
-                source: Box::new(config::ConfigError::SaveConfig {
-                    path: "themes".into(),
-                    temporary_path: "settings.json.tmp".into(),
-                    source: std::io::Error::other("private dependency prose"),
-                }),
-            }),
-            AppearanceError::ThemeNotSaved {
-                source: Box::new(AppearanceError::Config(config::ConfigError::SaveConfig {
-                    path: "themes".into(),
-                    temporary_path: "settings.json.tmp".into(),
-                    source: std::io::Error::other("private dependency prose"),
-                })),
-            },
-        ] {
-            let diagnostic = format!("{error:?}");
-            assert!(diagnostic.contains("path: \"themes\""), "{diagnostic}");
-            assert!(!diagnostic.contains("private dependency prose"), "{diagnostic}");
-            assert_eq!(error.to_string(), error.code());
-        }
-    }
-
-    #[test]
-    fn diagnostic_formatting_keeps_bundle_parser_and_os_details() {
-        let error = AppearanceError::LoadBundledTheme {
-            bundle: "ayu.json",
-            source: Some(config::ConfigDiagnostic::Json {
-                category: serde_json::error::Category::Syntax,
-                line: 2,
-                column: 3,
-            }),
-        };
-        let diagnostic = format!("{error:?}");
-        for field in ["bundle: \"ayu.json\"", "category: Syntax", "line: 2", "column: 3"] {
-            assert!(diagnostic.contains(field), "{diagnostic}");
-        }
-        let source = std::io::Error::from_raw_os_error(13);
-        let kind = source.kind();
-        let error = AppearanceError::ReadThemeEntry {
-            path: "themes".into(),
-            source,
-        };
-        let diagnostic = format!("{error:?}");
-        assert!(diagnostic.contains(&format!("io_kind: {kind:?}")), "{diagnostic}");
-        assert!(diagnostic.contains("os_error: Some(13)"), "{diagnostic}");
-        assert_eq!(
-            std::error::Error::source(&error)
-                .unwrap()
-                .downcast_ref::<std::io::Error>()
-                .unwrap()
-                .raw_os_error(),
-            Some(13)
-        );
-    }
-
-    #[test]
-    fn unsaved_changes_preserve_typed_configuration_and_io_sources() {
-        use std::error::Error;
-
-        let error = AppearanceError::ThemeNotSaved {
-            source: Box::new(AppearanceError::from(config::ConfigError::ReadConfig {
-                path: "settings.json".into(),
-                source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
-            })),
-        };
-        let appearance = error.source().unwrap().downcast_ref::<AppearanceError>().unwrap();
-        let config = appearance.source().unwrap().downcast_ref::<config::ConfigError>().unwrap();
-        assert!(matches!(config, config::ConfigError::ReadConfig { path, .. } if path == Path::new("settings.json")));
-        assert_eq!(
-            config.source().unwrap().downcast_ref::<std::io::Error>().unwrap().kind(),
-            std::io::ErrorKind::PermissionDenied
-        );
-    }
-
-    #[test]
-    fn theme_loader_sources_are_safe_diagnostics_or_absent() {
-        use std::error::Error;
-
-        let error = AppearanceError::LoadBundledTheme {
-            bundle: "ayu.json",
-            source: Some(config::ConfigDiagnostic::Json {
-                category: serde_json::error::Category::Syntax,
-                line: 2,
-                column: 3,
-            }),
-        };
-        assert!(matches!(error, AppearanceError::LoadBundledTheme { bundle: "ayu.json", .. }));
-        assert!(matches!(
-            error.source().unwrap().downcast_ref::<config::ConfigDiagnostic>(),
-            Some(config::ConfigDiagnostic::Json {
-                category: serde_json::error::Category::Syntax,
-                line: 2,
-                column: 3
-            })
-        ));
-        assert!(
-            AppearanceError::LoadCustomTheme {
-                path: "custom.json".into(),
-                source: None
-            }
-            .source()
-            .is_none()
-        );
     }
 
     #[test]
@@ -896,6 +418,8 @@ mod tests {
             serde_json::json!("On"),
             serde_json::json!("true"),
             serde_json::json!("false"),
+            serde_json::json!(true),
+            serde_json::json!(false),
             serde_json::json!(null),
             serde_json::json!(0),
             serde_json::json!(1),
@@ -910,19 +434,14 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn reduce_motion_defaults_to_system_for_older_settings(cx: &mut TestAppContext) {
+    fn reduce_motion_defaults_to_system_when_unspecified(cx: &mut TestAppContext) {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("appearance.json");
         cx.update(|cx| {
             setup(cx, &path);
             assert_eq!(Appearance::reduce_motion(cx), ReduceMotion::System);
             assert_eq!(Appearance::default().reduce_motion, ReduceMotion::System);
-            for content in [
-                "{}",
-                r#"{"mode":"light","light_theme":"Ayu Light","dark_theme":"Ayu Dark"}"#,
-                r#"{"theme":"Ayu Dark"}"#,
-                r#"{"theme":null}"#,
-            ] {
+            for content in ["{}", r#"{"mode":"light","light_theme":"Ayu Light","dark_theme":"Ayu Dark"}"#] {
                 fs::write(&path, content).unwrap();
                 cx.set_global(load(&path, cx).unwrap());
                 assert_eq!(
@@ -956,28 +475,6 @@ mod tests {
                 assert_eq!(Appearance::mode(cx), AppearanceMode::System);
                 assert_eq!(Appearance::selected_theme(ThemeMode::Light, cx), DEFAULT_LIGHT_THEME);
                 assert_eq!(Appearance::selected_theme(ThemeMode::Dark, cx), DEFAULT_DARK_THEME);
-            }
-        });
-    }
-
-    #[gpui_kit::test]
-    fn reduce_motion_migrates_legacy_bools_to_strings(cx: &mut TestAppContext) {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("appearance.json");
-        cx.update(|cx| {
-            setup(cx, &path);
-            for (legacy, expected, serialized) in [(true, ReduceMotion::On, "on"), (false, ReduceMotion::System, "system")] {
-                fs::write(&path, serde_json::to_vec(&serde_json::json!({"reduce_motion": legacy})).unwrap()).unwrap();
-                cx.set_global(load(&path, cx).unwrap());
-                assert_eq!(Appearance::reduce_motion(cx), expected);
-                for system in [false, true] {
-                    cx.set_reduce_motion(system);
-                    assert_eq!(Appearance::motion_reduced(cx), legacy || system);
-                }
-                save(cx).unwrap();
-                let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-                assert_eq!(saved["reduce_motion"], serialized);
-                assert_eq!(load(&path, cx).unwrap().reduce_motion, expected);
             }
         });
     }
@@ -1019,7 +516,7 @@ mod tests {
                 assert!(matches!(
                     error,
                     AppearanceError::ReduceMotionNotSaved { source }
-                        if matches!(source.as_ref(), AppearanceError::Config(config::ConfigError::SaveConfig { path: saved, .. }) if saved == &path)
+                        if matches!(source.as_ref(), AppearanceError::Config(ConfigError::SaveConfig { path: saved, .. }) if saved == &path)
                 ));
                 assert_eq!(Appearance::reduce_motion(cx), reduce_motion);
                 assert_eq!(Appearance::motion_reduced(cx), expected);
@@ -1051,56 +548,7 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn legacy_named_themes_migrate_using_registry_mode(cx: &mut TestAppContext) {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("appearance.json");
-        cx.update(|cx| {
-            setup(cx, &path);
-            ThemeRegistry::global_mut(cx)
-                .load_themes_from_str(r#"{"name":"Custom","themes":[{"name":"Midnight","mode":"light","colors":{}}]}"#)
-                .unwrap();
-            for (name, mode, slot) in [
-                ("Ayu Light", AppearanceMode::Light, ThemeMode::Light),
-                ("Tokyo Night", AppearanceMode::Dark, ThemeMode::Dark),
-                ("Midnight", AppearanceMode::Light, ThemeMode::Light),
-            ] {
-                fs::write(&path, serde_json::to_vec(&serde_json::json!({"theme":name})).unwrap()).unwrap();
-                let preferences = load(&path, cx).unwrap();
-                assert_eq!(preferences.mode, mode);
-                assert_eq!(preferences.theme(slot), name);
-                let other = if slot.is_dark() { ThemeMode::Light } else { ThemeMode::Dark };
-                assert_eq!(preferences.theme(other), Appearance::default().theme(other));
-                assert_eq!(preferences.path.as_deref(), Some(path.as_path()));
-            }
-            fs::write(&path, r#"{"theme":"Removed"}"#).unwrap();
-            assert_eq!(load(&path, cx).unwrap().mode, AppearanceMode::System);
-        });
-    }
-
-    #[gpui_kit::test]
-    fn legacy_null_preserves_system_ayu_pair_and_new_schema_takes_precedence(cx: &mut TestAppContext) {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("appearance.json");
-        cx.update(|cx| {
-            setup(cx, &path);
-            fs::write(&path, r#"{"theme":null}"#).unwrap();
-            let preferences = load(&path, cx).unwrap();
-            assert_eq!(preferences.mode, AppearanceMode::System);
-            assert_eq!(preferences.light_theme, "Ayu Light");
-            assert_eq!(preferences.dark_theme, "Ayu Dark");
-            cx.set_global(preferences);
-            apply(AppearanceMode::System, None, cx).unwrap();
-            assert_eq!(Theme::global(cx).light_theme.name.as_str(), "Ayu Light");
-            assert_eq!(Theme::global(cx).dark_theme.name.as_str(), "Ayu Dark");
-            fs::write(&path, r#"{"mode":"light","dark_theme":"Tokyo Night","theme":null}"#).unwrap();
-            let preferences = load(&path, cx).unwrap();
-            assert_eq!(preferences.mode, AppearanceMode::Light);
-            assert_eq!(preferences.dark_theme, "Tokyo Night");
-        });
-    }
-
-    #[gpui_kit::test]
-    fn unavailable_or_wrong_mode_slots_recover_independently(cx: &mut TestAppContext) {
+    fn unavailable_or_wrong_mode_themes_recover_independently(cx: &mut TestAppContext) {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("appearance.json");
         cx.update(|cx| {
@@ -1394,7 +842,7 @@ mod tests {
             for (content, code) in [
                 ("invalid", "config.parse_failed"),
                 (r#"{"mode":"invalid"}"#, "appearance.settings.parse_failed"),
-                (r#"{"theme":42}"#, "appearance.settings.legacy_theme_invalid"),
+                (r#"{"reduce_motion":true}"#, "appearance.settings.parse_failed"),
                 (r#"{"light_theme":null}"#, "appearance.settings.parse_failed"),
             ] {
                 fs::write(&path, content).unwrap();
@@ -1410,7 +858,7 @@ mod tests {
             fs::create_dir(&unreadable).unwrap();
             assert!(matches!(
                 load(&unreadable, cx).unwrap_err(),
-                AppearanceError::Config(config::ConfigError::ReadConfig { path, .. }) if path == unreadable
+                AppearanceError::Config(ConfigError::ReadConfig { path, .. }) if path == unreadable
             ));
             assert_eq!(load_or_default(&unreadable, cx).path.as_deref(), Some(unreadable.as_path()));
         });
@@ -1431,7 +879,7 @@ mod tests {
             assert!(matches!(
                 error,
                 AppearanceError::AppearanceNotSaved { source }
-                    if matches!(source.as_ref(), AppearanceError::Config(config::ConfigError::SaveConfig { path: saved, .. }) if saved == &path)
+                    if matches!(source.as_ref(), AppearanceError::Config(ConfigError::SaveConfig { path: saved, .. }) if saved == &path)
             ));
             assert_eq!(Appearance::mode(cx), AppearanceMode::Light);
             assert_eq!(Theme::global(cx).theme_name().as_str(), DEFAULT_LIGHT_THEME);
@@ -1493,7 +941,7 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn invalid_settings_retain_safe_diagnostics_without_echoing_values(cx: &mut TestAppContext) {
+    fn invalid_settings_preserve_paths_and_typed_diagnostics(cx: &mut TestAppContext) {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("appearance.json");
         cx.update(|cx| {
@@ -1501,18 +949,13 @@ mod tests {
             fs::write(&path, r#"{"mode":"private-parser-value"}"#).unwrap();
             let error = load(&path, cx).unwrap_err();
             assert_eq!(error.code(), "appearance.settings.parse_failed");
-            assert!(!format!("{error:?}").contains("private-parser-value"));
             assert!(matches!(
                 error,
                 AppearanceError::ParseSettings {
                     path: failed_path,
-                    source: config::ConfigDiagnostic::Json { category: serde_json::error::Category::Data, .. },
+                    source: ConfigDiagnostic::Json { category: serde_json::error::Category::Data, .. },
                 } if failed_path == path
             ));
-            fs::write(&path, r#"{"theme":42}"#).unwrap();
-            assert!(
-                matches!(load(&path, cx).unwrap_err(), AppearanceError::InvalidLegacyTheme { path: failed_path } if failed_path == path)
-            );
         });
     }
 
@@ -1529,12 +972,11 @@ mod tests {
             gpui_kit::init(cx);
             let error = load_custom_theme(&path, cx).unwrap_err();
             assert_eq!(error.code(), "appearance.custom_theme.load_failed");
-            assert!(!format!("{error:?}").contains("private-parser-value"));
             assert!(matches!(
                 error,
                 AppearanceError::LoadCustomTheme {
                     path: failed_path,
-                    source: Some(config::ConfigDiagnostic::Json { category: serde_json::error::Category::Data, line, column }),
+                    source: Some(ConfigDiagnostic::Json { category: serde_json::error::Category::Data, line, column }),
                 } if failed_path == path && line > 0 && column > 0
             ));
             fs::remove_file(&path).unwrap();

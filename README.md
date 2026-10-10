@@ -44,10 +44,8 @@ Settings are stored in `config.json` in the application configuration directory.
 
 - `active_connection` is the name of the connection to connect to at startup. Use `null` or omit it to start without connecting. An unknown name falls back to the first connection. When multiple connections have the same non-empty name, only the first is loaded; give each connection a unique name.
 - `connection` is the broker URI: use `mqtt://`, `mqtts://`, `ws://`, or `wss://` to select MQTT, MQTT over TLS, WebSocket, or secure WebSocket. Include the broker host and preferably an explicit port, for example `mqtts://mqtt-user@mqtt.lan:8883`. Put the username before `@`; omit it for an empty username. URL-encode reserved characters in the username. Do not put a password in the URI. If the URI omits the port, it defaults to `1883`, `8883`, `80`, or `443` for those schemes, respectively. IPv6 hosts must be bracketed, for example `mqtt://user@[::1]:1883`.
-- Older connection entries may use a separate `username` field; it is read and moved into the URI when saved.
 - `client_id` identifies the MQTT client. Use a different ID for each concurrently connected client on the same broker to avoid disconnecting each other. If omitted, an ID is generated when the connection is loaded.
 - `topics` must contain at least one unique MQTT filter. `+` matches one topic level; a final `#` matches any number of levels. `#` does not include topics starting with `$`; subscribe to `$SYS/#` separately for broker statistics. `qos` is the requested maximum delivery QoS: `0` (at most once), `1` (at least once), or `2` (exactly once). If `topics` is omitted, it defaults to `[{"topic":"#","qos":0}]`.
-- Connection entries using separate `host`, `port`, `tls`, and `websocket` fields are also accepted. When saved, the broker address is written as a `connection` URI instead.
 
 | Transport | URI scheme | Connection editor's default port |
 | --- | --- | --- |

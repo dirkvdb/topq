@@ -3,6 +3,7 @@
 mod appearance;
 mod bundled_themes;
 mod config;
+mod error;
 mod mqtt;
 mod topics;
 mod ui;

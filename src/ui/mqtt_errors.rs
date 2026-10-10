@@ -1,7 +1,7 @@
 //! English fallback messages for MQTT failures. Backend displays remain stable codes.
 
 use crate::{
-    mqtt::{MqttError, PublishAcknowledgement},
+    error::mqtt::{MqttError, PublishAcknowledgement},
     ui::messages::LocalizedError,
 };
 
@@ -104,7 +104,7 @@ impl LocalizedError for MqttError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mqtt::SubscriptionResult;
+    use crate::error::mqtt::SubscriptionResult;
 
     #[test]
     fn dependency_prose_is_diagnostic_only() {

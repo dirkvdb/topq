@@ -1073,21 +1073,119 @@ fn publish_topic_tab_preserves_unicode_empty_levels_and_undo(cx: &mut TestAppCon
 }
 
 #[gpui_kit::test]
-fn publish_disclosure_restores_saved_state_in_new_explorers(cx: &mut TestAppContext) {
-    let (handle, _) = open(cx, false, 900., 640.);
-    cx.update_window(handle, |_, window, _| window.activate_window()).unwrap();
-    cx.run_until_parked();
+fn ui_state_is_saved_as_one_snapshot_only_when_the_window_closes(cx: &mut TestAppContext) {
     for expected_open in [true, false] {
+        let initial = config::UiState {
+            publish_open: !expected_open,
+            ..Default::default()
+        };
+        config::save_ui_state(&initial);
+        let path = config::state_path().unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let (handle, view) = open(cx, false, 1200., 850.);
+        view.update(cx, |view, cx| {
+            view.publish_open = initial.publish_open;
+            cx.notify();
+        });
         cx.update_window(handle, |_, window, cx| {
+            window.activate_window();
             window.render_frame(cx);
             window.click("toggle-publish", cx);
-            let restored = cx.new(|cx| Explorer::new(window, cx));
-            assert_eq!(restored.read(cx).publish_open, expected_open);
-            assert_eq!(crate::config::load_publish_layout().unwrap().open, expected_open);
+            window.press("ctrl-alt-right", cx);
+            assert_eq!(view.read(cx).publish_open, expected_open);
         })
         .unwrap();
         cx.run_until_parked();
+        let expected = cx.update(|cx| view.read(cx).ui_state());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(expected.topics_width_rem.is_some());
+        drop(view);
+        cx.update_window(handle, |_, window, _| window.remove_window()).unwrap();
+        cx.run_until_parked();
+        assert_eq!(config::load_ui_state(), expected);
+
+        let (restored_handle, restored) = cx
+            .update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| cx.new(|cx| Explorer::new(window, cx))).unwrap());
+        cx.update(|cx| assert_eq!(restored.read(cx).ui_state(), expected));
+        drop(restored);
+        cx.update_window(restored_handle, |_, window, _| window.remove_window()).unwrap();
+        cx.run_until_parked();
     }
+}
+
+#[gpui_kit::test]
+fn ui_state_changes_do_not_create_a_file_and_application_quit_saves_once(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, false, 1200., 850.);
+    let path = config::state_path().unwrap();
+    assert!(!path.exists());
+    cx.update_window(handle, |_, window, cx| {
+        window.activate_window();
+        window.render_frame(cx);
+        window.click("toggle-publish", cx);
+        window.click("publish-payload", cx);
+        window.press("ctrl-alt-up", cx);
+        window.press("ctrl-alt-right", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let expected = cx.update(|cx| view.read(cx).ui_state());
+    assert!(expected.publish_open);
+    assert!(expected.topics_width_rem.is_some());
+    assert!(expected.publish_height_rem.is_some());
+    assert!(!path.exists());
+    cx.quit();
+    assert_eq!(config::load_ui_state(), expected);
+
+    // Release after the quit callback must not attempt a second save.
+    let sentinel = b"publish_open = false\n";
+    std::fs::write(&path, sentinel).unwrap();
+    drop(view);
+    cx.update(|_| {});
+    assert_eq!(std::fs::read(path).unwrap(), sentinel);
+}
+
+#[gpui_kit::test]
+fn layout_save_failures_do_not_show_alerts_or_replace_user_facing_errors(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, false, 1200., 760.);
+    let path = config::state_path().unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let malformed_state = "topics_width_rem = [";
+    std::fs::write(&path, malformed_state).unwrap();
+
+    cx.update_window(handle, |_, window, cx| {
+        window.activate_window();
+        window.render_frame(cx);
+        window.click("toggle-publish", cx);
+        assert!(view.read(cx).publish_open);
+        assert!(view.read(cx).error.is_none());
+        assert!(window.try_find("application-error").is_none());
+        view.update(cx, |view, cx| {
+            let topics_panes = view.panes.clone();
+            let publish_panes = view.publish_panes.clone();
+            view.cache_topics_split(&topics_panes, window, cx);
+            view.cache_publish_split(&publish_panes, window, cx);
+        });
+        window.render_frame(cx);
+        assert!(view.read(cx).topics_width_rem.is_some());
+        assert!(view.read(cx).publish_height_rem.is_some());
+        assert!(view.read(cx).error.is_none());
+        assert!(window.try_find("application-error").is_none());
+
+        view.update(cx, |view, cx| {
+            view.error = Some("Could not save connection settings.".into());
+            let topics_panes = view.panes.clone();
+            let publish_panes = view.publish_panes.clone();
+            view.cache_topics_split(&topics_panes, window, cx);
+            view.cache_publish_split(&publish_panes, window, cx);
+        });
+        window.click("toggle-publish", cx);
+        view.update(cx, |view, _| view.save_ui_state_on_close());
+        assert!(!view.read(cx).publish_open);
+        assert_eq!(view.read(cx).error.as_deref(), Some("Could not save connection settings."));
+        assert!(window.find("application-error").visible());
+    })
+    .unwrap();
+    assert_eq!(std::fs::read_to_string(path).unwrap(), malformed_state);
 }
 
 #[gpui_kit::test]
@@ -1506,7 +1604,7 @@ fn publish_file_replace_collapse_and_remove_restore_the_editor_across_themes_and
     std::fs::write(&image, PUBLISH_FILE_SVG).unwrap();
     for mode in [ThemeMode::Light, ThemeMode::Dark] {
         for font_size in [16., 20.] {
-            crate::config::save_publish_open(false).unwrap();
+            crate::config::save_ui_state(&config::UiState::default());
             let (handle, view) = open_publish_file_draft(cx, 760., 540.);
             cx.update(|cx| {
                 Theme::change(mode, None, cx);
@@ -1617,7 +1715,7 @@ fn publish_file_images_fit_without_upscaling_or_overlapping_controls(cx: &mut Te
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("large.svg");
     for mode in [ThemeMode::Light, ThemeMode::Dark] {
-        crate::config::save_publish_open(false).unwrap();
+        crate::config::save_ui_state(&config::UiState::default());
         let (handle, _) = open_publish_file_draft(cx, 760., 540.);
         cx.update(|cx| {
             Theme::change(mode, None, cx);
@@ -2172,7 +2270,7 @@ fn saved_publish_height_restores_rem_when_no_fraction_is_cached(cx: &mut TestApp
             let height = window.find("publish-panel").bounds().size.height;
             assert!(
                 (height - window.rem_size() * 26.).abs() <= px(1.),
-                "legacy rem-only height must use the current zoom: height {height:?}, rem {:?}, sizes {:?}",
+                "saved rem-only height must use the current zoom: height {height:?}, rem {:?}, sizes {:?}",
                 window.rem_size(),
                 view.read(cx).publish_panes.read(cx).sizes()
             );
@@ -2752,7 +2850,7 @@ fn broker_event_channel_closure_fails_pending_publish_and_retains_connection_sta
     .unwrap();
     assert!(
         sender
-            .try_send(BrokerEvent::Status(crate::mqtt::MqttError::TrustedCertificatesUnavailable))
+            .try_send(BrokerEvent::Status(crate::error::mqtt::MqttError::TrustedCertificatesUnavailable))
             .is_ok()
     );
     cx.run_until_parked();
@@ -2797,7 +2895,7 @@ fn replacing_broker_event_listener_cancels_old_channel_and_ignores_queued_events
     cx.run_until_parked();
     assert!(
         old_sender
-            .try_send(BrokerEvent::Status(crate::mqtt::MqttError::WorkerStopped))
+            .try_send(BrokerEvent::Status(crate::error::mqtt::MqttError::WorkerStopped))
             .is_ok()
     );
     assert!(old_sender.try_send(BrokerEvent::Message(message("home/stale"))).is_ok());
@@ -3081,7 +3179,7 @@ fn testing_with_a_username_but_no_password_does_not_start_a_broker_test(cx: &mut
 fn application_errors_are_shown_in_alerts(cx: &mut TestAppContext) {
     let (handle, view) = open(cx, false, 900., 640.);
     view.update(cx, |view, cx| {
-        view.error = Some("Could not save the application state.".into());
+        view.error = Some("Could not save connection settings.".into());
         cx.notify();
     });
     cx.update_window(handle, |_, window, cx| {
@@ -3090,7 +3188,7 @@ fn application_errors_are_shown_in_alerts(cx: &mut TestAppContext) {
         let alert = window.find("application-error");
         assert!(alert.visible());
         let alert_bounds = alert.bounds();
-        assert_eq!(view.read(cx).error.as_deref(), Some("Could not save the application state."));
+        assert_eq!(view.read(cx).error.as_deref(), Some("Could not save connection settings."));
         // Alert's built-in close control has no test-support registration.
         window.click_at("application-error", gpui_kit::point(alert_bounds.size.width - px(26.), px(20.)), cx);
         window.render_frame(cx);
@@ -3116,12 +3214,14 @@ fn publish_errors_use_dismissible_alerts_without_changing_the_draft_layout(cx: &
                     view.update(cx, |view, cx| {
                         view.publish_pending = true;
                         view.apply_broker_events(
-                            [crate::mqtt::BrokerEvent::PublishError(crate::mqtt::MqttError::PublishRejected {
-                                packet_id: 1,
-                                acknowledgement: crate::mqtt::PublishAcknowledgement::PubAck,
-                                reason_code: 0x87,
-                                diagnostic_reason: Some("private broker diagnostic".into()),
-                            })],
+                            [crate::mqtt::BrokerEvent::PublishError(
+                                crate::error::mqtt::MqttError::PublishRejected {
+                                    packet_id: 1,
+                                    acknowledgement: crate::error::mqtt::PublishAcknowledgement::PubAck,
+                                    reason_code: 0x87,
+                                    diagnostic_reason: Some("private broker diagnostic".into()),
+                                },
+                            )],
                             window,
                             cx,
                         );
@@ -5993,7 +6093,7 @@ fn edit_value_prefills_publish_draft_and_focuses_the_payload_end(cx: &mut TestAp
             assert_publish_payload_detection(window, cx, &view, expected, None, expected.len());
             assert!(view.read(cx).publish_retain);
             assert_eq!(view.read(cx).publish_qos.read(cx).selected_value(), Some(&"1"));
-            assert!(crate::config::load_publish_layout().unwrap().open);
+            assert!(view.read(cx).publish_open);
             window.input("!", cx);
             let editor = view.read(cx).publish_payload.read(cx);
             assert_eq!(editor.value().as_str(), format!("{expected}!"));
@@ -6952,7 +7052,9 @@ fn failed_topic_deletion_reports_the_error_without_losing_topic_data(cx: &mut Te
     cx.update_window(handle, |_, window, cx| {
         view.update(cx, |view, cx| {
             view.select_topic("home/a", window, cx);
-            view.show_confirm_topic_deletion_dialog("home/a".into(), window, cx, |_, _| Err(crate::mqtt::MqttError::CommandQueueFull));
+            view.show_confirm_topic_deletion_dialog("home/a".into(), window, cx, |_, _| {
+                Err(crate::error::mqtt::MqttError::CommandQueueFull)
+            });
         });
     })
     .unwrap();

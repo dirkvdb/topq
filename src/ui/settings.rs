@@ -4,6 +4,7 @@ use super::{ConnectionStatus, ConnectionTestStatus, Explorer, connection_label, 
 use crate::{
     appearance::{self, Appearance, AppearanceMode, ReduceMotion},
     config::{self, ConnectionConfig, ConnectionField, SavedConnections, TopicSubscription},
+    error::config::ConfigError,
     mqtt::{self, Qos},
 };
 use gpui_kit::assets::IconName as AssetIconName;
@@ -532,7 +533,7 @@ impl Explorer {
         index: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
-        save: impl FnOnce(&SavedConnections) -> Result<(), config::ConfigError>,
+        save: impl FnOnce(&SavedConnections) -> Result<(), ConfigError>,
     ) {
         let mut connections = SavedConnections {
             connections: self.saved_connections.connections.clone(),
