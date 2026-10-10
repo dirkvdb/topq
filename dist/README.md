@@ -140,7 +140,10 @@ pure-Rust writer instead records mode `000` for the SquashFS root, preventing
 launch. CI checks the packaged root permissions before uploading. Version 0.11.0
 does not automatically collect shared libraries: compatible system libraries
 (including Fontconfig/XCB/XKB), a working Vulkan GPU driver, and a desktop
-session are still required. Building on Ubuntu 22.04
+session are still required. On Ubuntu, if launch reports that
+`libxkbcommon-x11.so.0` is missing, install its runtime package with
+`sudo apt install libxkbcommon-x11-0`; the `-dev` package installed in CI is a
+build dependency and is not included in the AppImage. Building on Ubuntu 22.04
 does not guarantee compatibility with older distributions. Systems without FUSE
 can use the runtime's `--appimage-extract-and-run` option. The AppImage is unsigned.
 
