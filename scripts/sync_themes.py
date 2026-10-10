@@ -6,10 +6,9 @@ import json
 import re
 import sys
 import tarfile
+import tomllib
 from pathlib import Path, PurePosixPath
 from urllib.request import urlopen
-
-import tomllib
 
 ROOT = Path(__file__).resolve().parent.parent
 
