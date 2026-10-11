@@ -1572,10 +1572,8 @@ impl Explorer {
                     div()
                         .h_flex()
                         .flex_none()
+                        .gap_1()
                         .child(div().flex_1().font_medium().child("Latest value"))
-                        .when(!self.numeric_fields.is_empty(), |toolbar| {
-                            toolbar.child(self.monitor_field_menu(cx))
-                        })
                         .child(
                             Toggle::new("preview-value")
                                 .small()
@@ -1620,7 +1618,10 @@ impl Explorer {
                                         cx.write_to_clipboard(ClipboardItem::new_string(text));
                                     }
                                 })),
-                        ),
+                        )
+                        .when(!self.numeric_fields.is_empty(), |toolbar| {
+                            toolbar.child(self.monitor_field_menu(cx))
+                        }),
                 )
                 .child(
                     div()

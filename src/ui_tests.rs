@@ -627,6 +627,46 @@ fn monitor_field_menu_supports_keyboard_selection_without_hover(cx: &mut TestApp
 }
 
 #[gpui_kit::test]
+fn raw_payload_keeps_add_to_chart_available(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, false, 1000., 800.);
+    cx.update_window(handle, |_, window, cx| {
+        window.activate_window();
+        view.update(cx, |view, cx| {
+            let mut incoming = message("home/a");
+            incoming.payload = Bytes::from_static(b"{\"power\":5}");
+            view.apply_broker_events([crate::mqtt::BrokerEvent::Message(incoming)], window, cx);
+            view.select_topic("home/a", window, cx);
+        });
+        window.render_frame(cx);
+        assert!(window.find("monitor-field-menu").visible());
+        window.click("preview-value", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(!view.read(cx).payload_preview);
+        assert!(window.find("monitor-field-menu").visible());
+        assert!(window.try_find("monitor-hovered-field").is_none());
+        window.click("monitor-field-menu", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.press("down", cx);
+        window.press("enter", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(view.read(cx).monitoring.contains("home/a", "/power"));
+        assert!(window.find("monitor-panel").visible());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
 fn monitoring_charts_wrap_into_rows_as_window_width_changes(cx: &mut TestAppContext) {
     for (width, columns) in [(900., 1), (1400., 2), (2600., 3)] {
         let (handle, view) = open(cx, false, width, 800.);
@@ -6499,6 +6539,32 @@ fn reduced_motion_hides_update_flashes_without_losing_selection(cx: &mut TestApp
         assert_eq!(window.find("selected-topic").label(), Some("home"));
     })
     .unwrap();
+}
+
+#[gpui_kit::test]
+fn payload_editor_fills_preview_width_with_and_without_numeric_fields(cx: &mut TestAppContext) {
+    for (width, font_size) in [(760., 14.), (1200., 16.), (1200., 24.)] {
+        let (handle, view) = open(cx, false, width, 760.);
+        cx.update(|cx| Theme::update(cx, |theme| theme.font_size = px(font_size)));
+        for payload in [r#"{"reading":3}"#, r#"{"status":"online"}"#] {
+            cx.update_window(handle, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    receive_payload(view, "home/a", payload, window, cx);
+                    view.select_topic("home/a", window, cx);
+                });
+                window.render_frame(cx);
+                let viewport = window.find("payload").bounds();
+                let editor = window.find(("input", view.read(cx).payload.entity_id())).bounds();
+                let leading = editor.left() - viewport.left();
+                let trailing = viewport.right() - editor.right();
+                assert!(
+                    leading.abs() <= px(1.) && trailing.abs() <= px(1.),
+                    "editor must fill preview width at width {width}, font {font_size}, payload {payload}: {leading:?} vs {trailing:?}"
+                );
+            })
+            .unwrap();
+        }
+    }
 }
 
 #[gpui_kit::test]

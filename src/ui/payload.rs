@@ -145,7 +145,10 @@ impl Explorer {
         Button::new("monitor-field-menu")
             .ghost()
             .small()
-            .label("New field chart")
+            .icon(AssetIconName::ChartLine)
+            .label("") // Use empty label, icon only with caret is not sized properly
+            .accessibility_label("Add to chart")
+            .tooltip("Add to chart")
             .dropdown_caret(true)
             .dropdown_menu(move |mut menu, _, cx| {
                 let Some(view) = view.upgrade() else { return menu };
@@ -197,7 +200,7 @@ impl Explorer {
                 )
                 .into_any_element();
         }
-        let numeric = !self.numeric_fields.is_empty();
+        let numeric = self.payload_preview && !self.numeric_fields.is_empty();
         let hovered = self
             .hovered_field
             .as_ref()
@@ -245,7 +248,6 @@ impl Explorer {
             .test_support()
             .relative()
             .size_full()
-            .when(numeric, |container| container.pl_6())
             .child(
                 Editor::new(&self.payload)
                     .readonly(true)
@@ -382,13 +384,14 @@ impl Explorer {
                     "plaintext"
                 }
         {
-            self.numeric_fields = if self.payload_preview && format == "JSON" {
+            self.numeric_fields = if format == "JSON" {
                 monitor::numeric_fields(&text)
             } else {
                 Vec::new()
             };
             // Live value changes do not end the pointer interaction with this field.
-            if !same_topic
+            if !self.payload_preview
+                || !same_topic
                 || self
                     .hovered_field
                     .as_ref()
