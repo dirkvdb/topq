@@ -64,6 +64,7 @@ gpui_kit::actions!(
         FocusTopicFilter,
         FirstTopic,
         LastTopic,
+        NavigateTopicLeft,
         NarrowTopics,
         WidenTopics,
         PublishMessage,
@@ -85,6 +86,11 @@ pub(crate) fn init(cx: &mut App) {
         KeyBinding::new("secondary-1", FocusTopics, Some("Explorer")),
         KeyBinding::new("home", FirstTopic, Some("Tree")),
         KeyBinding::new("end", LastTopic, Some("Tree")),
+        KeyBinding::new("left", NavigateTopicLeft, Some("Tree")),
+        KeyBinding::new("h", NavigateTopicLeft, Some("Tree")),
+        KeyBinding::new("j", gpui_kit::base::actions::SelectDown, Some("Tree")),
+        KeyBinding::new("k", gpui_kit::base::actions::SelectUp, Some("Tree")),
+        KeyBinding::new("l", gpui_kit::base::actions::SelectRight, Some("Tree")),
         KeyBinding::new("enter", gpui_kit::base::actions::Confirm { secondary: false }, Some("Tree")),
         KeyBinding::new("ctrl-alt-left", NarrowTopics, Some("Explorer")),
         KeyBinding::new("ctrl-alt-right", WidenTopics, Some("Explorer")),
@@ -749,6 +755,10 @@ impl Explorer {
                 payload_changed = true;
             }
             self.sync_tree(cx);
+            // Hand off the empty pane's default focus without interrupting other controls.
+            if self.focus.is_focused(window) {
+                self.focus_topics(window, cx);
+            }
         }
         if payload_changed {
             self.refresh_details(window, cx);
@@ -1016,6 +1026,27 @@ impl Explorer {
         self.tree_state.update(cx, |state, cx| {
             state.set_selected_index(Some(ix), cx);
             state.scroll_to_item(ix, if last { ScrollStrategy::Bottom } else { ScrollStrategy::Top });
+        });
+    }
+
+    fn navigate_topic_left(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let tree = self.tree_state.read(cx);
+        let Some(item) = tree.selected_item() else {
+            return;
+        };
+        if item.is_folder() && item.is_expanded() {
+            window.dispatch_action(Box::new(gpui_kit::base::actions::SelectLeft), cx);
+            return;
+        }
+        let Some((parent, _)) = item.id.rsplit_once('/') else {
+            return;
+        };
+        let Some(index) = tree.index_of(&SharedString::from(parent.to_owned())) else {
+            return;
+        };
+        self.tree_state.update(cx, |state, cx| {
+            state.set_selected_index(Some(index), cx);
+            state.scroll_to_item(index, ScrollStrategy::Top);
         });
     }
 
@@ -1804,6 +1835,7 @@ impl Render for Explorer {
             .on_action(cx.listener(|view, _: &FocusTopicFilter, window, cx| view.focus_topic_filter(window, cx)))
             .on_action(cx.listener(|view, _: &FirstTopic, _, cx| view.select_boundary(false, cx)))
             .on_action(cx.listener(|view, _: &LastTopic, _, cx| view.select_boundary(true, cx)))
+            .on_action(cx.listener(|view, _: &NavigateTopicLeft, window, cx| view.navigate_topic_left(window, cx)))
             .on_action(cx.listener(|view, _: &NarrowTopics, window, cx| view.resize_topics(false, window, cx)))
             .on_action(cx.listener(|view, _: &WidenTopics, window, cx| view.resize_topics(true, window, cx)))
             .size_full()

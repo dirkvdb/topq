@@ -6311,6 +6311,221 @@ fn pending_connection_prevents_duplicate_submission(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn first_topics_receive_default_focus_for_arrow_key_navigation(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, false, 1200., 760.);
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.clear_topics(window, cx);
+            view.focus_topics(window, cx);
+        });
+        window.render_frame(cx);
+        assert!(view.read(cx).focus.is_focused(window));
+        view.update(cx, |view, cx| {
+            view.apply_broker_events([crate::mqtt::BrokerEvent::Message(message("home/a"))], window, cx);
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.press("down", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(view.read(cx).selected.as_deref(), Some("home"));
+        window.press("right", cx);
+        window.press("down", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update(|cx| assert_eq!(view.read(cx).selected.as_deref(), Some("home/a")));
+}
+
+#[gpui_kit::test]
+fn first_topics_do_not_steal_focus_from_inputs_or_settings(cx: &mut TestAppContext) {
+    for target in ["topic-search", "publish-topic", "name"] {
+        let (handle, view) = open(cx, false, 1200., 760.);
+        let mut previous_focus = None;
+        cx.update_window(handle, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                view.clear_topics(window, cx);
+                view.focus_topics(window, cx);
+            });
+            window.render_frame(cx);
+            match target {
+                "publish-topic" => window.click("toggle-publish", cx),
+                "name" => {
+                    window.click("settings", cx);
+                    window.click("new-connection", cx);
+                }
+                _ => {}
+            }
+            window.click(target, cx);
+            previous_focus = window.focused(cx);
+            view.update(cx, |view, cx| {
+                view.apply_broker_events([crate::mqtt::BrokerEvent::Message(message("home/a"))], window, cx);
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.focused(cx), previous_focus);
+            assert_eq!(window.find(target).focused(), Some(true));
+        })
+        .unwrap();
+    }
+}
+
+#[gpui_kit::test]
+fn tree_vim_navigation_matches_arrow_key_selection_and_expansion(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, false, 1200., 760.);
+    for (key, selected, expanded) in [
+        ("j", "home", false),
+        ("l", "home", true),
+        ("j", "home/a", true),
+        ("j", "home/b", true),
+        ("j", "home", true),
+        ("k", "home/b", true),
+        ("k", "home/a", true),
+        ("k", "home", true),
+        ("h", "home", false),
+        ("l", "home", true),
+    ] {
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.press(key, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(view.read(cx).selected.as_deref(), Some(selected), "selection after {key}");
+            assert_eq!(view.read(cx).expanded.contains("home"), expanded, "expansion after {key}");
+            assert_eq!(window.try_find("topic:home/a").is_some(), expanded);
+        })
+        .unwrap();
+    }
+}
+
+#[gpui_kit::test]
+fn tree_left_navigation_collapses_before_selecting_the_parent(cx: &mut TestAppContext) {
+    for key in ["h", "left"] {
+        for filtering in [false, true] {
+            let (handle, view) = open(cx, false, 1200., 760.);
+            cx.update_window(handle, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.apply_broker_events([crate::mqtt::BrokerEvent::Message(message("home/a/leaf"))], window, cx);
+                    view.select_topic("home/a", window, cx);
+                });
+                window.render_frame(cx);
+                if filtering {
+                    window.click("topic-search", cx);
+                    window.input("leaf", cx);
+                    window.press("escape", cx);
+                } else {
+                    window.press("right", cx);
+                }
+            })
+            .unwrap();
+            cx.run_until_parked();
+            for (selected, expanded) in [("home/a", false), ("home", true), ("home", false), ("home", false)] {
+                cx.update_window(handle, |_, window, cx| {
+                    window.render_frame(cx);
+                    window.press(key, cx);
+                })
+                .unwrap();
+                cx.run_until_parked();
+                cx.update_window(handle, |_, window, cx| {
+                    window.render_frame(cx);
+                    let explorer = view.read(cx);
+                    assert_eq!(explorer.selected.as_deref(), Some(selected));
+                    assert_eq!(window.find("selected-topic").label(), Some(selected));
+                    assert_eq!(explorer.tree_state.read(cx).selected_item().unwrap().is_expanded(), expanded);
+                    assert!(window.try_find("topic:home/a/leaf").is_none());
+                })
+                .unwrap();
+            }
+        }
+    }
+}
+
+#[gpui_kit::test]
+fn tree_left_navigation_selects_leaf_parents_preserving_unicode_and_empty_levels(cx: &mut TestAppContext) {
+    for key in ["h", "left"] {
+        for (topic, parents) in [
+            ("家//leaf", ["家/", "家/", "家", "家", "家"]),
+            ("/leading/leaf", ["/leading", "/leading", "", "", ""]),
+        ] {
+            let (handle, view) = open(cx, false, 1200., 760.);
+            cx.update_window(handle, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.apply_broker_events([crate::mqtt::BrokerEvent::Message(message(topic))], window, cx);
+                    view.select_topic(topic, window, cx);
+                });
+            })
+            .unwrap();
+            cx.run_until_parked();
+            let mut previous_focus = None;
+            for parent in parents {
+                cx.update_window(handle, |_, window, cx| {
+                    window.render_frame(cx);
+                    previous_focus = window.focused(cx);
+                    window.press(key, cx);
+                })
+                .unwrap();
+                cx.run_until_parked();
+                cx.update_window(handle, |_, window, cx| {
+                    window.render_frame(cx);
+                    assert_eq!(view.read(cx).selected.as_deref(), Some(parent));
+                    assert_eq!(window.focused(cx), previous_focus);
+                })
+                .unwrap();
+            }
+        }
+    }
+}
+
+#[gpui_kit::test]
+fn tree_vim_navigation_does_not_intercept_text_input(cx: &mut TestAppContext) {
+    for target in ["topic-search", "publish-topic", "publish-payload", "name"] {
+        let (handle, view) = open(cx, false, 1200., 760.);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            match target {
+                "publish-topic" | "publish-payload" => window.click("toggle-publish", cx),
+                "name" => {
+                    window.click("settings", cx);
+                    window.click("new-connection", cx);
+                }
+                _ => {}
+            }
+            window.click(target, cx);
+            window.press("secondary-a", cx);
+            window.input("hjkl", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            if target == "publish-payload" {
+                let editor = view.read(cx).publish_payload.read(cx);
+                assert_eq!(editor.value().as_str(), "hjkl");
+                assert!(editor.focus_handle(cx).is_focused(window));
+            } else {
+                assert_eq!(window.find(target).value(), Some("hjkl"), "text input in {target}");
+                assert_eq!(window.find(target).focused(), Some(true));
+            }
+            assert!(view.read(cx).selected.is_none());
+            assert!(view.read(cx).expanded.is_empty());
+        })
+        .unwrap();
+    }
+}
+
+#[gpui_kit::test]
 fn tree_keyboard_selection_survives_insertions_before_the_selected_topic(cx: &mut TestAppContext) {
     let (handle, view) = open(cx, false, 1200., 760.);
     cx.update_window(handle, |_, window, cx| {
