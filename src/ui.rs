@@ -1473,17 +1473,34 @@ impl Explorer {
                 breadcrumbs = breadcrumbs.child(div().flex_none().text_color(cx.theme().muted_foreground).child("/"));
             }
             end += level.len();
-            let prefix = path[..end].to_owned();
-            breadcrumbs = breadcrumbs.child(
-                Button::new(SharedString::from(format!("topic-segment:{index}")))
-                    .link()
-                    .small()
-                    .flex_none()
-                    .font_medium()
-                    .label(if level.is_empty() { "(empty level)" } else { level }.to_owned())
-                    .accessibility_label(format!("Navigate to topic {prefix}"))
-                    .on_click(cx.listener(move |view, _, window, cx| view.select_topic(&prefix, window, cx))),
-            );
+            let id = SharedString::from(format!("topic-segment:{index}"));
+            let label = if level.is_empty() { "(empty level)" } else { level }.to_owned();
+            if end == path.len() {
+                breadcrumbs = breadcrumbs.child(
+                    div()
+                        .id(id)
+                        .test_support()
+                        .aria_label(label.clone())
+                        .flex_none()
+                        .text_sm()
+                        .font_medium()
+                        .text_color(cx.theme().link)
+                        .whitespace_nowrap()
+                        .child(label),
+                );
+            } else {
+                let prefix = path[..end].to_owned();
+                breadcrumbs = breadcrumbs.child(
+                    Button::new(id)
+                        .link()
+                        .small()
+                        .flex_none()
+                        .font_medium()
+                        .label(label)
+                        .accessibility_label(format!("Navigate to topic {prefix}"))
+                        .on_click(cx.listener(move |view, _, window, cx| view.select_topic(&prefix, window, cx))),
+                );
+            }
         }
         let copy_path = path.clone();
         panel = panel.child(

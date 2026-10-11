@@ -7356,6 +7356,38 @@ fn selected_topic_breadcrumbs_fit_in_the_header_at_different_font_sizes(cx: &mut
 }
 
 #[gpui_kit::test]
+fn current_topic_breadcrumb_is_plain_text_and_does_not_navigate(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, false, 1200., 760.);
+    for topic in ["espaltherma", "energy/solar/result", "/energy//測定値/", ""] {
+        cx.update_window(handle, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                view.topics.receive(message(topic), std::time::Instant::now());
+                view.select_topic(topic, window, cx);
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("payload", cx);
+            window.press("secondary-a", cx);
+            let selection = view.read(cx).payload.read(cx).selected_range();
+            let id = format!("topic-segment:{}", topic.split('/').count() - 1);
+            let segment = window.find(id.clone());
+            let level = topic.rsplit('/').next().unwrap();
+            assert_eq!(segment.label(), Some(if level.is_empty() { "(empty level)" } else { level }));
+            assert_eq!(segment.role(), None);
+            assert_eq!(segment.focused(), None);
+            window.click(id.clone(), cx);
+            assert_eq!(window.find(id).focused(), None);
+            assert_eq!(view.read(cx).selected.as_deref(), Some(topic));
+            assert_eq!(view.read(cx).payload.read(cx).selected_range(), selection);
+        })
+        .unwrap();
+    }
+}
+
+#[gpui_kit::test]
 fn topic_breadcrumbs_navigate_to_their_full_prefix_and_update_the_tree_and_payload(cx: &mut TestAppContext) {
     let (handle, view) = open(cx, false, 1200., 760.);
     cx.update_window(handle, |_, window, cx| {
@@ -7366,7 +7398,7 @@ fn topic_breadcrumbs_navigate_to_their_full_prefix_and_update_the_tree_and_paylo
     })
     .unwrap();
     cx.run_until_parked();
-    for (index, path, payload) in [(2, "energy/solar/result", "42"), (1, "energy/solar", ""), (0, "energy", "")] {
+    for (index, path, payload) in [(1, "energy/solar", ""), (0, "energy", "")] {
         cx.update_window(handle, |_, window, cx| {
             window.render_frame(cx);
             assert_eq!(
@@ -7395,7 +7427,7 @@ fn topic_breadcrumbs_navigate_to_their_full_prefix_and_update_the_tree_and_paylo
 fn topic_breadcrumbs_preserve_empty_levels_and_unicode_prefixes(cx: &mut TestAppContext) {
     let (handle, view) = open(cx, false, 1200., 760.);
     let topic = "/energy//測定値/";
-    for (index, prefix) in ["", "/energy", "/energy/", "/energy//測定値", topic].into_iter().enumerate() {
+    for (index, prefix) in ["", "/energy", "/energy/", "/energy//測定値"].into_iter().enumerate() {
         cx.update_window(handle, |_, window, cx| {
             view.update(cx, |view, cx| {
                 view.topics.receive(message(topic), std::time::Instant::now());
