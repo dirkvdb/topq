@@ -5,7 +5,8 @@ use std::time::Instant;
 use gpui_kit::base::TreeEntryState;
 use gpui_kit::component::{ActiveTheme, Icon, IconName, Selectable, Sizable, StyledExt, list::ListItem};
 use gpui_kit::{
-    App, Context, Entity, IntoElement, MouseButton, Render, SharedString, Subscription, WeakEntity, Window, div, prelude::*, rems,
+    App, Context, Entity, IntoElement, MouseButton, Render, SharedString, Subscription, TestSupportExt, WeakEntity, Window, div,
+    prelude::*, rems,
 };
 
 use super::{Explorer, TreeEntry, topic_summary};
@@ -23,10 +24,12 @@ struct RowState {
     topics: usize,
     messages: u64,
     has_value: bool,
+    inline_payload: bool,
+    max_chars: Option<usize>,
 }
 
 impl RowState {
-    fn new(entry: &TreeEntry, interaction: TreeEntryState, explorer: &Explorer) -> Self {
+    fn new(entry: &TreeEntry, interaction: TreeEntryState, explorer: &Explorer, cx: &App) -> Self {
         let node = explorer.topics.nodes.get(entry.item().id.as_str());
         Self {
             depth: entry.depth(),
@@ -38,6 +41,8 @@ impl RowState {
             topics: node.map_or(0, |node| node.topics),
             messages: node.map_or(0, |node| node.messages),
             has_value: node.is_some_and(|node| node.value.is_some()),
+            inline_payload: Appearance::inline_payload(cx),
+            max_chars: Appearance::inline_payload_limit_enabled(cx).then(|| Appearance::inline_payload_max_chars(cx)),
         }
     }
 }
@@ -64,8 +69,8 @@ impl TopicRow {
             .unwrap_or("(empty level)")
             .to_owned()
             .into();
-        let state = RowState::new(entry, interaction, explorer.read(cx));
-        let preview = Self::preview(&path, explorer.read(cx));
+        let state = RowState::new(entry, interaction, explorer.read(cx), cx);
+        let preview = Self::preview(&path, explorer.read(cx), state.inline_payload, state.max_chars);
         let tree_state = explorer.read(cx).tree_state.clone();
         Self {
             explorer: explorer.downgrade(),
@@ -83,23 +88,29 @@ impl TopicRow {
         }
     }
 
-    fn preview(path: &str, explorer: &Explorer) -> SharedString {
+    fn preview(path: &str, explorer: &Explorer, inline_payload: bool, max_chars: Option<usize>) -> SharedString {
         explorer.topics.nodes.get(path).map_or_else(SharedString::default, |node| {
             node.value
                 .as_ref()
                 .map_or_else(
                     || topic_summary(node.topics, node.messages),
-                    |value| format!("= {}", value.preview()),
+                    |value| {
+                        if !inline_payload {
+                            String::new()
+                        } else {
+                            value.preview(max_chars).map_or_else(String::new, |preview| format!("= {preview}"))
+                        }
+                    },
                 )
                 .into()
         })
     }
 
-    pub(super) fn sync(&mut self, entry: &TreeEntry, interaction: TreeEntryState, explorer: &Explorer) {
-        let state = RowState::new(entry, interaction, explorer);
+    pub(super) fn sync(&mut self, entry: &TreeEntry, interaction: TreeEntryState, explorer: &Explorer, cx: &App) {
+        let state = RowState::new(entry, interaction, explorer, cx);
         if self.state != state {
             self.state = state;
-            self.preview = Self::preview(&self.path, explorer);
+            self.preview = Self::preview(&self.path, explorer, state.inline_payload, state.max_chars);
         }
     }
 
@@ -145,15 +156,20 @@ impl TopicRow {
                         )
                     }))
                     .child(div().min_w_0().truncate().font_medium().child(self.label.clone()))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(self.preview.clone()),
-                    ),
+                    .when(!self.preview.is_empty(), |this| {
+                        this.child(
+                            div()
+                                .id(SharedString::from(format!("{}:preview", self.id)))
+                                .test_support()
+                                .aria_label(self.preview.clone())
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(self.preview.clone()),
+                        )
+                    }),
             )
     }
 }

@@ -399,9 +399,17 @@ fn read_connections(path: &Path) -> Result<Option<StoredConnections>, ConfigErro
         return Ok(None);
     };
     if path.file_name().is_some_and(|name| name == "config.json") && value.get("connections").is_none() {
-        let appearance_only = ["mode", "light_theme", "dark_theme", "reduce_motion"]
-            .iter()
-            .any(|key| value.get(key).is_some());
+        let appearance_only = [
+            "mode",
+            "light_theme",
+            "dark_theme",
+            "reduce_motion",
+            "inline_payload",
+            "inline_payload_limit_enabled",
+            "inline_payload_max_chars",
+        ]
+        .iter()
+        .any(|key| value.get(key).is_some());
         if appearance_only || value.as_object().is_some_and(serde_json::Map::is_empty) {
             return Ok(Some(StoredConnections::default()));
         }
@@ -2098,6 +2106,46 @@ mod tests {
         assert_eq!(read_config_value(&state).unwrap().unwrap()["mode"], "dark");
         assert_eq!(load_connections().unwrap().connections[0].password, changed.password);
         assert_eq!(fs::read(&config).unwrap(), before);
+    }
+
+    #[test]
+    fn inline_payload_only_config_loads_without_connections() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.json");
+        fs::write(&path, r#"{"inline_payload":false}"#).unwrap();
+        assert!(read_connections(&path).unwrap().unwrap().connections.is_empty());
+    }
+
+    #[test]
+    fn inline_payload_limit_enabled_only_config_loads_without_connections() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.json");
+        for enabled in [false, true] {
+            fs::write(
+                &path,
+                serde_json::to_vec(&serde_json::json!({"inline_payload_limit_enabled": enabled})).unwrap(),
+            )
+            .unwrap();
+            let stored = read_connections(&path).unwrap().unwrap();
+            assert!(stored.connections.is_empty());
+            assert!(stored.active_connection.is_none());
+        }
+    }
+
+    #[test]
+    fn inline_payload_max_chars_only_config_loads_without_connections() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.json");
+        for limit in [0, 10, 256] {
+            fs::write(
+                &path,
+                serde_json::to_vec(&serde_json::json!({"inline_payload_max_chars": limit})).unwrap(),
+            )
+            .unwrap();
+            let stored = read_connections(&path).unwrap().unwrap();
+            assert!(stored.connections.is_empty());
+            assert!(stored.active_connection.is_none());
+        }
     }
 
     #[test]

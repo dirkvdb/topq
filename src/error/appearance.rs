@@ -52,6 +52,9 @@ pub(crate) enum AppearanceError {
     ReduceMotionNotSaved {
         source: Box<AppearanceError>,
     },
+    InlinePayloadNotSaved {
+        source: Box<AppearanceError>,
+    },
 }
 
 impl AppearanceError {
@@ -69,6 +72,7 @@ impl AppearanceError {
             Self::AppearanceNotSaved { .. } => "appearance.mode.not_saved",
             Self::ThemeNotSaved { .. } => "appearance.theme.not_saved",
             Self::ReduceMotionNotSaved { .. } => "appearance.reduce_motion.not_saved",
+            Self::InlinePayloadNotSaved { .. } => "appearance.inline_payload.not_saved",
         }
     }
 }
@@ -88,9 +92,10 @@ impl std::error::Error for AppearanceError {
             Self::ReadThemesDirectory { source, .. } | Self::ReadThemeEntry { source, .. } | Self::ReadCustomTheme { source, .. } => {
                 Some(source)
             }
-            Self::AppearanceNotSaved { source } | Self::ThemeNotSaved { source } | Self::ReduceMotionNotSaved { source } => {
-                Some(source.as_ref())
-            }
+            Self::AppearanceNotSaved { source }
+            | Self::ThemeNotSaved { source }
+            | Self::ReduceMotionNotSaved { source }
+            | Self::InlinePayloadNotSaved { source } => Some(source.as_ref()),
             Self::ThemeUnavailable { .. } | Self::ThemeModeMismatch { .. } => None,
         }
     }
@@ -190,6 +195,10 @@ mod tests {
             (
                 AppearanceError::ReduceMotionNotSaved { source: config_source() },
                 "appearance.reduce_motion.not_saved",
+            ),
+            (
+                AppearanceError::InlinePayloadNotSaved { source: config_source() },
+                "appearance.inline_payload.not_saved",
             ),
         ] {
             assert_eq!(error.code(), code);

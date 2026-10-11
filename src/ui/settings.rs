@@ -13,12 +13,13 @@ use gpui_kit::component::{
     button::{Button, ButtonVariant, ButtonVariants},
     checkbox::Checkbox,
     collapsible::Collapsible,
-    input::{Input, InputGroup, InputState},
+    input::{Input, InputGroup, InputState, NumberInput},
     label::Label,
     menu::{DropdownMenu, PopupMenuItem},
     notification::Notification,
     select::Select,
     setting::{SelectIndex, SettingGroup, SettingItem, SettingPage, Settings},
+    switch::Switch,
     tag::Tag,
     tooltip::Tooltip,
 };
@@ -123,6 +124,9 @@ impl Explorer {
         if !self.show_config {
             self.settings_generation += 1;
             self.settings_page_ix = 0;
+            self.inline_payload_max_chars.update(cx, |input, cx| {
+                input.set_value(Appearance::inline_payload_max_chars(cx).to_string(), window, cx);
+            });
             self.restore_focus = window.focused(cx);
             if let Some(config) = self
                 .editing
@@ -1305,6 +1309,67 @@ impl Explorer {
             })
             .keywords(["motion", "animation", "performance", "appearance"]),
         );
+        let view = cx.weak_entity();
+        group = group.item(
+            SettingItem::render(move |options, _, cx| {
+                let view = view.clone();
+                Self::appearance_setting(
+                    "inline-payload",
+                    "Inline payload",
+                    "Show payload previews in the topic tree.",
+                    div().h_8().h_flex().items_center().child(
+                        Switch::new("inline-payload")
+                            .accessibility_label("Inline payload")
+                            .checked(Appearance::inline_payload(cx))
+                            .on_change(move |enabled, _, cx| {
+                                _ = view.update(cx, |view, cx| view.set_inline_payload(*enabled, cx));
+                            }),
+                    ),
+                    options.layout().is_vertical(),
+                    cx,
+                )
+            })
+            .keywords(["inline", "json", "text", "payload", "preview", "topic", "tree", "appearance"]),
+        );
+        if Appearance::inline_payload(cx) {
+            let view = cx.weak_entity();
+            let max_chars = self.inline_payload_max_chars.clone();
+            group = group.item(
+                SettingItem::render(move |options, _, cx| {
+                    let view = view.clone();
+                    let limit_enabled = Appearance::inline_payload_limit_enabled(cx);
+                    Self::appearance_setting(
+                        "inline-payload-limit",
+                        "Limit display length",
+                        "Only inline payloads at or below this character count. Longer payloads are hidden.",
+                        div()
+                            .h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                Switch::new("inline-payload-limit")
+                                    .accessibility_label("Limit display length")
+                                    .checked(limit_enabled)
+                                    .on_change(move |enabled, _, cx| {
+                                        _ = view.update(cx, |view, cx| view.set_inline_payload_limit_enabled(*enabled, cx));
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .id("inline-payload-max-chars")
+                                    .test_support()
+                                    .aria_label("Maximum payload characters")
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(NumberInput::new(&max_chars).w_full().disabled(!limit_enabled)),
+                            ),
+                        options.layout().is_vertical(),
+                        cx,
+                    )
+                })
+                .keywords(["inline", "payload", "length", "limit", "characters", "display"]),
+            );
+        }
         if let Some(error) = self.error.clone() {
             group = group.footer(move |_, cx| {
                 div()
@@ -1450,6 +1515,30 @@ impl Explorer {
             self.error = Some(error.localized_message());
         }
         self.refresh_animation(window, cx);
+        cx.notify();
+    }
+
+    fn set_inline_payload(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if let Err(error) = appearance::set_inline_payload(enabled, cx) {
+            self.error = Some(error.localized_message());
+        }
+        cx.notify();
+    }
+
+    fn set_inline_payload_limit_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if let Err(error) = appearance::set_inline_payload_limit_enabled(enabled, cx) {
+            self.error = Some(error.localized_message());
+        }
+        cx.notify();
+    }
+
+    pub(super) fn set_inline_payload_max_chars(&mut self, max_chars: usize, cx: &mut Context<Self>) {
+        if max_chars == Appearance::inline_payload_max_chars(cx) {
+            return;
+        }
+        if let Err(error) = appearance::set_inline_payload_max_chars(max_chars, cx) {
+            self.error = Some(error.localized_message());
+        }
         cx.notify();
     }
 

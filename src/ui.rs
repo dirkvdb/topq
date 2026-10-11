@@ -202,6 +202,7 @@ pub struct Explorer {
     client_id: Entity<InputState>,
     topic_input: Entity<InputState>,
     topic_filter: Entity<InputState>,
+    inline_payload_max_chars: Entity<InputState>,
     topic_qos: Entity<SelectState<Vec<&'static str>>>,
     subscription_topics: Vec<TopicSubscription>,
     topics_open: bool,
@@ -346,6 +347,13 @@ impl Explorer {
         let client_id = cx.new(|cx| InputState::new(window, cx).default_value(initial.client_id));
         let topic_input = cx.new(|cx| InputState::new(window, cx).placeholder("e.g. home/#"));
         let topic_filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter"));
+        let inline_payload_max_chars = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(Appearance::inline_payload_max_chars(cx).to_string())
+                .step(1.)
+                .min(0.)
+                .validate(|value, _| value.is_empty() || value.parse::<usize>().is_ok())
+        });
         let topic_qos = cx.new(|cx| SelectState::new(vec!["0", "1", "2"], Some(IndexPath::default()), window, cx));
         let username = cx.new(|cx| InputState::new(window, cx).placeholder("Optional").default_value(initial.username));
         let password = cx.new(|cx| {
@@ -431,6 +439,21 @@ impl Explorer {
             }
             cx.notify();
         }));
+        subscriptions.push(
+            cx.subscribe_in(&inline_payload_max_chars, window, |view, input, event, window, cx| match event {
+                InputEvent::Change if Appearance::inline_payload(cx) && Appearance::inline_payload_limit_enabled(cx) => {
+                    if let Ok(max_chars) = input.read(cx).value().parse::<usize>() {
+                        view.set_inline_payload_max_chars(max_chars, cx);
+                    }
+                }
+                InputEvent::Blur if input.read(cx).value().is_empty() => {
+                    input.update(cx, |input, cx| {
+                        input.set_value(Appearance::inline_payload_max_chars(cx).to_string(), window, cx);
+                    });
+                }
+                _ => {}
+            }),
+        );
         subscriptions.push(cx.subscribe_in(&topic_filter, window, |view, _, event, _, cx| {
             if matches!(event, InputEvent::Change) {
                 view.sync_tree(cx);
@@ -505,6 +528,7 @@ impl Explorer {
             client_id,
             topic_input,
             topic_filter,
+            inline_payload_max_chars,
             topic_qos,
             subscription_topics: initial.topics,
             topics_open: true,
@@ -1373,7 +1397,7 @@ impl Explorer {
                                                 .entry(entry.item().id.clone())
                                                 .or_insert_with(|| cx.new(|cx| TopicRow::new(&view, entry, interaction, cx)))
                                                 .clone();
-                                            row.update(cx, |row, cx| row.sync(entry, interaction, view.read(cx)));
+                                            row.update(cx, |row, cx| row.sync(entry, interaction, view.read(cx), cx));
                                             row.cached(StyleRefinement::default().w_full().h(rems(1.5))).into_any_element()
                                         })
                                         .list_style(StyleRefinement::default().flex_grow_1().size_full())

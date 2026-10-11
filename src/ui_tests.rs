@@ -3431,10 +3431,247 @@ fn appearance_selectors_stay_compact_and_aligned(cx: &mut TestAppContext) {
                 assert!(motion.bounds().top() >= settings.top() && motion.bounds().bottom() <= settings.bottom());
                 assert_eq!(description.left(), label.left());
                 assert!(description.bottom() <= settings.bottom());
+                let inline = window.find("inline-payload");
+                let label = window.find("inline-payload-label").bounds();
+                let description = window.find("inline-payload-description").bounds();
+                assert!(inline.visible(), "inline payload must be reachable at minimum size and larger text");
+                assert!(inline.bounds().left() >= settings.left() && inline.bounds().right() <= settings.right());
+                assert_eq!(inline.bounds().left(), motion.bounds().left());
+                assert_eq!(description.left(), label.left());
+                assert!(description.bottom() <= settings.bottom());
             })
             .unwrap();
         }
     }
+}
+
+#[gpui_kit::test]
+fn inline_payload_switch_updates_cached_previews_and_persists_pointer_and_keyboard_changes(cx: &mut TestAppContext) {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.json");
+    let (handle, view) = open(cx, false, 1200., 900.);
+    cx.update(|cx| cx.set_global(crate::appearance::load(&path, cx).unwrap()));
+    cx.update_window(handle, |_, window, cx| {
+        window.activate_window();
+        view.update(cx, |view, cx| {
+            receive_payload(view, "home/a", r#"{"reading":1}"#, window, cx);
+            receive_payload(view, "home/b", "plain text", window, cx);
+            view.select_topic("home/a", window, cx);
+        });
+        window.render_frame(cx);
+        assert_eq!(window.find("topic:home/a:preview").label(), Some(r#"= {"reading":1}"#));
+        assert_eq!(window.find("topic:home/b:preview").label(), Some("= plain text"));
+        window.click("settings", cx);
+        window.click("settings-section-appearance", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    for enabled in [false, true] {
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find("inline-payload").label(), Some("Inline payload"));
+            assert_eq!(window.find("inline-payload").checked(), Some(!enabled));
+            if enabled {
+                window.click("reduce-motion", cx);
+            } else {
+                window.click("inline-payload", cx);
+            }
+        })
+        .unwrap();
+        cx.run_until_parked();
+        if enabled {
+            cx.update_window(handle, |_, window, cx| window.press("escape", cx)).unwrap();
+            cx.run_until_parked();
+            cx.update_window(handle, |_, window, cx| {
+                for _ in 0..16 {
+                    window.press("tab", cx);
+                    if window.find("inline-payload").focused() == Some(true) {
+                        break;
+                    }
+                }
+                assert_eq!(window.find("inline-payload").focused(), Some(true));
+                window.press("space", cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+        }
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find("inline-payload").checked(), Some(enabled));
+            assert_eq!(Appearance::inline_payload(cx), enabled);
+            let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(saved["inline_payload"], enabled);
+            window.click("close-settings", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            if enabled {
+                assert_eq!(window.find("topic:home/a:preview").label(), Some(r#"= {"reading":1}"#));
+                assert_eq!(window.find("topic:home/b:preview").label(), Some("= plain text"));
+            } else {
+                assert!(window.try_find("topic:home/a:preview").is_none());
+                assert!(window.try_find("topic:home/b:preview").is_none());
+                view.update(cx, |view, cx| receive_payload(view, "home/a", r#"{"reading":2}"#, window, cx));
+                window.render_frame(cx);
+                assert!(window.try_find("topic:home/a:preview").is_none());
+                view.update(cx, |view, cx| receive_payload(view, "home/a", r#"{"reading":1}"#, window, cx));
+                window.render_frame(cx);
+            }
+            assert!(window.find("topic:home:preview").label().unwrap().contains("2 topics"));
+            assert_eq!(view.read(cx).selected.as_deref(), Some("home/a"));
+            assert_eq!(view.read(cx).payload.read(cx).value().as_str(), "{\n  \"reading\": 1\n}");
+            cx.set_global(crate::appearance::load(&path, cx).unwrap());
+            assert_eq!(Appearance::inline_payload(cx), enabled);
+            if !enabled {
+                window.click("settings", cx);
+                window.click("settings-section-appearance", cx);
+            }
+        })
+        .unwrap();
+        cx.run_until_parked();
+    }
+}
+
+#[gpui_kit::test]
+fn inline_payload_length_limit_supports_native_input_steps_and_hides_only_long_payloads(cx: &mut TestAppContext) {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.json");
+    let (handle, view) = open(cx, false, 1200., 900.);
+    cx.update(|cx| cx.set_global(crate::appearance::load(&path, cx).unwrap()));
+    let input_id = cx.update(|cx| view.read(cx).inline_payload_max_chars.entity_id());
+    cx.update_window(handle, |_, window, cx| {
+        window.activate_window();
+        view.update(cx, |view, cx| {
+            receive_payload(view, "home/a", r#"{"v":true}"#, window, cx);
+            receive_payload(view, "home/b", "12345678901", window, cx);
+            view.select_topic("home/a", window, cx);
+        });
+        window.render_frame(cx);
+        assert_eq!(window.find("topic:home/a:preview").label(), Some(r#"= {"v":true}"#));
+        assert_eq!(window.find("topic:home/b:preview").label(), Some("= 12345678901"));
+        window.click("settings", cx);
+        window.click("settings-section-appearance", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("inline-payload-limit").checked(), Some(false));
+        assert_eq!(window.find(("input", input_id)).value(), Some("10"));
+        let before = Appearance::inline_payload_max_chars(cx);
+        window.within(("number-input", input_id)).click("increment", cx);
+        assert_eq!(Appearance::inline_payload_max_chars(cx), before);
+        window.click("inline-payload-limit", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("inline-payload-limit").checked(), Some(true));
+        window.click("close-settings", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("topic:home/a:preview").label(), Some(r#"= {"v":true}"#));
+        assert!(window.try_find("topic:home/b:preview").is_none());
+        assert_eq!(view.read(cx).selected.as_deref(), Some("home/a"));
+        assert_eq!(view.read(cx).payload.read(cx).value().as_str(), "{\n  \"v\": true\n}");
+        window.click("settings", cx);
+        window.click("settings-section-appearance", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click(("input", input_id), cx);
+        window.press("secondary-a", cx);
+        window.input("11", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(Appearance::inline_payload_max_chars(cx), 11);
+        window.press("down", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find(("input", input_id)).value(), Some("10"));
+        assert_eq!(Appearance::inline_payload_max_chars(cx), 10);
+        window.within(("number-input", input_id)).click("increment", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find(("input", input_id)).value(), Some("11"));
+        assert_eq!(Appearance::inline_payload_max_chars(cx), 11);
+        window.click("close-settings", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("topic:home/b:preview").label(), Some("= 12345678901"));
+        view.update(cx, |view, cx| receive_payload(view, "home/b", "123456789012", window, cx));
+        window.render_frame(cx);
+        assert!(window.try_find("topic:home/b:preview").is_none());
+        assert!(window.find("topic:home:preview").label().unwrap().contains("2 topics"));
+        window.click("settings", cx);
+        window.click("settings-section-appearance", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("inline-payload-limit", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("inline-payload-limit").checked(), Some(false));
+        assert_eq!(window.find(("input", input_id)).value(), Some("11"));
+        let before = Appearance::inline_payload_max_chars(cx);
+        window.within(("number-input", input_id)).click("increment", cx);
+        assert_eq!(Appearance::inline_payload_max_chars(cx), before);
+        window.click("inline-payload", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("inline-payload-limit").is_none());
+        assert!(window.try_find("inline-payload-max-chars").is_none());
+        window.click("inline-payload", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("inline-payload-limit").checked(), Some(false));
+        assert_eq!(window.find(("input", input_id)).value(), Some("11"));
+        window.click("close-settings", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("topic:home/b:preview").label(), Some("= 123456789012"));
+        let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["inline_payload_max_chars"], 11);
+        assert_eq!(saved["inline_payload_limit_enabled"], false);
+        cx.set_global(crate::appearance::load(&path, cx).unwrap());
+        assert_eq!(Appearance::inline_payload_max_chars(cx), 11);
+        assert!(!Appearance::inline_payload_limit_enabled(cx));
+    })
+    .unwrap();
 }
 
 #[gpui_kit::test]

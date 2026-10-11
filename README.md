@@ -26,6 +26,9 @@ Settings are stored in `config.json` in the application configuration directory.
   "light_theme": "Ayu Light",
   "dark_theme": "Ayu Dark",
   "reduce_motion": "system",
+  "inline_payload": true,
+  "inline_payload_limit_enabled": false,
+  "inline_payload_max_chars": 10,
   "connections": [
     {
       "name": "Home broker",
@@ -65,6 +68,19 @@ Appearance settings live alongside connection settings in `config.json`:
 - `mode`: `system`, `light`, or `dark`. `system` (default) follows the OS appearance.
 - `light_theme` and `dark_theme`: exact theme names for each mode, not filenames. Defaults are `Ayu Light` and `Ayu Dark`. Missing themes or themes for the wrong mode fall back to the defaults.
 - `reduce_motion`: `system` (default) follows the OS preference, `on` reduces motion, and `off` overrides the OS preference to allow motion.
+- `inline_payload`: `true` (default) shows payload previews in the topic tree, including JSON and text. Set to `false` to hide them; topic summaries and the full payload view are unchanged.
+- `inline_payload_limit_enabled`: `false` (default) does not hide previews based on payload length, preserving the existing behavior and its 100-character presentation cap. Set to `true` to apply `inline_payload_max_chars` when `inline_payload` is also enabled. Disabling the limit retains the saved maximum.
+- `inline_payload_max_chars`: `10` (default) is the stored maximum, used only when `inline_payload_limit_enabled` is `true`. Textual payloads are measured by Unicode character count, not byte count; binary payload size is measured in bytes. Payloads whose character count or binary byte size is less than or equal to the limit qualify for an inline preview; larger payloads are hidden rather than truncated to fit the limit. `0` is allowed; with the limit enabled, only an empty textual payload qualifies at this limit. The full payload view is unchanged.
+
+For example, to enable a 10-character limit:
+
+```json
+{
+  "inline_payload": true,
+  "inline_payload_limit_enabled": true,
+  "inline_payload_max_chars": 10
+}
+```
 
 Place custom theme JSON files in `~/.config/topq/themes/` (or `$XDG_CONFIG_HOME/topq/themes/` when set on Linux).
 Theme files use the [GPUI Kit theme format](https://gpui-kit.com/component/theme)

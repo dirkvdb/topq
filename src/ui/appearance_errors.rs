@@ -54,6 +54,7 @@ impl LocalizedError for AppearanceError {
             Self::AppearanceNotSaved { .. } => "Appearance changed, but the preference could not be saved.".into(),
             Self::ThemeNotSaved { .. } => "Theme changed, but the preference could not be saved.".into(),
             Self::ReduceMotionNotSaved { .. } => "Reduce motion changed, but the preference could not be saved.".into(),
+            Self::InlinePayloadNotSaved { .. } => "Inline payload changed, but the preference could not be saved.".into(),
         }
     }
 }
@@ -138,6 +139,10 @@ mod tests {
             (
                 AppearanceError::ReduceMotionNotSaved { source: source() },
                 "Reduce motion changed, but the preference could not be saved.",
+            ),
+            (
+                AppearanceError::InlinePayloadNotSaved { source: source() },
+                "Inline payload changed, but the preference could not be saved.",
             ),
         ] {
             assert_eq!(error.localized_message(), message);

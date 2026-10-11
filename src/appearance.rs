@@ -40,6 +40,9 @@ pub(crate) struct Appearance {
     light_theme: String,
     dark_theme: String,
     reduce_motion: ReduceMotion,
+    inline_payload: bool,
+    inline_payload_limit_enabled: bool,
+    inline_payload_max_chars: usize,
     #[serde(skip)]
     path: Option<PathBuf>,
 }
@@ -51,6 +54,9 @@ impl Default for Appearance {
             light_theme: DEFAULT_LIGHT_THEME.to_owned(),
             dark_theme: DEFAULT_DARK_THEME.to_owned(),
             reduce_motion: ReduceMotion::System,
+            inline_payload: true,
+            inline_payload_limit_enabled: false,
+            inline_payload_max_chars: 10,
             path: None,
         }
     }
@@ -69,6 +75,18 @@ impl Appearance {
 
     pub(crate) fn reduce_motion(cx: &App) -> ReduceMotion {
         cx.global::<Self>().reduce_motion
+    }
+
+    pub(crate) fn inline_payload(cx: &App) -> bool {
+        cx.global::<Self>().inline_payload
+    }
+
+    pub(crate) fn inline_payload_limit_enabled(cx: &App) -> bool {
+        cx.global::<Self>().inline_payload_limit_enabled
+    }
+
+    pub(crate) fn inline_payload_max_chars(cx: &App) -> usize {
+        cx.global::<Self>().inline_payload_max_chars
     }
 
     pub(crate) fn motion_reduced(cx: &App) -> bool {
@@ -329,6 +347,21 @@ pub(crate) fn set_reduce_motion(reduce_motion: ReduceMotion, cx: &mut App) -> Re
     save(cx).map_err(|source| AppearanceError::ReduceMotionNotSaved { source: Box::new(source) })
 }
 
+pub(crate) fn set_inline_payload(inline_payload: bool, cx: &mut App) -> Result<(), AppearanceError> {
+    cx.global_mut::<Appearance>().inline_payload = inline_payload;
+    save(cx).map_err(|source| AppearanceError::InlinePayloadNotSaved { source: Box::new(source) })
+}
+
+pub(crate) fn set_inline_payload_limit_enabled(inline_payload_limit_enabled: bool, cx: &mut App) -> Result<(), AppearanceError> {
+    cx.global_mut::<Appearance>().inline_payload_limit_enabled = inline_payload_limit_enabled;
+    save(cx).map_err(|source| AppearanceError::InlinePayloadNotSaved { source: Box::new(source) })
+}
+
+pub(crate) fn set_inline_payload_max_chars(inline_payload_max_chars: usize, cx: &mut App) -> Result<(), AppearanceError> {
+    cx.global_mut::<Appearance>().inline_payload_max_chars = inline_payload_max_chars;
+    save(cx).map_err(|source| AppearanceError::InlinePayloadNotSaved { source: Box::new(source) })
+}
+
 fn save(cx: &mut App) -> Result<(), AppearanceError> {
     let preferred_path = match &cx.global::<Appearance>().path {
         Some(path) => path.clone(),
@@ -386,7 +419,7 @@ mod tests {
         assert_eq!(AppearanceMode::default(), AppearanceMode::System);
         assert_eq!(
             serde_json::to_value(preferences).unwrap(),
-            serde_json::json!({"mode": "system", "light_theme": "Ayu Light", "dark_theme": "Ayu Dark", "reduce_motion": "system"})
+            serde_json::json!({"mode": "system", "light_theme": "Ayu Light", "dark_theme": "Ayu Dark", "reduce_motion": "system", "inline_payload": true, "inline_payload_limit_enabled": false, "inline_payload_max_chars": 10})
         );
         for (mode, serialized) in [
             (AppearanceMode::System, "system"),
@@ -396,6 +429,173 @@ mod tests {
             assert_eq!(serde_json::to_value(mode).unwrap(), serialized);
             assert_eq!(serde_json::from_value::<AppearanceMode>(serialized.into()).unwrap(), mode);
         }
+    }
+
+    #[test]
+    fn inline_payload_defaults_to_true_when_unspecified() {
+        assert!(Appearance::default().inline_payload);
+        for content in ["{}", r#"{"mode":"dark","reduce_motion":"on"}"#] {
+            assert!(serde_json::from_str::<Appearance>(content).unwrap().inline_payload);
+        }
+    }
+
+    #[gpui_kit::test]
+    fn inline_payload_persists_both_states(cx: &mut TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("appearance.json");
+        cx.update(|cx| {
+            setup(cx, &path);
+            assert!(Appearance::inline_payload(cx));
+            for enabled in [false, true] {
+                set_inline_payload(enabled, cx).unwrap();
+                assert_eq!(Appearance::inline_payload(cx), enabled);
+                let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                assert_eq!(saved["inline_payload"], enabled);
+                cx.set_global(load(&path, cx).unwrap());
+                assert_eq!(Appearance::inline_payload(cx), enabled);
+            }
+        });
+    }
+
+    #[gpui_kit::test]
+    fn inline_payload_save_errors_do_not_revert_the_setting(cx: &mut TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("appearance.json");
+        cx.update(|cx| {
+            setup(cx, &path);
+            fs::create_dir(&path).unwrap();
+            let error = set_inline_payload(false, cx).unwrap_err();
+            assert_eq!(error.code(), "appearance.inline_payload.not_saved");
+            assert!(!Appearance::inline_payload(cx));
+        });
+    }
+
+    #[gpui_kit::test]
+    fn inline_payload_limit_defaults_to_disabled_when_unspecified(cx: &mut TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("appearance.json");
+        cx.update(|cx| {
+            setup(cx, &path);
+            assert!(!Appearance::inline_payload_limit_enabled(cx));
+            assert!(!Appearance::default().inline_payload_limit_enabled);
+            for content in ["{}", r#"{"inline_payload_max_chars":0}"#, r#"{"inline_payload_max_chars":256}"#] {
+                fs::write(&path, content).unwrap();
+                cx.set_global(load(&path, cx).unwrap());
+                assert!(!Appearance::inline_payload_limit_enabled(cx));
+            }
+        });
+    }
+
+    #[gpui_kit::test]
+    fn inline_payload_limit_persists_both_states_without_changing_max_chars(cx: &mut TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.json");
+        fs::write(&path, r#"{"inline_payload":false,"connections":[]}"#).unwrap();
+        cx.update(|cx| {
+            setup(cx, &path);
+            for limit in [10, 256] {
+                set_inline_payload_max_chars(limit, cx).unwrap();
+                for enabled in [true, false] {
+                    set_inline_payload_limit_enabled(enabled, cx).unwrap();
+                    assert_eq!(Appearance::inline_payload_limit_enabled(cx), enabled);
+                    assert_eq!(Appearance::inline_payload_max_chars(cx), limit);
+                    let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                    assert_eq!(saved["inline_payload_limit_enabled"], enabled);
+                    assert_eq!(saved["inline_payload_max_chars"], limit);
+                    assert_eq!(saved["inline_payload"], false);
+                    assert_eq!(saved["connections"], serde_json::json!([]));
+                    cx.set_global(load(&path, cx).unwrap());
+                    assert_eq!(Appearance::inline_payload_limit_enabled(cx), enabled);
+                    assert_eq!(Appearance::inline_payload_max_chars(cx), limit);
+                    assert!(!Appearance::inline_payload(cx));
+                }
+            }
+        });
+    }
+
+    #[gpui_kit::test]
+    fn inline_payload_limit_save_errors_do_not_revert_the_setting(cx: &mut TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("appearance.json");
+        cx.update(|cx| {
+            setup(cx, &path);
+            fs::create_dir(&path).unwrap();
+            let error = set_inline_payload_limit_enabled(true, cx).unwrap_err();
+            assert_eq!(error.code(), "appearance.inline_payload.not_saved");
+            assert!(matches!(
+                error,
+                AppearanceError::InlinePayloadNotSaved { source }
+                    if matches!(source.as_ref(), AppearanceError::Config(ConfigError::SaveConfig { path: saved, .. }) if saved == &path)
+            ));
+            assert!(Appearance::inline_payload_limit_enabled(cx));
+            assert_eq!(Appearance::inline_payload_max_chars(cx), 10);
+            assert!(Appearance::inline_payload(cx));
+            assert_eq!(cx.global::<Appearance>().path.as_deref(), Some(path.as_path()));
+        });
+    }
+
+    #[gpui_kit::test]
+    fn inline_payload_max_chars_defaults_to_10_when_unspecified(cx: &mut TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("appearance.json");
+        cx.update(|cx| {
+            setup(cx, &path);
+            assert_eq!(Appearance::inline_payload_max_chars(cx), 10);
+            assert_eq!(Appearance::default().inline_payload_max_chars, 10);
+            for content in [
+                "{}",
+                r#"{"mode":"dark","inline_payload":false}"#,
+                r#"{"inline_payload_limit_enabled":true}"#,
+            ] {
+                fs::write(&path, content).unwrap();
+                cx.set_global(load(&path, cx).unwrap());
+                assert_eq!(Appearance::inline_payload_max_chars(cx), 10);
+            }
+        });
+    }
+
+    #[gpui_kit::test]
+    fn inline_payload_max_chars_persists_including_zero(cx: &mut TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.json");
+        fs::write(&path, r#"{"inline_payload":false,"connections":[]}"#).unwrap();
+        cx.update(|cx| {
+            setup(cx, &path);
+            for limit in [0, 1, 10, 256] {
+                set_inline_payload_max_chars(limit, cx).unwrap();
+                assert_eq!(Appearance::inline_payload_max_chars(cx), limit);
+                assert!(!Appearance::inline_payload(cx));
+                let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                assert_eq!(saved["inline_payload_max_chars"], limit);
+                assert_eq!(saved["inline_payload_limit_enabled"], false);
+                assert_eq!(saved["inline_payload"], false);
+                assert_eq!(saved["connections"], serde_json::json!([]));
+                cx.set_global(load(&path, cx).unwrap());
+                assert_eq!(Appearance::inline_payload_max_chars(cx), limit);
+                assert!(!Appearance::inline_payload_limit_enabled(cx));
+                assert!(!Appearance::inline_payload(cx));
+            }
+        });
+    }
+
+    #[gpui_kit::test]
+    fn inline_payload_max_chars_save_errors_do_not_revert_the_setting(cx: &mut TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("appearance.json");
+        cx.update(|cx| {
+            setup(cx, &path);
+            fs::create_dir(&path).unwrap();
+            let error = set_inline_payload_max_chars(0, cx).unwrap_err();
+            assert_eq!(error.code(), "appearance.inline_payload.not_saved");
+            assert!(matches!(
+                error,
+                AppearanceError::InlinePayloadNotSaved { source }
+                    if matches!(source.as_ref(), AppearanceError::Config(ConfigError::SaveConfig { path: saved, .. }) if saved == &path)
+            ));
+            assert_eq!(Appearance::inline_payload_max_chars(cx), 0);
+            assert!(Appearance::inline_payload(cx));
+            assert_eq!(cx.global::<Appearance>().path.as_deref(), Some(path.as_path()));
+        });
     }
 
     #[test]
@@ -604,8 +804,11 @@ mod tests {
             assert_eq!(preferences.light_theme, "Gruvbox Light");
             assert_eq!(preferences.dark_theme, "Tokyo Night");
             let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-            assert_eq!(saved.as_object().unwrap().len(), 4);
+            assert_eq!(saved.as_object().unwrap().len(), 7);
             assert_eq!(saved["reduce_motion"], "system");
+            assert_eq!(saved["inline_payload"], true);
+            assert_eq!(saved["inline_payload_limit_enabled"], false);
+            assert_eq!(saved["inline_payload_max_chars"], 10);
             select_mode(AppearanceMode::Dark, window, cx).unwrap();
             assert_eq!(Theme::global(cx).theme_name().as_str(), "Tokyo Night");
             select_theme(ThemeMode::Dark, "Gruvbox Dark".into(), window, cx).unwrap();
