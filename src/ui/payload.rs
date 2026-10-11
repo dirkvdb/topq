@@ -156,13 +156,9 @@ impl Explorer {
                 for field in &explorer.numeric_fields {
                     let pointer = field.pointer().to_owned();
                     let owner = view.downgrade();
-                    menu = menu.item(
-                        PopupMenuItem::new(if pointer.is_empty() { "(root)".to_owned() } else { pointer.clone() }).on_click(
-                            move |_, _, cx| {
-                                let _ = owner.update(cx, |view, cx| view.start_monitoring(&pointer, cx));
-                            },
-                        ),
-                    );
+                    menu = menu.item(PopupMenuItem::new(field.label().to_owned()).on_click(move |_, _, cx| {
+                        let _ = owner.update(cx, |view, cx| view.start_monitoring(&pointer, cx));
+                    }));
                 }
                 menu
             })

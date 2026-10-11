@@ -58,6 +58,14 @@ impl NumericField {
         &self.pointer
     }
 
+    pub(super) fn label(&self) -> &str {
+        if self.pointer.is_empty() {
+            "(root)"
+        } else {
+            self.pointer.strip_prefix('/').unwrap_or(&self.pointer)
+        }
+    }
+
     /// The quoted key's start, or the number's start for array elements/root values.
     pub(super) fn offset(&self) -> usize {
         self.key_offset.unwrap_or(self.value_offset)
@@ -987,6 +995,34 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn numeric_field_labels_omit_the_leading_slash_without_changing_pointers() {
+        let fields = numeric_fields(r#"{"water_temperature":21,"water_setpoint":22}"#);
+        let actual: Vec<_> = fields.iter().map(|field| (field.label(), field.pointer())).collect();
+        assert_eq!(
+            actual,
+            vec![("water_temperature", "/water_temperature"), ("water_setpoint", "/water_setpoint")]
+        );
+    }
+
+    #[test]
+    fn numeric_field_labels_preserve_nested_paths() {
+        let fields = numeric_fields(r#"{"sensor":{"temperatures":[21]}}"#);
+        assert_eq!(fields[0].label(), "sensor/temperatures/0");
+    }
+
+    #[test]
+    fn numeric_field_labels_identify_root_values() {
+        let fields = numeric_fields("21");
+        assert_eq!(fields[0].label(), "(root)");
+    }
+
+    #[test]
+    fn numeric_field_labels_do_not_confuse_empty_keys_with_root_values() {
+        let fields = numeric_fields(r#"{"":21}"#);
+        assert_eq!(fields[0].label(), "");
     }
 
     #[test]

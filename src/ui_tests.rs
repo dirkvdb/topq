@@ -3439,6 +3439,21 @@ fn appearance_selectors_stay_compact_and_aligned(cx: &mut TestAppContext) {
                 assert_eq!(inline.bounds().left(), motion.bounds().left());
                 assert_eq!(description.left(), label.left());
                 assert!(description.bottom() <= settings.bottom());
+                window.scroll("inline-payload", gpui_kit::ScrollDelta::Lines(gpui_kit::point(0., -20.)), cx);
+                let limit = window.find("inline-payload-limit");
+                let number = window.find("inline-payload-max-chars");
+                let label = window.find("inline-payload-limit-label").bounds();
+                let description = window.find("inline-payload-limit-description").bounds();
+                assert!(
+                    limit.visible() && number.visible(),
+                    "length controls must fit at minimum size and larger text"
+                );
+                assert!(limit.bounds().left() >= settings.left());
+                assert!(limit.bounds().right() < number.bounds().left());
+                assert!(number.bounds().right() <= settings.right());
+                assert_eq!(number.bounds().center().y, limit.bounds().center().y);
+                assert_eq!(label.left(), description.left());
+                assert!(description.bottom() <= settings.bottom());
             })
             .unwrap();
         }
