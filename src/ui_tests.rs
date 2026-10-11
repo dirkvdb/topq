@@ -6210,16 +6210,16 @@ fn edit_value_supports_keyboard_activation_and_is_absent_without_a_topic_value(c
     })
     .unwrap();
     cx.run_until_parked();
-    for _ in 0..2 {
+    for id in ["monitor-field-menu", "copy-value", "edit-value"] {
         cx.update_window(handle, |_, window, cx| window.press("shift-tab", cx)).unwrap();
         cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find(id).focused(), Some(true), "Shift+Tab should focus {id}");
+        })
+        .unwrap();
     }
-    cx.update_window(handle, |_, window, cx| {
-        window.render_frame(cx);
-        assert_eq!(window.find("edit-value").focused(), Some(true));
-        window.press("enter", cx);
-    })
-    .unwrap();
+    cx.update_window(handle, |_, window, cx| window.press("enter", cx)).unwrap();
     cx.run_until_parked();
     cx.update_window(handle, |_, window, cx| {
         window.render_frame(cx);
