@@ -11,7 +11,7 @@ use super::{
 };
 use crate::{
     appearance::Appearance,
-    topics::{FLASH_DURATION, flash_amount},
+    topics::{FLASH_DURATION, TopicValue, flash_amount},
 };
 
 pub(super) struct PayloadHighlight {
@@ -85,6 +85,14 @@ fn image_content_type(content_type: Option<&str>) -> Option<&str> {
     let mime_type = content_type?.split(';').next()?.trim();
     let (kind, subtype) = mime_type.split_once('/')?;
     (kind.eq_ignore_ascii_case("image") && !subtype.is_empty()).then_some(mime_type)
+}
+
+pub(super) fn payload_image_content_type(value: &TopicValue) -> Option<&str> {
+    value
+        .properties
+        .content_type()
+        .filter(|content_type| image_content_type(Some(content_type)).is_some())
+        .or_else(|| image_content_type(value.inferred_content_type()))
 }
 
 fn image_status(id: &'static str, message: &'static str, color: gpui_kit::Hsla) -> AnyElement {
@@ -311,7 +319,7 @@ impl Explorer {
             .and_then(|path| self.topics.nodes.get(path))
             .and_then(|node| node.value.as_ref());
         let same_topic = self.payload_topic == self.selected;
-        let image_type = value.and_then(|value| image_content_type(value.properties.content_type()));
+        let image_type = value.and_then(payload_image_content_type);
         // Images stay as shared bytes in raw mode. Never decode the complete payload
         // into a text editor: binary data can produce enormous logical lines.
         let raw_bytes = value.filter(|_| !self.payload_preview && image_type.is_some());
@@ -324,7 +332,8 @@ impl Explorer {
         } else {
             self.payload_raw = None;
         }
-        let image_format = image_type.and_then(|mime_type| ImageFormat::from_mime_type(&mime_type.to_ascii_lowercase()));
+        let image_format =
+            image_content_type(image_type).and_then(|mime_type| ImageFormat::from_mime_type(&mime_type.to_ascii_lowercase()));
         let image_value = value.zip(image_format).filter(|_| self.payload_preview);
         let same_image = match (&self.payload_image, image_value) {
             (Some(image), Some((value, format))) => image.format() == format && image.bytes() == value.payload.as_ref(),

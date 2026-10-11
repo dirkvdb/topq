@@ -3,7 +3,7 @@
 use std::time::Instant;
 
 use gpui_kit::base::TreeEntryState;
-use gpui_kit::component::{ActiveTheme, Icon, IconName, Selectable, Sizable, StyledExt, list::ListItem};
+use gpui_kit::component::{ActiveTheme, Icon, IconName, Selectable, Sizable, StyledExt, list::ListItem, tag::Tag};
 use gpui_kit::{
     App, Context, Entity, IntoElement, MouseButton, Render, SharedString, Subscription, TestSupportExt, WeakEntity, Window, div,
     prelude::*, rems,
@@ -47,12 +47,18 @@ impl RowState {
     }
 }
 
+enum RowPreview {
+    Hidden,
+    Text(SharedString),
+    Datatype(SharedString),
+}
+
 pub(super) struct TopicRow {
     explorer: WeakEntity<Explorer>,
     path: SharedString,
     id: SharedString,
     label: SharedString,
-    preview: SharedString,
+    preview: RowPreview,
     state: RowState,
     _subscriptions: [Subscription; 2],
     #[cfg(test)]
@@ -88,22 +94,20 @@ impl TopicRow {
         }
     }
 
-    fn preview(path: &str, explorer: &Explorer, inline_payload: bool, max_chars: Option<usize>) -> SharedString {
-        explorer.topics.nodes.get(path).map_or_else(SharedString::default, |node| {
-            node.value
-                .as_ref()
-                .map_or_else(
-                    || topic_summary(node.topics, node.messages),
-                    |value| {
-                        if !inline_payload {
-                            String::new()
-                        } else {
-                            value.preview(max_chars).map_or_else(String::new, |preview| format!("= {preview}"))
-                        }
-                    },
-                )
-                .into()
-        })
+    fn preview(path: &str, explorer: &Explorer, inline_payload: bool, max_chars: Option<usize>) -> RowPreview {
+        let Some(node) = explorer.topics.nodes.get(path) else {
+            return RowPreview::Hidden;
+        };
+        let Some(value) = &node.value else {
+            return RowPreview::Text(topic_summary(node.topics, node.messages).into());
+        };
+        if !inline_payload {
+            return RowPreview::Hidden;
+        }
+        match value.preview(max_chars) {
+            Some(preview) => RowPreview::Text(format!("= {preview}").into()),
+            None => RowPreview::Datatype(value.datatype_label().to_owned().into()),
+        }
     }
 
     pub(super) fn sync(&mut self, entry: &TreeEntry, interaction: TreeEntryState, explorer: &Explorer, cx: &App) {
@@ -156,19 +160,31 @@ impl TopicRow {
                         )
                     }))
                     .child(div().min_w_0().truncate().font_medium().child(self.label.clone()))
-                    .when(!self.preview.is_empty(), |this| {
-                        this.child(
+                    .map(|this| match &self.preview {
+                        RowPreview::Hidden => this,
+                        RowPreview::Text(preview) => this.child(
                             div()
                                 .id(SharedString::from(format!("{}:preview", self.id)))
                                 .test_support()
-                                .aria_label(self.preview.clone())
+                                .aria_label(preview.clone())
                                 .flex_1()
                                 .min_w_0()
                                 .truncate()
                                 .text_xs()
                                 .text_color(cx.theme().muted_foreground)
-                                .child(self.preview.clone()),
-                        )
+                                .child(preview.clone()),
+                        ),
+                        RowPreview::Datatype(datatype) => this.child(
+                            Tag::secondary().outline().small().min_w_0().child(
+                                div()
+                                    .id(SharedString::from(format!("{}:datatype", self.id)))
+                                    .test_support()
+                                    .aria_label(datatype.clone())
+                                    .min_w_0()
+                                    .truncate()
+                                    .child(datatype.clone()),
+                            ),
+                        ),
                     }),
             )
     }

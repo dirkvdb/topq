@@ -1492,10 +1492,22 @@ impl Explorer {
         let mut content = div().v_flex().p_4().gap_4().flex_1().min_h_0().min_w_0();
         if let Some(value) = &node.value {
             let payload_format_label = if self.payload_format == "Image" {
-                value.properties.content_type().unwrap_or(self.payload_format)
+                payload::payload_image_content_type(value).unwrap_or(self.payload_format)
             } else {
                 self.payload_format
             };
+            let declared_content_type = value.properties.content_type();
+            let metadata_content_type = declared_content_type
+                .filter(|mime_type| {
+                    !mime_type
+                        .split(';')
+                        .next()
+                        .unwrap_or_default()
+                        .trim()
+                        .eq_ignore_ascii_case("application/octet-stream")
+                })
+                .or_else(|| value.inferred_content_type())
+                .or(declared_content_type);
             let bytes = value.payload.len();
             let payload_size = format_payload_size(bytes);
 
@@ -1561,7 +1573,7 @@ impl Explorer {
                                 ),
                         )
                         .when_some(
-                            value.properties.content_type().filter(|_| self.payload_format != "Image"),
+                            metadata_content_type.filter(|_| self.payload_format != "Image"),
                             |metadata, content_type| {
                                 let tooltip_content_type = content_type.to_owned();
                                 metadata.child(

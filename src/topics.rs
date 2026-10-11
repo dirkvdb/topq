@@ -93,6 +93,10 @@ pub struct TopicValue {
 }
 
 impl TopicValue {
+    pub(crate) fn inferred_content_type(&self) -> Option<&'static str> {
+        infer::get(&self.payload).map(|kind| kind.mime_type())
+    }
+
     pub fn display_payload(&self) -> String {
         match std::str::from_utf8(&self.payload) {
             Ok(text) => serde_json::from_str::<serde_json::Value>(text)
@@ -369,6 +373,26 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(MessageProperties::from_publish(Some(properties)), MessageProperties::default());
+    }
+
+    #[test]
+    fn inferred_content_types_use_signatures_without_changing_publish_metadata() {
+        for (payload, expected) in [
+            (&[0xff, 0xd8, 0xff, 0xe0][..], Some("image/jpeg")),
+            (b"\x89PNG\r\n\x1a\n".as_slice(), Some("image/png")),
+            (b"GIF89a".as_slice(), Some("image/gif")),
+            (b"%PDF-1.7\n".as_slice(), Some("application/pdf")),
+            (br#"{"on":true}"#.as_slice(), None),
+            (b"hello".as_slice(), None),
+            (&[0xff, 0x00][..], None),
+        ] {
+            let mut store = TopicStore::default();
+            store.receive(message("test", payload), Instant::now());
+            let value = store.nodes["test"].value.as_ref().unwrap();
+            assert_eq!(value.inferred_content_type(), expected);
+            assert_eq!(value.properties.content_type(), None);
+            assert_eq!(value.payload.as_ref(), payload);
+        }
     }
 
     #[test]

@@ -3460,6 +3460,26 @@ fn appearance_selectors_stay_compact_and_aligned(cx: &mut TestAppContext) {
     }
 }
 
+fn assert_topic_datatype(window: &mut Window, path: &str, expected: &str) {
+    let row_id = format!("topic:{path}");
+    let datatype_id = format!("{row_id}:datatype");
+    assert!(window.try_find(format!("{row_id}:preview")).is_none());
+    let tag = window.within(row_id.clone()).find(datatype_id);
+    assert_eq!(tag.label(), Some(expected), "datatype for {path}");
+    assert!(tag.visible(), "datatype for {path} must be visible");
+    let bounds = tag.bounds();
+    let row = window.find(row_id).bounds();
+    assert!(bounds.size.width > px(0.) && bounds.size.height > px(0.));
+    assert!(
+        bounds.left() >= row.left() && bounds.right() <= row.right(),
+        "datatype must fit horizontally inside {path}"
+    );
+    assert!(
+        bounds.top() >= row.top() && bounds.bottom() <= row.bottom(),
+        "datatype must fit vertically inside {path}"
+    );
+}
+
 #[gpui_kit::test]
 fn inline_payload_switch_updates_cached_previews_and_persists_pointer_and_keyboard_changes(cx: &mut TestAppContext) {
     let directory = tempfile::tempdir().unwrap();
@@ -3522,6 +3542,8 @@ fn inline_payload_switch_updates_cached_previews_and_persists_pointer_and_keyboa
         cx.run_until_parked();
         cx.update_window(handle, |_, window, cx| {
             window.render_frame(cx);
+            assert!(window.try_find("topic:home/a:datatype").is_none());
+            assert!(window.try_find("topic:home/b:datatype").is_none());
             if enabled {
                 assert_eq!(window.find("topic:home/a:preview").label(), Some(r#"= {"reading":1}"#));
                 assert_eq!(window.find("topic:home/b:preview").label(), Some("= plain text"));
@@ -3566,6 +3588,8 @@ fn inline_payload_length_limit_supports_native_input_steps_and_hides_only_long_p
         window.render_frame(cx);
         assert_eq!(window.find("topic:home/a:preview").label(), Some(r#"= {"v":true}"#));
         assert_eq!(window.find("topic:home/b:preview").label(), Some("= 12345678901"));
+        assert!(window.try_find("topic:home/a:datatype").is_none());
+        assert!(window.try_find("topic:home/b:datatype").is_none());
         window.click("settings", cx);
         window.click("settings-section-appearance", cx);
     })
@@ -3592,9 +3616,13 @@ fn inline_payload_length_limit_supports_native_input_steps_and_hides_only_long_p
     cx.update_window(handle, |_, window, cx| {
         window.render_frame(cx);
         assert_eq!(window.find("topic:home/a:preview").label(), Some(r#"= {"v":true}"#));
-        assert!(window.try_find("topic:home/b:preview").is_none());
+        assert!(window.try_find("topic:home/a:datatype").is_none());
+        assert_topic_datatype(window, "home/b", "JSON");
         assert_eq!(view.read(cx).selected.as_deref(), Some("home/a"));
         assert_eq!(view.read(cx).payload.read(cx).value().as_str(), "{\n  \"v\": true\n}");
+        view.update(cx, |view, cx| receive_payload(view, "home/a", r#"{"v":false}"#, window, cx));
+        window.render_frame(cx);
+        assert_topic_datatype(window, "home/a", "JSON");
         window.click("settings", cx);
         window.click("settings-section-appearance", cx);
     })
@@ -3633,10 +3661,13 @@ fn inline_payload_length_limit_supports_native_input_steps_and_hides_only_long_p
     cx.run_until_parked();
     cx.update_window(handle, |_, window, cx| {
         window.render_frame(cx);
+        assert_eq!(window.find("topic:home/a:preview").label(), Some(r#"= {"v":false}"#));
         assert_eq!(window.find("topic:home/b:preview").label(), Some("= 12345678901"));
+        assert!(window.try_find("topic:home/a:datatype").is_none());
+        assert!(window.try_find("topic:home/b:datatype").is_none());
         view.update(cx, |view, cx| receive_payload(view, "home/b", "123456789012", window, cx));
         window.render_frame(cx);
-        assert!(window.try_find("topic:home/b:preview").is_none());
+        assert_topic_datatype(window, "home/b", "JSON");
         assert!(window.find("topic:home:preview").label().unwrap().contains("2 topics"));
         window.click("settings", cx);
         window.click("settings-section-appearance", cx);
@@ -3679,6 +3710,8 @@ fn inline_payload_length_limit_supports_native_input_steps_and_hides_only_long_p
     cx.update_window(handle, |_, window, cx| {
         window.render_frame(cx);
         assert_eq!(window.find("topic:home/b:preview").label(), Some("= 123456789012"));
+        assert!(window.try_find("topic:home/a:datatype").is_none());
+        assert!(window.try_find("topic:home/b:datatype").is_none());
         let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(saved["inline_payload_max_chars"], 11);
         assert_eq!(saved["inline_payload_limit_enabled"], false);
@@ -3687,6 +3720,209 @@ fn inline_payload_length_limit_supports_native_input_steps_and_hides_only_long_p
         assert!(!Appearance::inline_payload_limit_enabled(cx));
     })
     .unwrap();
+}
+
+#[gpui_kit::test]
+fn inline_payload_nontext_types_use_datatype_tags_without_a_length_limit_and_hide_when_disabled(cx: &mut TestAppContext) {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.json");
+    let (handle, view) = open(cx, false, 760., 540.);
+    cx.update(|cx| {
+        cx.set_global(crate::appearance::load(&path, cx).unwrap());
+        crate::appearance::set_inline_payload_max_chars(0, cx).unwrap();
+        Theme::update(cx, |theme| theme.font_size = px(20.));
+    });
+    cx.update_window(handle, |_, window, cx| {
+        window.activate_window();
+        view.update(cx, |view, cx| view.select_topic("home/a", window, cx));
+        window.render_frame(cx);
+        assert!(Appearance::inline_payload(cx));
+        assert!(!Appearance::inline_payload_limit_enabled(cx));
+        assert_eq!(window.find("topic:home/b:preview").label(), Some("= 42"));
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let cached_row = cx.update(|cx| view.read(cx).topic_rows.borrow().get("home/a").unwrap().clone());
+
+    for (payload, content_type, expected) in [
+        (
+            &[0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0x00][..],
+            None,
+            "image/jpeg",
+        ),
+        (b"\x89PNG\r\n\x1a\n".as_slice(), None, "image/png"),
+        // These signatures are valid UTF-8: inference must still suppress text previews.
+        (b"GIF89a".as_slice(), None, "image/gif"),
+        (b"%PDF-1.7\n".as_slice(), None, "application/pdf"),
+        (&[0xff, 0x00, 0x80][..], None, "Binary"),
+        (PUBLISH_FILE_SVG, Some("image/svg+xml"), "image/svg+xml"),
+    ] {
+        cx.update_window(handle, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                let incoming = Message {
+                    payload: Bytes::copy_from_slice(payload),
+                    properties: crate::topics::MessageProperties::from_publish(content_type.map(|content_type| {
+                        rumqttc::v5::mqttbytes::v5::PublishProperties {
+                            content_type: Some(content_type.to_owned()),
+                            ..Default::default()
+                        }
+                    })),
+                    ..message("home/a")
+                };
+                view.apply_broker_events([crate::mqtt::BrokerEvent::Message(incoming)], window, cx);
+            });
+            window.render_frame(cx);
+            assert_topic_datatype(window, "home/a", expected);
+            assert_eq!(
+                view.read(cx).topic_rows.borrow().get("home/a").unwrap().entity_id(),
+                cached_row.entity_id()
+            );
+            assert!(window.find("topic:home:preview").label().unwrap().contains("2 topics"));
+            assert!(window.try_find("topic:home:datatype").is_none());
+            window.press("down", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(view.read(cx).selected.as_deref(), Some("home/b"));
+            assert!(window.find("topic:home/b").visible());
+            assert_eq!(window.find("selected-topic").label(), Some("home/b"));
+            window.press("up", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(view.read(cx).selected.as_deref(), Some("home/a"));
+            assert!(window.find("topic:home/a").visible());
+            assert_eq!(window.find("selected-topic").label(), Some("home/a"));
+            assert_topic_datatype(window, "home/a", expected);
+        })
+        .unwrap();
+    }
+
+    cx.simulate_window_resize(handle, size(px(1200.), px(900.)));
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.click("settings", cx);
+        window.click("settings-section-appearance", cx);
+        window.click("inline-payload", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| window.click("close-settings", cx))
+        .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(!Appearance::inline_payload(cx));
+        for topic in ["home/a", "home/b"] {
+            assert!(window.try_find(format!("topic:{topic}:preview")).is_none());
+            assert!(window.try_find(format!("topic:{topic}:datatype")).is_none());
+        }
+        view.update(cx, |view, cx| receive_payload(view, "home/a", "GIF89a", window, cx));
+        window.render_frame(cx);
+        assert!(window.try_find("topic:home/a:preview").is_none());
+        assert!(window.try_find("topic:home/a:datatype").is_none());
+        assert!(window.find("topic:home:preview").label().unwrap().contains("2 topics"));
+        window.click("settings", cx);
+        window.click("settings-section-appearance", cx);
+        window.click("inline-payload", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| window.click("close-settings", cx))
+        .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_topic_datatype(window, "home/a", "image/gif");
+        assert_eq!(window.find("topic:home/b:preview").label(), Some("= 42"));
+        assert!(window.try_find("topic:home/b:datatype").is_none());
+        assert_eq!(
+            view.read(cx).topic_rows.borrow().get("home/a").unwrap().entity_id(),
+            cached_row.entity_id()
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn inline_payload_live_type_transitions_reuse_cached_rows_and_fit_across_themes_and_zoom(cx: &mut TestAppContext) {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.json");
+    for mode in [ThemeMode::Light, ThemeMode::Dark] {
+        for font_size in [16., 20.] {
+            let (handle, view) = open(cx, false, 760., 540.);
+            cx.update(|cx| {
+                cx.set_global(crate::appearance::load(&path, cx).unwrap());
+                crate::appearance::set_inline_payload_max_chars(10, cx).unwrap();
+                crate::appearance::set_inline_payload_limit_enabled(true, cx).unwrap();
+                Theme::change(mode, None, cx);
+                Theme::update(cx, |theme| theme.font_size = px(font_size));
+                cx.set_reduce_motion(true);
+            });
+            cx.update_window(handle, |_, window, cx| {
+                window.activate_window();
+                view.update(cx, |view, cx| {
+                    receive_payload(view, "home/a", "ready", window, cx);
+                    view.select_topic("home/a", window, cx);
+                });
+                window.render_frame(cx);
+                assert_eq!(window.find("topic:home/a:preview").label(), Some("= ready"));
+                assert!(window.try_find("topic:home/a:datatype").is_none());
+            })
+            .unwrap();
+            cx.run_until_parked();
+            let cached_row = cx.update(|cx| view.read(cx).topic_rows.borrow().get("home/a").unwrap().clone());
+
+            for (payload, datatype, preview) in [
+                (b"plain payload longer".as_slice(), Some("Text"), None),
+                (br#"{"reading":123}"#.as_slice(), Some("JSON"), None),
+                (&[0xff, 0xd8, 0xff, 0xe0][..], Some("image/jpeg"), None),
+                (&[0xff, 0x00, 0x80][..], Some("Binary"), None),
+                (b"done".as_slice(), None, Some("= done")),
+            ] {
+                cx.update_window(handle, |_, window, cx| {
+                    view.update(cx, |view, cx| {
+                        if let Ok(text) = std::str::from_utf8(payload) {
+                            receive_payload(view, "home/a", text, window, cx);
+                        } else {
+                            view.apply_broker_events(
+                                [crate::mqtt::BrokerEvent::Message(Message {
+                                    payload: Bytes::copy_from_slice(payload),
+                                    ..message("home/a")
+                                })],
+                                window,
+                                cx,
+                            );
+                        }
+                    });
+                    window.render_frame(cx);
+                    if let Some(expected) = datatype {
+                        assert_topic_datatype(window, "home/a", expected);
+                    } else {
+                        let inline = window.find("topic:home/a:preview");
+                        assert_eq!(inline.label(), preview);
+                        assert!(inline.visible());
+                        assert!(window.try_find("topic:home/a:datatype").is_none());
+                    }
+                    assert_eq!(
+                        view.read(cx).topic_rows.borrow().get("home/a").unwrap().entity_id(),
+                        cached_row.entity_id()
+                    );
+                    assert_eq!(view.read(cx).selected.as_deref(), Some("home/a"));
+                    assert!(window.find("topic:home/a").visible());
+                    assert_eq!(window.find("topic:home/a").bounds().size.height, window.rem_size() * 1.5);
+                    assert!(window.find("topic:home:preview").label().unwrap().contains("2 topics"));
+                    assert!(window.try_find("topic:home:datatype").is_none());
+                })
+                .unwrap();
+                cx.run_until_parked();
+            }
+        }
+    }
 }
 
 #[gpui_kit::test]

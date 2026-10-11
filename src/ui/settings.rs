@@ -1341,7 +1341,7 @@ impl Explorer {
                     Self::appearance_setting(
                         "inline-payload-limit",
                         "Limit display length",
-                        "Only inline payloads at or below this character count. Longer payloads are hidden.",
+                        "Maximum payload size for inlining",
                         div()
                             .h_flex()
                             .items_center()

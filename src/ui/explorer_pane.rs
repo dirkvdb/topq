@@ -384,6 +384,18 @@ mod tests {
             0x9c, 0x63, 0xf8, 0xcf, 0xc0, 0xf0, 0x1f, 0x00, 0x05, 0x00, 0x01, 0xff, 0x89, 0x99, 0x3d, 0x1d, 0x00, 0x00, 0x00, 0x00, 0x49,
             0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
         ];
+        // One grayscale pixel, with single-symbol DC/AC Huffman tables.
+        const JPEG: &[u8] = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xff\xdb\x00\x43\x00\
+            \x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\
+            \x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\
+            \x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\
+            \x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\
+            \xff\xc0\x00\x0b\x08\x00\x01\x00\x01\x01\x01\x11\x00\xff\xc4\x00\x26\x00\x01\
+            \x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x10\x01\
+            \x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\
+            \xff\xda\x00\x08\x01\x01\x00\x00\x3f\x00\x3f\xff\xd9";
+        const CORRUPT_PNG: &[u8] = b"\x89PNG\r\n\x1a\n";
+        const PSD: &[u8] = b"8BPS\x00\x01\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x01\x00\x00\x00\x01\x00\x08\x00\x01";
         for mode in [ThemeMode::Light, ThemeMode::Dark] {
             let (handle, view) = cx.update(|cx| {
                 if !cx.has_global::<Theme>() {
@@ -423,32 +435,94 @@ mod tests {
             .unwrap();
             cx.run_until_parked();
 
-            for (content_type, payload, expected_error) in [
-                (Some(" image/svg+xml ; charset=utf-8"), SVG, None),
-                (Some("IMAGE/PNG"), PNG, None),
+            // Expected badges and editor text are fixture data, independent of MIME inference.
+            for (content_type, payload, expected_badge, expected_error, expected_text) in [
+                (
+                    Some(" image/svg+xml ; charset=utf-8"),
+                    SVG,
+                    " image/svg+xml ; charset=utf-8",
+                    None,
+                    None,
+                ),
+                (Some("IMAGE/PNG"), PNG, "IMAGE/PNG", None, None),
+                (None, PNG, "image/png", None, None),
+                (Some("application/octet-stream"), PNG, "image/png", None, None),
+                (Some("text/plain"), PNG, "image/png", None, None),
+                (None, JPEG, "image/jpeg", None, None),
                 (
                     Some("image/svg+xml; charset=utf-8; profile=very-long-profile-name-for-the-original-image-content-type-badge"),
                     SVG,
+                    "image/svg+xml; charset=utf-8; profile=very-long-profile-name-for-the-original-image-content-type-badge",
+                    None,
                     None,
                 ),
-                (Some("image/svg+xml"), SQUARE, None),
-                (Some("image/svg+xml"), WIDE, None),
-                (Some("image/svg+xml"), TALL, None),
+                (Some("image/svg+xml"), SQUARE, "image/svg+xml", None, None),
+                (Some("image/svg+xml"), WIDE, "image/svg+xml", None, None),
+                (Some("image/svg+xml"), TALL, "image/svg+xml", None, None),
                 (
                     Some("image/png"),
                     b"invalid image".as_slice(),
+                    "image/png",
                     Some("Unable to display image payload"),
+                    None,
                 ),
-                (Some("image/vnd.example.custom"), SVG, Some("Unsupported image content type")),
-                (None, SVG, None),
-                (Some("application/json"), br#"{"on":true}"#.as_slice(), None),
-                (Some("image/svg+xml"), SVG, None),
+                (None, CORRUPT_PNG, "image/png", Some("Unable to display image payload"), None),
+                (
+                    Some("application/octet-stream"),
+                    CORRUPT_PNG,
+                    "image/png",
+                    Some("Unable to display image payload"),
+                    None,
+                ),
+                (Some("image/jpeg"), PNG, "image/jpeg", Some("Unable to display image payload"), None),
+                (
+                    Some("image/vnd.example.custom"),
+                    PNG,
+                    "image/vnd.example.custom",
+                    Some("Unsupported image content type"),
+                    None,
+                ),
+                (None, PSD, "image/vnd.adobe.photoshop", Some("Unsupported image content type"), None),
+                (None, b"plain payload".as_slice(), "Text", None, Some("plain payload")),
+                (None, b"\xff\x00A".as_slice(), "Binary · hex", None, Some("ff 00 41")),
+                (
+                    Some("application/octet-stream"),
+                    b"\xff\x00A".as_slice(),
+                    "Binary · hex",
+                    None,
+                    Some("ff 00 41"),
+                ),
+                (None, SVG, "Text", None, Some(std::str::from_utf8(SVG).unwrap())),
+                (
+                    Some("application/json"),
+                    br#"{"on":true}"#.as_slice(),
+                    "JSON",
+                    None,
+                    Some("{\n  \"on\": true\n}"),
+                ),
+                (None, b"%PDF-1.7\n".as_slice(), "Text", None, Some("%PDF-1.7\n")),
+                (
+                    None,
+                    b"%PDF-1.7\n\xff".as_slice(),
+                    "Binary · hex",
+                    None,
+                    Some("25 50 44 46 2d 31 2e 37 0a ff"),
+                ),
+                (
+                    Some(" APPLICATION/OCTET-STREAM ; charset=binary"),
+                    b"%PDF-1.7\n\xff".as_slice(),
+                    "Binary · hex",
+                    None,
+                    Some("25 50 44 46 2d 31 2e 37 0a ff"),
+                ),
+                (Some("image/svg+xml"), SVG, "image/svg+xml", None, None),
             ] {
+                let payload = Bytes::copy_from_slice(payload);
                 let previous_image = cx.update(|cx| view.read(cx).payload_image.clone());
                 cx.update_window(handle, |_, window, cx| {
                     view.update(cx, |view, cx| {
                         let mut incoming = message(content_type);
-                        incoming.payload = Bytes::from_static(payload);
+                        incoming.payload = payload.clone();
                         view.topics.receive(incoming, Instant::now());
                         view.refresh_details(window, cx);
                     });
@@ -462,13 +536,11 @@ mod tests {
                     cx.update_window(handle, |_, window, cx| {
                         window.render_frame(cx);
                         let explorer = view.read(cx);
-                        let is_image =
-                            content_type.is_some_and(|content_type| content_type.trim().to_ascii_lowercase().starts_with("image/"));
-                        if is_image {
+                        if expected_text.is_none() {
                             assert_eq!(explorer.payload_format, "Image");
                             assert!(window.try_find("message-content-type").is_none());
                             let badge = window.find("payload-format");
-                            assert_eq!(badge.label(), content_type);
+                            assert_eq!(badge.label(), Some(expected_badge));
                             assert!(badge.visible());
                             assert!(badge.bounds().right() <= window.find("topic-metadata").bounds().right());
                             assert!(explorer.payload.read(cx).value().is_empty());
@@ -491,7 +563,7 @@ mod tests {
                                 assert!(bounds.size.width > px(0.) && bounds.size.height > px(0.));
                                 assert!(bounds.left() >= payload_bounds.left() && bounds.right() <= payload_bounds.right());
                                 assert!(bounds.top() >= payload_bounds.top() && bounds.bottom() <= payload_bounds.bottom());
-                                assert_eq!(image.bytes(), payload);
+                                assert_eq!(image.bytes(), payload.as_ref());
                                 let image_bounds = window.find(("payload-image-data", image.id())).bounds();
                                 let decoded = image.get_render_image(window, cx).expect("Image payload must decode successfully");
                                 assert!(
@@ -512,14 +584,80 @@ mod tests {
                                 assert!((fitted.center().x - bounds.center().x).abs() <= px(0.01));
                                 assert!((fitted.center().y - bounds.center().y).abs() <= px(0.01));
                             }
-                        } else {
+                        } else if let Some(expected_text) = expected_text {
                             assert!(explorer.payload_image.is_none());
                             assert!(window.find("payload-editor").visible());
-                            assert_ne!(explorer.payload_format, "Image");
-                            assert_eq!(window.find("payload-format").label(), Some(explorer.payload_format));
+                            assert_eq!(explorer.payload_format, expected_badge);
+                            assert_eq!(window.find("payload-format").label(), Some(expected_badge));
+                            assert_eq!(explorer.payload.read(cx).value().as_str(), expected_text);
+                            assert!(window.try_find("payload-image").is_none());
+                            assert!(window.try_find("payload-image-error").is_none());
+                            if payload.starts_with(b"%PDF-") {
+                                assert_eq!(window.find("message-content-type").label(), Some("Content type: application/pdf"));
+                                assert_eq!(window.find("message-content-type-value").label(), Some("application/pdf"));
+                                assert!(window.find("message-content-type").visible());
+                                assert_eq!(
+                                    explorer.topics.nodes["test"].value.as_ref().unwrap().properties.content_type(),
+                                    content_type
+                                );
+                            }
                         }
-                        if let Some(previous) = &previous_image {
+                        let explorer = view.read(cx);
+                        assert!(explorer.payload_raw.is_none());
+                        if let Some(previous) = &previous_image
+                            && explorer
+                                .payload_image
+                                .as_ref()
+                                .is_none_or(|current| !Arc::ptr_eq(previous, current))
+                        {
                             assert!(!previous.is_asset_cached(cx), "Replaced images must leave the asset cache");
+                        }
+                    })
+                    .unwrap();
+                }
+                if expected_text.is_none() {
+                    cx.update_window(handle, |_, window, cx| {
+                        window.click("preview-value", cx);
+                        let explorer = view.read(cx);
+                        assert!(!explorer.payload_preview);
+                        assert_eq!(window.find("preview-value").label(), Some("Render payload"));
+                        assert_eq!(window.find("payload-format").label(), Some(expected_badge));
+                        assert!(window.find("payload-raw").visible());
+                        assert!(window.try_find("payload-editor").is_none());
+                        assert!(window.try_find("payload-image").is_none());
+                        assert!(window.try_find("payload-image-error").is_none());
+                        assert!(explorer.payload_image.is_none());
+                        assert!(explorer.payload.read(cx).value().is_empty());
+                        let raw = explorer.payload_raw.as_ref().unwrap().read(cx);
+                        assert_eq!(raw.bytes(), &payload);
+                        assert_eq!(raw.bytes().as_ptr(), payload.as_ptr(), "Raw view must share inferred image bytes");
+                        if let Some(previous) = &previous_image {
+                            assert!(!previous.is_asset_cached(cx));
+                        }
+                        window.click("preview-value", cx);
+                        assert!(view.read(cx).payload_preview);
+                        assert_eq!(window.find("preview-value").label(), Some("Show raw payload"));
+                        assert!(window.try_find("payload-raw").is_none());
+                        assert!(view.read(cx).payload_raw.is_none());
+                    })
+                    .unwrap();
+                    cx.run_until_parked();
+                    cx.update_window(handle, |_, window, cx| {
+                        window.render_frame(cx);
+                        if let Some(error) = expected_error {
+                            assert_eq!(window.find("payload-image-error").label(), Some(error));
+                        } else {
+                            assert!(window.find("payload-image").visible());
+                            assert!(window.try_find("payload-image-error").is_none());
+                            assert!(
+                                view.read(cx)
+                                    .payload_image
+                                    .as_ref()
+                                    .unwrap()
+                                    .clone()
+                                    .get_render_image(window, cx)
+                                    .is_some()
+                            );
                         }
                     })
                     .unwrap();
@@ -528,7 +666,10 @@ mod tests {
 
             let image = cx.update(|cx| view.read(cx).payload_image.as_ref().unwrap().clone());
             cx.update_window(handle, |_, window, cx| {
-                view.update(cx, |view, cx| view.refresh_details(window, cx));
+                view.update(cx, |view, cx| {
+                    view.refresh_details(window, cx);
+                    view.focus_topics(window, cx);
+                });
                 assert!(Arc::ptr_eq(&image, view.read(cx).payload_image.as_ref().unwrap()));
                 window.render_frame(cx);
                 window.press("down", cx);

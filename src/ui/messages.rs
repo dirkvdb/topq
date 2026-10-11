@@ -8,21 +8,32 @@ pub(super) trait LocalizedError {
 
 impl crate::topics::TopicValue {
     pub(crate) fn preview(&self, max_chars: Option<usize>) -> Option<String> {
-        match std::str::from_utf8(&self.payload) {
-            Ok(text) => {
-                if max_chars.is_some_and(|limit| text.chars().nth(limit).is_some()) {
-                    return None;
-                }
-                Some(
-                    text.chars()
-                        .take(max_chars.unwrap_or(100))
-                        .map(|ch| if ch.is_control() { ' ' } else { ch })
-                        .collect(),
-                )
-            }
-            Err(_) if max_chars.is_some_and(|limit| self.payload.len() > limit) => None,
-            Err(_) => Some(format!("<{} binary bytes>", self.payload.len())),
+        if super::payload::payload_image_content_type(self).is_some()
+            || self
+                .inferred_content_type()
+                .is_some_and(|mime_type| !mime_type.starts_with("text/"))
+        {
+            return None;
         }
+        let text = std::str::from_utf8(&self.payload).ok()?;
+        if max_chars.is_some_and(|limit| text.chars().nth(limit).is_some()) {
+            return None;
+        }
+        Some(
+            text.chars()
+                .take(max_chars.unwrap_or(100))
+                .map(|ch| if ch.is_control() { ' ' } else { ch })
+                .collect(),
+        )
+    }
+
+    pub(crate) fn datatype_label(&self) -> &str {
+        super::payload::payload_image_content_type(self)
+            .or_else(|| self.inferred_content_type())
+            .unwrap_or_else(|| match self.format_label() {
+                "Binary · hex" => "Binary",
+                label => label,
+            })
     }
 
     pub fn format_label(&self) -> &'static str {
@@ -87,7 +98,7 @@ mod tests {
     }
 
     #[test]
-    fn inline_payload_binary_length_limit_uses_payload_bytes() {
+    fn inline_payload_binary_values_never_produce_text_previews() {
         let value = crate::topics::TopicValue {
             payload: bytes::Bytes::from_static(&[0xff, 0x00]),
             qos: 0,
@@ -96,18 +107,18 @@ mod tests {
             messages: 1,
             properties: MessageProperties::default(),
         };
-        assert_eq!(value.preview(Some(2)).as_deref(), Some("<2 binary bytes>"));
-        assert!(value.preview(Some(1)).is_none());
-        assert!(value.preview(Some(0)).is_none());
-        assert_eq!(value.preview(None).as_deref(), Some("<2 binary bytes>"));
+        for limit in [Some(2), Some(1), Some(0), None] {
+            assert!(value.preview(limit).is_none());
+        }
+        assert_eq!(value.datatype_label(), "Binary");
     }
 
     #[test]
-    fn payload_labels_and_binary_preview_are_ui_copy() {
+    fn payload_labels_and_text_previews_are_ui_copy() {
         for (payload, label, preview) in [
-            (br#"{"on":true}"#.as_slice(), "JSON", "{\"on\":true}"),
-            (b"hello\n".as_slice(), "Text", "hello "),
-            (&[0xff, 0x00], "Binary · hex", "<2 binary bytes>"),
+            (br#"{"on":true}"#.as_slice(), "JSON", Some("{\"on\":true}")),
+            (b"hello\n".as_slice(), "Text", Some("hello ")),
+            (&[0xff, 0x00], "Binary · hex", None),
         ] {
             let mut store = TopicStore::default();
             store.receive(
@@ -123,7 +134,7 @@ mod tests {
             );
             let value = store.nodes["test"].value.as_ref().unwrap();
             assert_eq!(value.format_label(), label);
-            assert_eq!(value.preview(None).as_deref(), Some(preview));
+            assert_eq!(value.preview(None).as_deref(), preview);
         }
     }
 }
