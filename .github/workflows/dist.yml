@@ -10,7 +10,16 @@ permissions:
 
 jobs:
   flatpak:
-    runs-on: ubuntu-24.04
+    name: Flatpak (${{ matrix.variant.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.variant.runner }}
     timeout-minutes: 60
     container:
       image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-25.08
@@ -35,6 +44,7 @@ jobs:
         uses: flatpak/flatpak-github-actions/flatpak-builder@v6
         with:
           manifest-path: dist/flatpak/io.github.dirkvdb.topq.json
+          arch: ${{ matrix.variant.arch }}
           bundle: TopQ.flatpak
           artifact-name: TopQ-Flatpak-${{ runner.arch }}
           build-dir: dist/build/flatpak/app

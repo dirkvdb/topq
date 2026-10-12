@@ -209,8 +209,10 @@ The distribution workflow uses the official
 [`flatpak/flatpak-github-actions/flatpak-builder@v6`](https://github.com/flatpak/flatpak-github-actions)
 action in Flathub's privileged Freedesktop 25.08 container. After vendoring the
 locked Cargo dependencies, the action handles SDK installation, build caching,
-bundle export, and artifact upload. It builds an x86_64 `TopQ.flatpak` bundle and
-uploads it as `TopQ-Flatpak-X64`. Local builds still use `just flatpak` and target
+bundle export, and artifact upload. It builds `TopQ.flatpak` bundles natively for
+x86_64 on `ubuntu-24.04` and aarch64 on `ubuntu-24.04-arm`, uploading separate
+`TopQ-Flatpak-X64` and `TopQ-Flatpak-ARM64` artifacts. A failure on one architecture
+does not cancel the other build. Local builds still use `just flatpak` and target
 the host architecture. Build state, the
 local repository, vendored dependencies, and generated Cargo configuration are
 ignored by Git. These are local/CI bundles, not a Flathub submission: the manifest
