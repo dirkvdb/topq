@@ -53,4 +53,12 @@ appimage:
 
 # Refresh bundled themes from the source revision of gpui-kit in Cargo.lock.
 sync-themes:
-    python3 scripts/sync_themes.py
+    python3 scripts/sync_gpui.py themes
+
+# Replace the copied GPUI agent skills with those from the locked release.
+sync-skills:
+    python3 scripts/sync_gpui.py skills
+
+# Refresh both themes and agent skills from a single locked source download.
+sync-gpui:
+    python3 scripts/sync_gpui.py all
