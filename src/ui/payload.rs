@@ -178,6 +178,7 @@ impl Explorer {
                 .selected
                 .as_ref()
                 .and_then(|path| self.topics.nodes.get(path))
+                .filter(|node| node.previous_value().is_some())
                 .and_then(|node| node.value.as_ref())
                 .is_some_and(super::payload_comparison::is_text_payload)
         {
@@ -465,7 +466,7 @@ impl Explorer {
                 .as_deref()
                 .zip(node)
                 .and_then(|(topic, node)| node.value.as_ref().map(|value| (topic, node, value)))
-                .filter(|(_, _, value)| super::payload_comparison::is_text_payload(value))
+                .filter(|(_, node, value)| node.previous_value().is_some() && super::payload_comparison::is_text_payload(value))
         {
             let text = self.payload.read(cx).value();
             self.payload_comparison.update(cx, |comparison, cx| {

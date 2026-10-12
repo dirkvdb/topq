@@ -535,7 +535,7 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn payload_diff_toggle_supports_pointer_and_space_and_explains_the_first_message(cx: &mut TestAppContext) {
+    fn payload_diff_toggle_supports_pointer_and_space_and_shows_the_first_payload(cx: &mut TestAppContext) {
         for mode in [ThemeMode::Light, ThemeMode::Dark] {
             let (handle, view) = cx.update(|cx| {
                 if !cx.has_global::<Theme>() {
@@ -586,7 +586,11 @@ mod tests {
             .unwrap();
             cx.run_until_parked();
             cx.update_window(handle, |_, window, cx| {
-                assert_comparison_status(&view, "No previous payload. Waiting for the next message.", window, cx);
+                window.render_frame(cx);
+                assert!(window.find("payload-editor").visible());
+                assert_eq!(view.read(cx).payload.read(cx).value().as_str(), "first payload");
+                assert!(window.try_find("payload-diff").is_none());
+                assert!(window.try_find("payload-diff-status").is_none());
                 window.press("space", cx);
                 assert!(!view.read(cx).payload_diff_enabled);
                 assert_eq!(window.find("diff-value").checked(), Some(false));
@@ -602,7 +606,19 @@ mod tests {
             .unwrap();
             cx.run_until_parked();
             cx.update_window(handle, |_, window, cx| {
-                assert_comparison_status(&view, "No previous payload. Waiting for the next message.", window, cx);
+                window.render_frame(cx);
+                assert!(window.find("payload-editor").visible());
+                assert_eq!(view.read(cx).payload.read(cx).value().as_str(), "first payload");
+                assert!(window.try_find("payload-diff").is_none());
+                assert!(window.try_find("payload-diff-status").is_none());
+                view.update(cx, |view, cx| {
+                    receive_comparison_payload(view, "test", b"second payload", None, window, cx);
+                });
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.update_window(handle, |_, window, cx| {
+                assert_loaded_comparison(&view, "first payload", "second payload", "plaintext", window, cx);
             })
             .unwrap();
         }
