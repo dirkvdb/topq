@@ -5,6 +5,7 @@ mod bundled_themes;
 mod config;
 mod error;
 mod mqtt;
+mod secrets;
 mod topics;
 mod ui;
 

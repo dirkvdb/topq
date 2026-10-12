@@ -62,7 +62,9 @@ WebSocket connections use the fixed path `/mqtt`; custom paths are not configura
 
 `validate_certificate` defaults to `true`: TLS uses the system's trusted certificates and verifies the broker hostname. Setting it to `false` disables certificate and hostname verification; encryption remains, but the broker is not authenticated. It has no effect without TLS.
 
-Passwords are stored only in the system credential store and must not be included in the URI. A JSON `password` field is ignored. For connections with a username, the password is retrieved from the credential store. Anonymous connections (without a username) do not need a password. Saving or restoring passwords requires an available, unlocked credential store; there is no plaintext fallback.
+Passwords are stored only in secure credential storage and must not be included in the URI. A JSON `password` field is ignored. For connections with a username, the password is retrieved from credential storage. Anonymous connections (without a username) do not need a password. Saving or restoring passwords requires an available, unlocked credential store; there is no plaintext fallback.
+
+Credential storage uses the native Keychain on macOS and Credential Manager on Windows. On Linux, `oo7` automatically selects the desktop Secret Service for regular installations or an encrypted file backed by the Secret portal inside Flatpak. Flatpak password storage requires a host implementation of `org.freedesktop.portal.Secret`; normal operation does not require direct access to `org.freedesktop.secrets`. Keep the Flatpak application ID stable because the portal encryption key is application-scoped. Passwords are not migrated between native and Flatpak installations; re-enter them when switching.
 
 Appearance settings live alongside connection settings in `config.json`:
 

@@ -18,7 +18,6 @@ chrono = "0.4"
 directories = "6"
 gpui-kit = { version = "0.7", features = ["tree-sitter", "gpui-fast"] }
 infer = { version = "0.22", default-features = false }
-keyring = { version = "4.2", default-features = false, features = ["v1"] }
 rumqttc = { version = "0.25", default-features = false, features = ["use-rustls", "websocket"] }
 rustls-native-certs = "0.8"
 serde = { version = "1", features = ["derive"] }
@@ -31,7 +30,15 @@ tokio = { version = "1", features = ["rt", "time", "sync", "macros"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
+keyring = { version = "4.2", default-features = false, features = ["v1"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+oo7 = { version = "0.6", default-features = false, features = ["async-std", "native_crypto"] }
+futures-lite = "2"
+
 [dev-dependencies]
+keyring = { version = "4.2", default-features = false, features = ["v1"] }
 gpui-kit = { version = "0.7", features = ["test-support"] }
 keyring-core = "1"
 tempfile = "3"

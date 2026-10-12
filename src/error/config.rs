@@ -5,9 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use keyring::Error as KeyringError;
-
-use crate::config::ConnectionField;
+use crate::{config::ConnectionField, secrets::Error as KeyringError};
 
 /// Stable validation reasons; their Display values are translation keys, never UI copy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -466,6 +464,7 @@ impl From<ConnectionValidationError> for ConfigError {
     }
 }
 
+#[cfg(any(test, target_os = "windows", target_os = "macos"))]
 pub(crate) fn credential_error(error: KeyringError) -> ConfigError {
     // Keyring payloads and their sources can contain secrets. Retain only the reason.
     match error {
@@ -474,6 +473,17 @@ pub(crate) fn credential_error(error: KeyringError) -> ConfigError {
         KeyringError::NoDefaultStore => ConfigError::CredentialStoreUnavailable,
         KeyringError::BadEncoding(_) | KeyringError::BadDataFormat(_, _) => ConfigError::CredentialNotDecodable,
         _ => ConfigError::CredentialOperationFailed,
+    }
+}
+
+#[cfg(all(target_os = "linux", not(test)))]
+pub(crate) fn credential_error(error: KeyringError) -> ConfigError {
+    match error {
+        KeyringError::NoEntry => ConfigError::CredentialMissing,
+        KeyringError::AccessDenied => ConfigError::CredentialAccessDenied,
+        KeyringError::Unavailable => ConfigError::CredentialStoreUnavailable,
+        KeyringError::NotDecodable => ConfigError::CredentialNotDecodable,
+        KeyringError::OperationFailed => ConfigError::CredentialOperationFailed,
     }
 }
 

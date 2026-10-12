@@ -11,13 +11,13 @@ use std::{
 
 #[cfg(not(test))]
 use directories::{BaseDirs, ProjectDirs};
-use keyring::{Entry, Error as KeyringError};
 use serde::{Deserialize, Serialize, ser::SerializeStruct};
 use url::Url;
 
 use crate::{
     error::config::{ConfigError, ConnectionValidationCode, ConnectionValidationError, LayoutDiagnostic, LayoutError, credential_error},
     mqtt::Qos,
+    secrets::{Entry, Error as KeyringError},
 };
 
 /// An MQTT topic filter and its requested maximum delivery QoS.
