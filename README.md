@@ -9,6 +9,7 @@ An MQTT 5 topic explorer built with Rust and [GPUI Kit](https://gpui-kit.com).
 - Connection management to quickly connect to your favorite brokers, with optional TLS and WebSocket support.
 - Live topic tree
 - Payload pane to inspect the message payloads
+- Live payload diffs
 - Publish messages.
 - Deletion of retained messages for a selected topic and its known subtopics.
 - Live line and area charts for monitored numeric JSON fields

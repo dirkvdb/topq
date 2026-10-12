@@ -3,7 +3,7 @@
 use std::{ops::Range, sync::Arc, time::Instant};
 
 use gpui_kit::component::input::{Editor, RangeDecoration, RangeDecorationCollection, RangeDecorationStyle};
-use gpui_kit::{AnyElement, Image, ImageFormat, ObjectFit, StyledImage, TestSupportExt, div, img, prelude::*, relative};
+use gpui_kit::{AnyElement, Image, ImageFormat, ObjectFit, StyledImage, TestSupportExt, div, img, prelude::*, relative, rems};
 
 use super::{
     ActiveTheme, App, AssetIconName, Button, ButtonVariants, Context, DropdownMenu, Explorer, PopupMenuItem, Sizable, StyledExt, Window,
@@ -173,6 +173,16 @@ impl Explorer {
     }
 
     pub(super) fn payload_view(&self, cx: &Context<Self>) -> AnyElement {
+        if self.payload_diff_enabled
+            && self
+                .selected
+                .as_ref()
+                .and_then(|path| self.topics.nodes.get(path))
+                .and_then(|node| node.value.as_ref())
+                .is_some_and(super::payload_comparison::is_text_payload)
+        {
+            return self.payload_comparison.clone().into_any_element();
+        }
         if let Some(raw) = &self.payload_raw {
             return raw.clone().into_any_element();
         }
@@ -257,7 +267,9 @@ impl Explorer {
                     .readonly(true)
                     .h(relative(1.))
                     .w_full()
-                    .text_sm()
+                    // Diff fixes its source metrics from the theme, independently of Styled overrides.
+                    .text_size(rems(f32::from(cx.theme().mono_font_size) / 16.))
+                    .line_height(relative(1.6))
                     .aria_label("Latest topic payload"),
             )
             .when(numeric, |container| {
@@ -446,6 +458,22 @@ impl Explorer {
                 .collect(),
             cx,
         );
+        let node = self.selected.as_ref().and_then(|path| self.topics.nodes.get(path));
+        if self.payload_diff_enabled
+            && let Some((topic, node, value)) = self
+                .selected
+                .as_deref()
+                .zip(node)
+                .and_then(|(topic, node)| node.value.as_ref().map(|value| (topic, node, value)))
+                .filter(|(_, _, value)| super::payload_comparison::is_text_payload(value))
+        {
+            let text = self.payload.read(cx).value();
+            self.payload_comparison.update(cx, |comparison, cx| {
+                comparison.refresh(topic, value, node.previous_value(), self.payload_preview, text.as_str(), cx);
+            });
+        } else {
+            self.payload_comparison.update(cx, |comparison, cx| comparison.clear(cx));
+        }
         self.schedule_received_age(window, cx);
         self.schedule_animation(window, cx);
         self.details_view.update(cx, |_, cx| cx.notify());

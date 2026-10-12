@@ -59,9 +59,12 @@ mod tests {
 
     use bytes::Bytes;
     use chrono::Local;
-    use gpui_kit::component::{Theme, ThemeMode, TitleBar};
+    use gpui_kit::component::{
+        Theme, ThemeMode, TitleBar,
+        diff::{DiffFileStatus, DiffLineRange, DiffSide},
+    };
     use gpui_kit::test::TestWindowExt;
-    use gpui_kit::{AppContext, Bounds, TestAppContext, WindowBounds, WindowOptions, px, size};
+    use gpui_kit::{App, AppContext, Bounds, Context, Entity, TestAppContext, Window, WindowBounds, WindowOptions, px, size};
     use rumqttc::v5::mqttbytes::v5::PublishProperties;
 
     use super::Explorer;
@@ -257,6 +260,708 @@ mod tests {
             .unwrap();
             cx.run_until_parked();
         }
+    }
+
+    fn receive_comparison_payload(
+        view: &mut Explorer,
+        topic: &str,
+        payload: &[u8],
+        content_type: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Explorer>,
+    ) {
+        let mut incoming = message(content_type);
+        incoming.topic = topic.into();
+        incoming.payload = Bytes::copy_from_slice(payload);
+        view.topics.receive(incoming, Instant::now());
+        view.sync_tree(cx);
+        view.refresh_details(window, cx);
+    }
+
+    fn assert_loaded_comparison(view: &Entity<Explorer>, previous: &str, current: &str, language: &str, window: &mut Window, cx: &mut App) {
+        window.render_frame(cx);
+        assert!(window.find("payload-diff").visible());
+        assert!(window.try_find("payload-diff-status").is_none());
+        assert!(window.try_find("payload-editor").is_none());
+        assert!(view.read(cx).payload_diff_enabled);
+        assert_eq!(window.find("diff-value").checked(), Some(true));
+        let diff = view.read(cx).payload_comparison.read(cx).diff().clone();
+        let files = diff.read(cx).files();
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            files[0].status(),
+            if previous == current {
+                DiffFileStatus::Unchanged
+            } else {
+                DiffFileStatus::Modified
+            }
+        );
+        assert!(!files[0].is_binary());
+        assert_eq!(files[0].has_changes(), previous != current);
+        assert_eq!(files[0].language().as_str(), language);
+        let path = files[0].path().clone();
+        // Read both complete sources through the public selection API, not private line storage.
+        for (side, expected) in [(DiffSide::Original, previous), (DiffSide::Modified, current)] {
+            // Reference files provide only the current side when both payloads are identical.
+            if previous == current && side == DiffSide::Original {
+                continue;
+            }
+            diff.update(cx, |diff, cx| {
+                diff.set_selected_lines(Some(DiffLineRange::new(path.clone(), side, 1, usize::MAX)), cx);
+                // Display patches omit file-ending notices and terminate source rows.
+                // The raw payload and toolbar Copy assertions below remain unchanged.
+                let expected = if expected.ends_with('\n') {
+                    expected.to_owned()
+                } else {
+                    format!("{expected}\n")
+                };
+                assert_eq!(diff.selected_text(cx), expected, "{side:?} display source");
+            });
+        }
+        diff.update(cx, |diff, cx| diff.set_selected_lines(None, cx));
+    }
+
+    fn assert_comparison_status(view: &Entity<Explorer>, expected: &str, window: &mut Window, cx: &mut App) {
+        window.render_frame(cx);
+        assert!(window.find("payload-diff").visible());
+        let status = window.find("payload-diff-status");
+        assert!(status.visible());
+        assert_eq!(status.label(), Some(expected));
+        assert!(window.try_find("payload-editor").is_none());
+        assert!(view.read(cx).payload_comparison.read(cx).diff().read(cx).files().is_empty());
+    }
+
+    #[gpui_kit::test]
+    fn payload_diff_keeps_source_visible_while_comparisons_are_pending(cx: &mut TestAppContext) {
+        let (handle, view) = cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::appearance::register_bundled(cx).unwrap();
+            super::super::init(cx);
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| {
+                    let mut explorer = Explorer::with_settings(None, None, None, window, cx);
+                    explorer.show_config = false;
+                    explorer.selected = Some("test".into());
+                    for (topic, payload) in [
+                        ("test", "first\n"),
+                        ("test", "second\n"),
+                        ("other", "other first\n"),
+                        ("other", "other second\n"),
+                    ] {
+                        receive_comparison_payload(&mut explorer, topic, payload.as_bytes(), None, window, cx);
+                    }
+                    explorer
+                })
+            })
+            .unwrap()
+        });
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.activate_window();
+            window.render_frame(cx);
+            window.click("diff-value", cx);
+            // Before background work runs, first activation already shows the current source.
+            assert_loaded_comparison(&view, "second\n", "second\n", "plaintext", window, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            assert_loaded_comparison(&view, "first\n", "second\n", "plaintext", window, cx);
+            // Keep the previous comparison visible through multiple superseding requests.
+            for current in ["third\n", "fourth\n"] {
+                view.update(cx, |view, cx| {
+                    receive_comparison_payload(view, "test", current.as_bytes(), None, window, cx)
+                });
+                assert_loaded_comparison(&view, "first\n", "second\n", "plaintext", window, cx);
+                window.click("copy-value", cx);
+                assert_eq!(cx.read_from_clipboard().unwrap().text().unwrap(), current);
+            }
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            assert_loaded_comparison(&view, "third\n", "fourth\n", "plaintext", window, cx);
+            view.update(cx, |view, cx| {
+                receive_comparison_payload(view, "test", b"fourth\n", None, window, cx)
+            });
+            assert_loaded_comparison(&view, "fourth\n", "fourth\n", "plaintext", window, cx);
+            view.update(cx, |view, cx| view.select_topic("other", window, cx));
+            // A topic switch shows its own current source, never the previous topic's diff.
+            assert_loaded_comparison(&view, "other second\n", "other second\n", "plaintext", window, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            assert_loaded_comparison(&view, "other first\n", "other second\n", "plaintext", window, cx);
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn payload_diff_shows_all_unchanged_lines_after_each_live_update(cx: &mut TestAppContext) {
+        let versions = [
+            "old\none\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nold end\n",
+            "new\none\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nnew end\n",
+            "latest\none\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nlatest end\n",
+        ];
+        for mode in [ThemeMode::Light, ThemeMode::Dark] {
+            let (handle, view) = cx.update(|cx| {
+                if !cx.has_global::<Theme>() {
+                    gpui_kit::init(cx);
+                    crate::appearance::register_bundled(cx).unwrap();
+                    super::super::init(cx);
+                }
+                Theme::change(mode, None, cx);
+                gpui_kit::open_window(
+                    WindowOptions {
+                        window_bounds: Some(WindowBounds::Windowed(Bounds::new(Default::default(), size(px(900.), px(900.))))),
+                        ..WindowOptions::default()
+                    },
+                    cx,
+                    |window, cx| {
+                        cx.new(|cx| {
+                            let mut explorer = Explorer::with_settings(None, None, None, window, cx);
+                            explorer.show_config = false;
+                            explorer.selected = Some("test".into());
+                            receive_comparison_payload(&mut explorer, "test", versions[0].as_bytes(), None, window, cx);
+                            explorer
+                        })
+                    },
+                )
+                .unwrap()
+            });
+            cx.run_until_parked();
+            cx.update_window(handle, |_, window, cx| {
+                window.activate_window();
+                window.render_frame(cx);
+                window.click("diff-value", cx);
+            })
+            .unwrap();
+            for pair in versions.windows(2) {
+                cx.update_window(handle, |_, window, cx| {
+                    view.update(cx, |view, cx| {
+                        receive_comparison_payload(view, "test", pair[1].as_bytes(), None, window, cx)
+                    });
+                })
+                .unwrap();
+                cx.run_until_parked();
+                cx.update_window(handle, |_, window, cx| {
+                    assert_loaded_comparison(&view, pair[0], pair[1], "plaintext", window, cx);
+                    let snapshots = gpui_kit::base::test_support::snapshots(window);
+                    let sources: Vec<_> = snapshots
+                        .iter()
+                        .filter(|snapshot| snapshot.path().last() == Some(&gpui_kit::ElementId::from("source")))
+                        .collect();
+                    assert_eq!(
+                        sources.len(),
+                        13,
+                        "every source row, including both changed versions, must be displayed"
+                    );
+                    for text in ["one", "two", "three", "four", "five", "six", "seven", "eight", "nine"] {
+                        assert!(
+                            sources.iter().any(|row| row.label() == Some(text) && row.visible()),
+                            "missing unchanged line {text}"
+                        );
+                    }
+                    assert!(
+                        !snapshots
+                            .iter()
+                            .any(|snapshot| snapshot.label().is_some_and(|label| label.contains("unchanged lines")))
+                    );
+                })
+                .unwrap();
+            }
+        }
+    }
+
+    #[gpui_kit::test]
+    fn payload_diff_font_metrics_and_top_inset_match_editor_across_themes_and_zoom(cx: &mut TestAppContext) {
+        for mode in [ThemeMode::Light, ThemeMode::Dark] {
+            for (font_size, mono_font_size) in [(14., 12.), (18., 16.)] {
+                let (handle, view) = cx.update(|cx| {
+                    if !cx.has_global::<Theme>() {
+                        gpui_kit::init(cx);
+                        crate::appearance::register_bundled(cx).unwrap();
+                        super::super::init(cx);
+                    }
+                    Theme::change(mode, None, cx);
+                    gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                        cx.new(|cx| {
+                            let mut explorer = Explorer::with_settings(None, None, None, window, cx);
+                            explorer.show_config = false;
+                            explorer.selected = Some("test".into());
+                            receive_comparison_payload(&mut explorer, "test", br#"{"reading":1}"#, None, window, cx);
+                            receive_comparison_payload(&mut explorer, "test", br#"{"reading":2}"#, None, window, cx);
+                            explorer
+                        })
+                    })
+                    .inspect(|_| {
+                        Theme::update(cx, |theme| {
+                            theme.font_size = px(font_size);
+                            theme.mono_font_size = px(mono_font_size);
+                        });
+                    })
+                    .unwrap()
+                });
+                cx.run_until_parked();
+                let (editor_inset, editor_character_size) = cx
+                    .update_window(handle, |_, window, cx| {
+                        window.activate_window();
+                        window.render_frame(cx);
+                        let first_row = view.read(cx).payload.read(cx).range_to_bounds(&(0..1)).unwrap();
+                        let inset = first_row.top() - window.find("payload-editor").bounds().top();
+                        window.click("diff-value", cx);
+                        (inset, first_row.size)
+                    })
+                    .unwrap();
+                cx.run_until_parked();
+                cx.update_window(handle, |_, window, cx| {
+                    window.render_frame(cx);
+                    let first_row = gpui_kit::base::test_support::snapshots(window)
+                        .into_iter()
+                        .find(|snapshot| {
+                            snapshot.label() == Some("{") && snapshot.path().last() == Some(&gpui_kit::ElementId::from("source"))
+                        })
+                        .expect("the diff's first source row should be rendered");
+                    let diff_inset = first_row.bounds().top() - window.find("payload-diff").bounds().top();
+                    assert_eq!(diff_inset, editor_inset, "first-row inset in {mode:?} at {font_size}px");
+                    // The source label rounds its layout width up; editor range geometry stays fractional.
+                    assert_eq!(
+                        first_row.bounds().size.width,
+                        px(f32::from(editor_character_size.width).ceil()),
+                        "character width in {mode:?} at {font_size}px"
+                    );
+                    assert_eq!(
+                        first_row.bounds().size.height,
+                        editor_character_size.height,
+                        "line height in {mode:?} at {font_size}px"
+                    );
+                })
+                .unwrap();
+            }
+        }
+    }
+
+    #[gpui_kit::test]
+    fn payload_diff_toggle_supports_pointer_and_space_and_explains_the_first_message(cx: &mut TestAppContext) {
+        for mode in [ThemeMode::Light, ThemeMode::Dark] {
+            let (handle, view) = cx.update(|cx| {
+                if !cx.has_global::<Theme>() {
+                    gpui_kit::init(cx);
+                    crate::appearance::register_bundled(cx).unwrap();
+                    super::super::init(cx);
+                }
+                Theme::change(mode, None, cx);
+                gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                    cx.new(|cx| {
+                        let mut explorer = Explorer::with_settings(None, None, None, window, cx);
+                        explorer.show_config = false;
+                        explorer.selected = Some("test".into());
+                        receive_comparison_payload(&mut explorer, "test", b"first payload", None, window, cx);
+                        explorer
+                    })
+                })
+                .unwrap()
+            });
+            cx.run_until_parked();
+            cx.update_window(handle, |_, window, cx| {
+                window.activate_window();
+                window.render_frame(cx);
+                assert!(!view.read(cx).payload_diff_enabled);
+                assert!(view.read(cx).topics.nodes["test"].previous_value().is_none());
+                let toggle = window.find("diff-value");
+                assert!(toggle.visible());
+                assert_eq!(toggle.checked(), Some(false));
+                assert_eq!(toggle.label(), Some("Compare with previous payload"));
+                let preview = window.find("preview-value").bounds();
+                let diff = toggle.bounds();
+                let edit = window.find("edit-value").bounds();
+                assert!(preview.right() <= diff.left());
+                assert!(diff.right() <= edit.left());
+                assert_eq!(preview.center().y, diff.center().y);
+                assert_eq!(diff.center().y, edit.center().y);
+                assert_eq!(diff.size.width, preview.size.width, "Diff must remain an icon-only toolbar toggle");
+                assert_eq!(diff.left() - preview.right(), edit.left() - diff.right());
+                assert!(window.find("payload-editor").visible());
+                assert!(window.try_find("payload-diff").is_none());
+
+                window.click("diff-value", cx);
+                assert!(view.read(cx).payload_diff_enabled);
+                assert_eq!(window.find("diff-value").checked(), Some(true));
+                assert_eq!(window.find("diff-value").label(), Some("Show latest payload"));
+                assert_eq!(window.find("diff-value").focused(), Some(true));
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.update_window(handle, |_, window, cx| {
+                assert_comparison_status(&view, "No previous payload. Waiting for the next message.", window, cx);
+                window.press("space", cx);
+                assert!(!view.read(cx).payload_diff_enabled);
+                assert_eq!(window.find("diff-value").checked(), Some(false));
+                assert_eq!(window.find("diff-value").label(), Some("Compare with previous payload"));
+                assert!(window.find("payload-editor").visible());
+                assert_eq!(view.read(cx).payload.read(cx).value().as_str(), "first payload");
+                assert!(window.try_find("payload-diff").is_none());
+                window.press("space", cx);
+                assert!(view.read(cx).payload_diff_enabled);
+                assert_eq!(window.find("diff-value").checked(), Some(true));
+                assert_eq!(window.find("diff-value").label(), Some("Show latest payload"));
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.update_window(handle, |_, window, cx| {
+                assert_comparison_status(&view, "No previous payload. Waiting for the next message.", window, cx);
+            })
+            .unwrap();
+        }
+    }
+
+    #[gpui_kit::test]
+    fn payload_diff_rolls_over_live_and_retains_history_while_another_topic_is_selected(cx: &mut TestAppContext) {
+        for mode in [ThemeMode::Light, ThemeMode::Dark] {
+            let (handle, view) = cx.update(|cx| {
+                if !cx.has_global::<Theme>() {
+                    gpui_kit::init(cx);
+                    crate::appearance::register_bundled(cx).unwrap();
+                    super::super::init(cx);
+                }
+                Theme::change(mode, None, cx);
+                gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                    cx.new(|cx| {
+                        let mut explorer = Explorer::with_settings(None, None, None, window, cx);
+                        explorer.show_config = false;
+                        explorer.selected = Some("test".into());
+                        receive_comparison_payload(&mut explorer, "test", b"first\n", None, window, cx);
+                        receive_comparison_payload(&mut explorer, "other", b"other first\n", None, window, cx);
+                        receive_comparison_payload(&mut explorer, "other", b"other second\n", None, window, cx);
+                        explorer
+                    })
+                })
+                .unwrap()
+            });
+            cx.run_until_parked();
+            cx.update_window(handle, |_, window, cx| {
+                window.activate_window();
+                window.render_frame(cx);
+                window.click("diff-value", cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            for (previous, current) in [("first\n", "second\n"), ("second\n", "third\n")] {
+                cx.update_window(handle, |_, window, cx| {
+                    view.update(cx, |view, cx| {
+                        receive_comparison_payload(view, "test", current.as_bytes(), None, window, cx);
+                    });
+                })
+                .unwrap();
+                cx.run_until_parked();
+                cx.update_window(handle, |_, window, cx| {
+                    assert_loaded_comparison(&view, previous, current, "plaintext", window, cx);
+                    assert_eq!(
+                        view.read(cx).topics.nodes["test"].previous_value().unwrap().payload.as_ref(),
+                        previous.as_bytes()
+                    );
+                })
+                .unwrap();
+            }
+            cx.update_window(handle, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    receive_comparison_payload(view, "test", b"third\n", None, window, cx)
+                });
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.update_window(handle, |_, window, cx| {
+                assert_loaded_comparison(&view, "third\n", "third\n", "plaintext", window, cx);
+                window.click("topic:other", cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.update_window(handle, |_, window, cx| {
+                assert_eq!(view.read(cx).selected.as_deref(), Some("other"));
+                assert_loaded_comparison(&view, "other first\n", "other second\n", "plaintext", window, cx);
+            })
+            .unwrap();
+            for current in [b"fourth\n".as_slice(), b"fifth\n".as_slice()] {
+                cx.update_window(handle, |_, window, cx| {
+                    view.update(cx, |view, cx| receive_comparison_payload(view, "test", current, None, window, cx));
+                })
+                .unwrap();
+                cx.run_until_parked();
+                cx.update_window(handle, |_, window, cx| {
+                    assert_eq!(view.read(cx).selected.as_deref(), Some("other"));
+                    assert_loaded_comparison(&view, "other first\n", "other second\n", "plaintext", window, cx);
+                    assert_eq!(view.read(cx).payload.read(cx).value().as_str(), "other second\n");
+                })
+                .unwrap();
+            }
+            cx.update_window(handle, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    receive_comparison_payload(view, "other", b"other third\n", None, window, cx)
+                });
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.update_window(handle, |_, window, cx| {
+                assert_loaded_comparison(&view, "other second\n", "other third\n", "plaintext", window, cx);
+                window.click("topic:test", cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.update_window(handle, |_, window, cx| {
+                assert_eq!(view.read(cx).selected.as_deref(), Some("test"));
+                assert_loaded_comparison(&view, "fourth\n", "fifth\n", "plaintext", window, cx);
+                assert_eq!(
+                    view.read(cx).topics.nodes["test"].previous_value().unwrap().payload.as_ref(),
+                    b"fourth\n"
+                );
+                assert_eq!(
+                    view.read(cx).topics.nodes["other"].previous_value().unwrap().payload.as_ref(),
+                    b"other second\n"
+                );
+            })
+            .unwrap();
+            cx.run_until_parked();
+        }
+    }
+
+    #[gpui_kit::test]
+    fn payload_diff_follows_preview_formatting_and_always_copies_the_latest_raw_payload(cx: &mut TestAppContext) {
+        for mode in [ThemeMode::Light, ThemeMode::Dark] {
+            let (handle, view) = cx.update(|cx| {
+                if !cx.has_global::<Theme>() {
+                    gpui_kit::init(cx);
+                    crate::appearance::register_bundled(cx).unwrap();
+                    super::super::init(cx);
+                }
+                Theme::change(mode, None, cx);
+                gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                    cx.new(|cx| {
+                        let mut explorer = Explorer::with_settings(None, None, None, window, cx);
+                        explorer.show_config = false;
+                        explorer
+                    })
+                })
+                .unwrap()
+            });
+            for (topic, previous_raw, current_raw, previous_preview, current_preview, language) in [
+                (
+                    "json",
+                    "{\"on\":false}",
+                    "{\"on\":true}",
+                    "{\n  \"on\": false\n}",
+                    "{\n  \"on\": true\n}",
+                    "json",
+                ),
+                (
+                    "ansi",
+                    "\x1b[31mold é\x1b[0m",
+                    "\x1b[32mnew 世界\x1b[0m",
+                    "old é",
+                    "new 世界",
+                    "plaintext",
+                ),
+                (
+                    "whitespace",
+                    "{\"on\":true}",
+                    "{ \"on\": true }",
+                    "{\n  \"on\": true\n}",
+                    "{\n  \"on\": true\n}",
+                    "json",
+                ),
+            ] {
+                cx.update_window(handle, |_, window, cx| {
+                    window.activate_window();
+                    view.update(cx, |view, cx| {
+                        receive_comparison_payload(view, topic, previous_raw.as_bytes(), None, window, cx);
+                        receive_comparison_payload(view, topic, current_raw.as_bytes(), None, window, cx);
+                        view.select_topic(topic, window, cx);
+                    });
+                    window.render_frame(cx);
+                    if !view.read(cx).payload_diff_enabled {
+                        window.click("diff-value", cx);
+                    }
+                })
+                .unwrap();
+                cx.run_until_parked();
+                for preview in [true, false, true] {
+                    cx.update_window(handle, |_, window, cx| {
+                        window.render_frame(cx);
+                        if view.read(cx).payload_preview != preview {
+                            window.click("preview-value", cx);
+                        }
+                    })
+                    .unwrap();
+                    cx.run_until_parked();
+                    cx.update_window(handle, |_, window, cx| {
+                        assert_eq!(view.read(cx).payload_preview, preview);
+                        assert_eq!(window.find("preview-value").checked(), Some(preview));
+                        let (previous, current, language) = if preview {
+                            (previous_preview, current_preview, language)
+                        } else {
+                            (previous_raw, current_raw, "plaintext")
+                        };
+                        assert_loaded_comparison(&view, previous, current, language, window, cx);
+                        assert!(view.read(cx).payload_diff_enabled);
+                        assert_eq!(window.find("diff-value").checked(), Some(true));
+                        assert_eq!(view.read(cx).payload.read(cx).value().as_str(), current);
+                        window.click("copy-value", cx);
+                        assert_eq!(cx.read_from_clipboard().unwrap().text().unwrap(), current_raw);
+                    })
+                    .unwrap();
+                    cx.run_until_parked();
+                }
+            }
+        }
+    }
+
+    #[gpui_kit::test]
+    fn payload_diff_is_suppressed_for_binary_and_images_and_explains_a_previous_binary_payload(cx: &mut TestAppContext) {
+        for mode in [ThemeMode::Light, ThemeMode::Dark] {
+            let (handle, view) = cx.update(|cx| {
+                if !cx.has_global::<Theme>() {
+                    gpui_kit::init(cx);
+                    crate::appearance::register_bundled(cx).unwrap();
+                    super::super::init(cx);
+                }
+                Theme::change(mode, None, cx);
+                gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                    cx.new(|cx| {
+                        let mut explorer = Explorer::with_settings(None, None, None, window, cx);
+                        explorer.show_config = false;
+                        explorer.selected = Some("test".into());
+                        receive_comparison_payload(&mut explorer, "test", b"initial text", None, window, cx);
+                        explorer
+                    })
+                })
+                .unwrap()
+            });
+            cx.run_until_parked();
+            cx.update_window(handle, |_, window, cx| {
+                window.activate_window();
+                window.render_frame(cx);
+                window.click("diff-value", cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            for (content_type, payload, inferred) in [
+                (None, b"\xff\x00A".as_slice(), None),
+                (None, b"%PDF-1.7\n".as_slice(), Some("application/pdf")),
+                (None, b"GIF89a".as_slice(), Some("image/gif")),
+                (
+                    Some("image/svg+xml"),
+                    b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"1\" height=\"1\"/>".as_slice(),
+                    None,
+                ),
+                (Some("image/png"), b"invalid image".as_slice(), None),
+            ] {
+                cx.update_window(handle, |_, window, cx| {
+                    view.update(cx, |view, cx| {
+                        receive_comparison_payload(view, "test", payload, content_type, window, cx)
+                    });
+                })
+                .unwrap();
+                cx.run_until_parked();
+                for preview in [true, false] {
+                    cx.update_window(handle, |_, window, cx| {
+                        window.render_frame(cx);
+                        if view.read(cx).payload_preview != preview {
+                            window.click("preview-value", cx);
+                        }
+                    })
+                    .unwrap();
+                    cx.run_until_parked();
+                    cx.update_window(handle, |_, window, cx| {
+                        window.render_frame(cx);
+                        assert_eq!(
+                            view.read(cx).topics.nodes["test"].value.as_ref().unwrap().inferred_content_type(),
+                            inferred
+                        );
+                        assert!(view.read(cx).payload_diff_enabled);
+                        assert!(window.try_find("diff-value").is_none());
+                        assert!(window.try_find("payload-diff").is_none());
+                        assert!(window.try_find("payload-diff-status").is_none());
+                        assert!(view.read(cx).payload_comparison.read(cx).diff().read(cx).files().is_empty());
+                    })
+                    .unwrap();
+                }
+                cx.update_window(handle, |_, window, cx| {
+                    view.update(cx, |view, cx| {
+                        receive_comparison_payload(view, "test", b"now text", None, window, cx)
+                    });
+                })
+                .unwrap();
+                cx.run_until_parked();
+                cx.update_window(handle, |_, window, cx| {
+                    assert_comparison_status(&view, "The previous payload is binary and cannot be compared as text.", window, cx);
+                    assert_eq!(window.find("diff-value").checked(), Some(true));
+                    assert_eq!(window.find("diff-value").label(), Some("Show latest payload"));
+                    assert_eq!(
+                        view.read(cx).topics.nodes["test"].previous_value().unwrap().payload.as_ref(),
+                        payload
+                    );
+                    window.click("copy-value", cx);
+                    assert_eq!(cx.read_from_clipboard().unwrap().text().unwrap(), "now text");
+                    view.update(cx, |view, cx| {
+                        receive_comparison_payload(view, "test", b"next text", None, window, cx)
+                    });
+                })
+                .unwrap();
+                cx.run_until_parked();
+                cx.update_window(handle, |_, window, cx| {
+                    assert_loaded_comparison(&view, "now text", "next text", "plaintext", window, cx);
+                })
+                .unwrap();
+                cx.run_until_parked();
+            }
+        }
+    }
+
+    #[gpui_kit::test]
+    fn payload_diff_rebuilds_when_a_topic_is_deleted_and_recreated_before_refresh(cx: &mut TestAppContext) {
+        let (handle, view) = cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::appearance::register_bundled(cx).unwrap();
+            super::super::init(cx);
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| {
+                    let mut explorer = Explorer::with_settings(None, None, None, window, cx);
+                    explorer.show_config = false;
+                    explorer.selected = Some("test".into());
+                    receive_comparison_payload(&mut explorer, "test", b"old first\n", None, window, cx);
+                    receive_comparison_payload(&mut explorer, "test", b"old second\n", None, window, cx);
+                    explorer
+                })
+            })
+            .unwrap()
+        });
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.activate_window();
+            window.render_frame(cx);
+            window.click("diff-value", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            assert_loaded_comparison(&view, "old first\n", "old second\n", "plaintext", window, cx);
+            view.update(cx, |view, cx| {
+                // Several queued messages can be applied before the next detail refresh.
+                for payload in [b"".as_slice(), b"new first\n", b"new second\n"] {
+                    let mut incoming = message(None);
+                    incoming.payload = Bytes::copy_from_slice(payload);
+                    view.topics.receive(incoming, Instant::now());
+                }
+                assert_eq!(view.topics.nodes["test"].value.as_ref().unwrap().messages, 2);
+                view.refresh_details(window, cx);
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            assert_loaded_comparison(&view, "new first\n", "new second\n", "plaintext", window, cx);
+        })
+        .unwrap();
     }
 
     #[gpui_kit::test]

@@ -44,6 +44,7 @@ use messages::LocalizedError;
 mod monitor;
 mod payload;
 mod payload_ansi;
+mod payload_comparison;
 mod payload_diff;
 mod payload_raw;
 
@@ -243,6 +244,8 @@ pub struct Explorer {
     monitoring: monitor::Monitoring,
     monitor_panes: Entity<ResizableState>,
     payload_preview: bool,
+    payload_diff_enabled: bool,
+    payload_comparison: Entity<payload_comparison::PayloadComparison>,
     payload_raw: Option<Entity<payload_raw::RawPayload>>,
     payload_image: Option<std::sync::Arc<gpui_kit::Image>>,
     payload_format: &'static str,
@@ -548,6 +551,8 @@ impl Explorer {
             monitoring: monitor::Monitoring::default(),
             monitor_panes: cx.new(|_| ResizableState::default()),
             payload_preview: true,
+            payload_diff_enabled: false,
+            payload_comparison: cx.new(payload_comparison::PayloadComparison::new),
             payload_raw: None,
             payload_image: None,
             payload_format: "Text",
@@ -1674,6 +1679,24 @@ impl Explorer {
                                     view.refresh_details(window, cx);
                                 })),
                         )
+                        .when(payload_comparison::is_text_payload(value), |toolbar| {
+                            toolbar.child(
+                                Toggle::new("diff-value")
+                                    .small()
+                                    .icon(AssetIconName::FileDiff)
+                                    .tooltip(if self.payload_diff_enabled {
+                                        "Show latest payload"
+                                    } else {
+                                        "Compare with previous payload"
+                                    })
+                                    .checked(self.payload_diff_enabled)
+                                    .on_click(cx.listener(|view, checked, window, cx| {
+                                        view.payload_diff_enabled = *checked;
+                                        view.clear_payload_highlights(cx);
+                                        view.refresh_details(window, cx);
+                                    })),
+                            )
+                        })
                         .child(
                             Button::new("edit-value")
                                 .ghost()

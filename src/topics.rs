@@ -1,4 +1,4 @@
-//! Latest payloads, aggregate topic counts, and tree traversal.
+//! Current and previous payloads, aggregate topic counts, and tree traversal.
 
 use std::{
     collections::{BTreeMap, BTreeSet, btree_map::Entry},
@@ -123,6 +123,7 @@ impl TopicValue {
 pub struct TopicNode {
     pub children: BTreeSet<String>,
     pub value: Option<TopicValue>,
+    previous_value: Option<TopicValue>,
     pub topics: usize,
     pub messages: u64,
     pub updated: Option<Instant>,
@@ -130,6 +131,10 @@ pub struct TopicNode {
 }
 
 impl TopicNode {
+    pub(crate) fn previous_value(&self) -> Option<&TopicValue> {
+        self.previous_value.as_ref()
+    }
+
     pub fn flashing(&self, now: Instant) -> bool {
         self.updated.is_some_and(|updated| now.duration_since(updated) < FLASH_DURATION)
     }
@@ -163,7 +168,7 @@ pub struct TopicStore {
 }
 
 impl TopicStore {
-    /// Updates the latest value and ancestor counts, returning whether the tree changed.
+    /// Retains the current and previous values and updates ancestor counts, returning whether the tree changed.
     ///
     /// Zero-length publishes remove cached values, matching retained-message deletion.
     /// Empty levels are preserved: `a`, `a/`, `/a` and `a//b` are distinct MQTT topics.
@@ -195,7 +200,7 @@ impl TopicStore {
                 node.children.insert(message.topic[..child_end].to_owned());
             } else {
                 let messages = node.value.as_ref().map_or(1, |value| value.messages + 1);
-                node.value = Some(TopicValue {
+                node.previous_value = node.value.replace(TopicValue {
                     payload: message.payload,
                     qos: message.qos,
                     retained: message.retained,
@@ -215,6 +220,7 @@ impl TopicStore {
         let Some(node) = self.nodes.get_mut(path) else {
             return false;
         };
+        node.previous_value = None;
         let Some(value) = node.value.take() else {
             return false;
         };
@@ -300,6 +306,154 @@ mod tests {
             correlation_data: Some(Bytes::from_static(&[0x00, 0xff])),
             user_properties: vec![("source".into(), "first".into()), ("source".into(), "second".into())],
             subscription_identifiers: vec![3, 9],
+        }
+    }
+
+    #[test]
+    fn receive_retains_only_current_and_previous_values_after_three_messages() {
+        let mut store = TopicStore::default();
+        let now = Instant::now();
+        store.receive(message("home/temperature", b"20"), now);
+        assert!(store.nodes["home/temperature"].previous_value().is_none());
+
+        store.receive(message("home/temperature", b"21"), now);
+        let node = &store.nodes["home/temperature"];
+        assert_eq!(node.value.as_ref().unwrap().payload.as_ref(), b"21");
+        assert_eq!(node.previous_value().unwrap().payload.as_ref(), b"20");
+
+        store.receive(message("home/temperature", b"22"), now);
+        let node = &store.nodes["home/temperature"];
+        assert_eq!(node.value.as_ref().unwrap().payload.as_ref(), b"22");
+        assert_eq!(node.value.as_ref().unwrap().messages, 3);
+        assert_eq!(node.previous_value().unwrap().payload.as_ref(), b"21");
+        assert_eq!(node.previous_value().unwrap().messages, 2);
+        assert_eq!((store.topics, store.messages), (1, 3));
+    }
+
+    #[test]
+    fn receive_rolls_over_previous_value_even_for_identical_messages() {
+        let mut store = TopicStore::default();
+        let now = Instant::now();
+        let received_at = Local::now();
+        for _ in 0..3 {
+            let mut incoming = message("home/temperature", b"21");
+            incoming.received_at = received_at;
+            store.receive(incoming, now);
+        }
+
+        let node = &store.nodes["home/temperature"];
+        let current = node.value.as_ref().unwrap();
+        let previous = node.previous_value().unwrap();
+        assert_eq!(current.payload.as_ref(), b"21");
+        assert_eq!(previous.payload, current.payload);
+        assert_eq!(previous.received_at, current.received_at);
+        assert_eq!(previous.properties, current.properties);
+        assert_eq!((current.messages, previous.messages), (3, 2));
+        assert_eq!((store.topics, store.messages), (1, 3));
+    }
+
+    #[test]
+    fn receive_keeps_previous_values_isolated_between_parent_child_and_sibling_topics() {
+        let mut store = TopicStore::default();
+        let now = Instant::now();
+        for (topic, payload) in [
+            ("home", b"offline".as_slice()),
+            ("home/temperature", b"20"),
+            ("home/humidity", b"40"),
+            ("home", b"online"),
+            ("home/humidity", b"41"),
+            ("home/temperature", b"21"),
+            ("home/temperature", b"22"),
+        ] {
+            store.receive(message(topic, payload), now);
+        }
+
+        for (topic, current, previous) in [
+            ("home", b"online".as_slice(), b"offline".as_slice()),
+            ("home/temperature", b"22", b"21"),
+            ("home/humidity", b"41", b"40"),
+        ] {
+            let node = &store.nodes[topic];
+            assert_eq!(node.value.as_ref().unwrap().payload.as_ref(), current);
+            assert_eq!(node.previous_value().unwrap().payload.as_ref(), previous);
+        }
+        assert_eq!((store.topics, store.messages), (3, 7));
+    }
+
+    #[test]
+    fn deleting_and_recreating_a_pruned_topic_does_not_restore_previous_value() {
+        let mut store = TopicStore::default();
+        let now = Instant::now();
+        store.receive(message("home/temperature", b"20"), now);
+        store.receive(message("home/temperature", b"21"), now);
+        assert!(store.nodes["home/temperature"].previous_value().is_some());
+
+        assert!(store.receive(message("home/temperature", b""), now));
+        assert!(store.nodes.is_empty());
+        assert_eq!((store.topics, store.messages), (0, 0));
+
+        store.receive(message("home/temperature", b"22"), now);
+        let node = &store.nodes["home/temperature"];
+        assert!(node.previous_value().is_none());
+        assert_eq!(node.value.as_ref().unwrap().payload.as_ref(), b"22");
+        assert_eq!(node.value.as_ref().unwrap().messages, 1);
+        assert_eq!((store.topics, store.messages), (1, 1));
+    }
+
+    #[test]
+    fn deleting_and_recreating_a_parent_clears_history_without_changing_child_history() {
+        let mut store = TopicStore::default();
+        let now = Instant::now();
+        store.receive(message("home", b"offline"), now);
+        store.receive(message("home", b"online"), now);
+        store.receive(message("home/temperature", b"20"), now);
+        store.receive(message("home/temperature", b"21"), now);
+        assert!(store.nodes["home"].previous_value().is_some());
+
+        assert!(store.receive(message("home", b""), now));
+        assert!(store.nodes["home"].value.is_none());
+        assert!(store.nodes["home"].previous_value().is_none());
+        assert!(!store.receive(message("home", b""), now));
+        assert_eq!((store.topics, store.messages), (1, 2));
+
+        store.receive(message("home", b"recreated"), now);
+        assert!(store.nodes["home"].previous_value().is_none());
+        assert_eq!(store.nodes["home"].value.as_ref().unwrap().messages, 1);
+        store.receive(message("home", b"updated"), now);
+        assert_eq!(store.nodes["home"].previous_value().unwrap().payload.as_ref(), b"recreated");
+        let child = &store.nodes["home/temperature"];
+        assert_eq!(child.value.as_ref().unwrap().payload.as_ref(), b"21");
+        assert_eq!(child.previous_value().unwrap().payload.as_ref(), b"20");
+        assert_eq!((store.topics, store.messages), (2, 4));
+    }
+
+    #[test]
+    fn previous_value_preserves_metadata_and_payload_detection_and_display() {
+        for (payload, inferred, display) in [
+            (b"\x89PNG\r\n\x1a\n".as_slice(), Some("image/png"), "89 50 4e 47 0d 0a 1a 0a"),
+            (br#"{"on":true}"#.as_slice(), None, "{\n  \"on\": true\n}"),
+            (b"hello".as_slice(), None, "hello"),
+            (&[0xff, 0x00], None, "ff 00"),
+        ] {
+            let mut store = TopicStore::default();
+            let now = Instant::now();
+            let mut incoming = message("test", payload);
+            incoming.qos = 2;
+            incoming.retained = false;
+            incoming.properties = MessageProperties::from_publish(Some(publish_properties()));
+            let received_at = incoming.received_at;
+            store.receive(incoming, now);
+            store.receive(message("test", b"replacement"), now);
+
+            let node = &store.nodes["test"];
+            let previous = node.previous_value().unwrap();
+            assert_eq!(previous.payload.as_ref(), payload);
+            assert_eq!((previous.qos, previous.retained, previous.messages), (2, false, 1));
+            assert_eq!(previous.received_at, received_at);
+            assert_eq!(previous.properties, MessageProperties::from_publish(Some(publish_properties())));
+            assert_eq!(previous.inferred_content_type(), inferred);
+            assert_eq!(previous.display_payload(), display);
+            assert_eq!(node.value.as_ref().unwrap().properties, MessageProperties::default());
         }
     }
 
