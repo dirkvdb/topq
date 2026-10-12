@@ -25,13 +25,13 @@ jobs:
       image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-25.08
       options: --privileged
     env:
-      MISE_DEFAULT_CONFIG_FILENAME: dist/mise.linux.toml
+      MISE_DEFAULT_CONFIG_FILENAME: dist/mise.flatpak.toml
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
 
 
-      - name: Set up mise and packaging tools
+      - name: Set up mise and vendoring tools
         uses: jdx/mise-action@v4
         with:
           version: 2026.10.4

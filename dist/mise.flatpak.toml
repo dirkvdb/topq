@@ -1,0 +1,8 @@
+# Host tools for preparing Flatpak sources; compilation uses the Flatpak SDK.
+[tools]
+just = "1.56.0"
+rust = { version = "1.95.0", profile = "minimal" }
+
+[env]
+RUSTUP_HOME = "{{config_root}}/build/flatpak-tools/rustup-home"
+CARGO_HOME = "{{config_root}}/build/flatpak-tools/cargo-home"

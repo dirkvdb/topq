@@ -21,7 +21,7 @@ Once installed, `mise exec -- just setup-macos` can refresh tools using the same
 configuration selection. There is no separate just installation.
 
 Build commands are directly in the justfile; there are no packaging helper
-scripts. All three platform configs install cargo-binstall before Cargo-backed
+scripts. The macOS, Windows, and AppImage configs install cargo-binstall before Cargo-backed
 tools. Mise uses it to prefer prebuilt cargo-bundle binaries from upstream
 releases, with third-party [cargo-quickinstall](https://github.com/cargo-bins/cargo-quickinstall)
 artifacts also enabled to increase binary availability. This trusts that service's
@@ -152,7 +152,9 @@ can use the runtime's `--appimage-extract-and-run` option. The AppImage is unsig
 Flatpak builds independently of the host's native libraries, using the Freedesktop
 25.08 SDK, its Rust stable and LLVM 20 extensions, and the corresponding runtime.
 It does not use cargo-bundle. Install `flatpak`, `flatpak-builder`, AppStream
-(with compose support), Cargo, and `just` on the host (or use mise with `dist/mise.linux.toml` for Cargo and just).
+(with compose support), Cargo, and `just` on the host (or use mise with
+`dist/mise.flatpak.toml` for Cargo and just). The Flatpak mise configuration
+installs only Rust and just: neither cargo-binstall nor cargo-bundle is needed.
 The Linux devenv shell includes `flatpak`, `flatpak-builder`, and `appstream`;
 re-enter it after updating `devenv.nix` (with direnv, run `direnv reload`).
 `just flatpak` checks these tools and AppStream compose support before vendoring
@@ -207,8 +209,9 @@ flatpak-builder --user --install --force-clean --state-dir=dist/build/flatpak/st
 
 The distribution workflow uses the official
 [`flatpak/flatpak-github-actions/flatpak-builder@v6`](https://github.com/flatpak/flatpak-github-actions)
-action in Flathub's privileged Freedesktop 25.08 container. After vendoring the
-locked Cargo dependencies, the action handles SDK installation, build caching,
+action in Flathub's privileged Freedesktop 25.08 container. The host-side Rust and
+just tools come from `dist/mise.flatpak.toml`, independently of AppImage tooling.
+After vendoring the locked Cargo dependencies, the action handles SDK installation, build caching,
 bundle export, and artifact upload. It builds `TopQ.flatpak` bundles natively for
 x86_64 on `ubuntu-24.04` and aarch64 on `ubuntu-24.04-arm`, uploading separate
 `TopQ-Flatpak-X64` and `TopQ-Flatpak-ARM64` artifacts. A failure on one architecture
