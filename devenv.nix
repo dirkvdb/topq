@@ -1,4 +1,9 @@
-{ pkgs, inputs, lib, ... }:
+{
+  pkgs,
+  inputs,
+  lib,
+  ...
+}:
 {
   tasks."ci:checks" = {
     exec = "just build && just test";
@@ -27,24 +32,33 @@
     ];
   };
 
-  packages = with pkgs; [
-    cargo-nextest
-    just
-    python3
-    sccache
-    pkg-config
-    fontconfig
-    fontconfig.dev
-    vulkan-headers
-    libxkbcommon
-    xorg.libxcb
-  ] ++ lib.optionals pkgs.stdenv.isDarwin [
-    apple-sdk_15
-  ];
+  packages =
+    with pkgs;
+    [
+      cargo-nextest
+      just
+      python3
+      sccache
+      pkg-config
+      fontconfig
+      fontconfig.dev
+      vulkan-headers
+      libxkbcommon
+      xorg.libxcb
+    ]
+    ++ lib.optionals pkgs.stdenv.isLinux [
+      appstream
+      flatpak
+      flatpak-builder
+    ]
+    ++ lib.optionals pkgs.stdenv.isDarwin [
+      apple-sdk_15
+    ];
 
   env = {
     RUSTC_WRAPPER = "${pkgs.sccache}/bin/sccache";
-  } // lib.optionalAttrs pkgs.stdenv.isLinux {
+  }
+  // lib.optionalAttrs pkgs.stdenv.isLinux {
     LD_LIBRARY_PATH = lib.makeLibraryPath [
       pkgs.wayland
       pkgs.libxkbcommon

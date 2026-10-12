@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.dirkvdb.topq</id>
+  <name>TopQ</name>
+  <summary>Explore MQTT topics and messages</summary>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT</project_license>
+  <developer id="io.github.dirkvdb">
+    <name>Dirk Vanden Boer</name>
+  </developer>
+  <description>
+    <p>TopQ is a native MQTT 5 topic explorer for inspecting messages and managing broker connections.</p>
+    <p>Browse a live topic tree, inspect and compare payloads, publish messages, remove retained messages, and chart numeric JSON fields. Connect using MQTT or WebSockets, with optional TLS.</p>
+  </description>
+  <launchable type="desktop-id">io.github.dirkvdb.topq.desktop</launchable>
+  <url type="homepage">https://github.com/dirkvdb/topq</url>
+  <url type="bugtracker">https://github.com/dirkvdb/topq/issues</url>
+  <screenshots>
+    <screenshot type="default">
+      <image>https://raw.githubusercontent.com/dirkvdb/topq/main/data/screenshot-1.png</image>
+      <caption>Browse topics and inspect message payloads</caption>
+    </screenshot>
+  </screenshots>
+  <categories>
+    <category>Network</category>
+    <category>Development</category>
+  </categories>
+  <content_rating type="oars-1.1" />
+</component>

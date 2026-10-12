@@ -147,6 +147,94 @@ build dependency and is not included in the AppImage. Building on Ubuntu 22.04
 does not guarantee compatibility with older distributions. Systems without FUSE
 can use the runtime's `--appimage-extract-and-run` option. The AppImage is unsigned.
 
+## Linux Flatpak
+
+Flatpak builds independently of the host's native libraries, using the Freedesktop
+25.08 SDK, its Rust stable and LLVM 20 extensions, and the corresponding runtime.
+It does not use cargo-bundle. Install `flatpak`, `flatpak-builder`, AppStream
+(with compose support), Cargo, and `just` on the host (or use mise with `dist/mise.linux.toml` for Cargo and just).
+The Linux devenv shell includes `flatpak`, `flatpak-builder`, and `appstream`;
+re-enter it after updating `devenv.nix` (with direnv, run `direnv reload`).
+`just flatpak` checks these tools and AppStream compose support before vendoring
+dependencies. AppStream composition runs on the host during packaging, so the
+SDK's copy of `appstreamcli` does not satisfy this requirement.
+
+On NixOS, also enable Flatpak in your **host NixOS configuration**, rebuild the
+system, and start a new login session if Flatpak was not previously enabled:
+
+```nix
+services.flatpak.enable = true;
+```
+
+Installing CLI tools in a development shell alone does not configure the host
+Flatpak service or desktop integration. On Debian/Ubuntu, install the tools with
+`sudo apt install flatpak flatpak-builder appstream appstream-compose` instead.
+
+From the repository root, set up the user-scoped runtime and SDK:
+
+```sh
+just setup-flatpak
+just flatpak
+```
+
+`setup-flatpak` adds Flathub if needed and installs the runtime, SDK, and Rust/LLVM
+extensions noninteractively for the host architecture (including aarch64). It
+requires network access and may download several gigabytes. It can be rerun safely;
+it does not install host CLI tools or enable the NixOS Flatpak service.
+
+The build first runs `cargo vendor --locked` to prepare all dependencies from
+`Cargo.lock` in `dist/flatpak/vendor/`, with a generated Cargo source configuration.
+This preparation needs network access when dependencies are not already cached.
+The manifest then builds the current checkout with `cargo build --release --frozen`
+inside Flatpak's offline sandbox. Themes and GPUI assets are embedded in the
+binary; the desktop entry, icon, AppStream metadata, and license are installed
+alongside it. The Rust stable SDK extension is updated by Flathub independently
+of the host's mise-pinned toolchain.
+
+The output is `dist/build/flatpak/TopQ.flatpak`. Install and launch it with:
+
+```sh
+flatpak install --user dist/build/flatpak/TopQ.flatpak
+flatpak run io.github.dirkvdb.topq
+```
+
+Run `just flatpak` again after source or lockfile changes. To replace an already
+installed local build from the generated repository, use:
+
+```sh
+flatpak-builder --user --install --force-clean --state-dir=dist/build/flatpak/state --repo=dist/build/flatpak/repo dist/build/flatpak/app dist/flatpak/io.github.dirkvdb.topq.json
+```
+
+The distribution workflow uses the official
+[`flatpak/flatpak-github-actions/flatpak-builder@v6`](https://github.com/flatpak/flatpak-github-actions)
+action in Flathub's privileged Freedesktop 25.08 container. After vendoring the
+locked Cargo dependencies, the action handles SDK installation, build caching,
+bundle export, and artifact upload. It builds an x86_64 `TopQ.flatpak` bundle and
+uploads it as `TopQ-Flatpak-X64`. Local builds still use `just flatpak` and target
+the host architecture. Build state, the
+local repository, vendored dependencies, and generated Cargo configuration are
+ignored by Git. These are local/CI bundles, not a Flathub submission: the manifest
+uses the checkout and locally vendored sources rather than release archives.
+Bundles are unsigned.
+
+### Sandbox and data
+
+The stable application ID is `io.github.dirkvdb.topq`. Networking is enabled for
+broker connections; Wayland, fallback X11 (with shared IPC), and GPU access are
+enabled for GPUI rendering. No home-directory or host-filesystem access is granted.
+The sandbox has its own configuration and data directories:
+
+- Settings: `~/.var/app/io.github.dirkvdb.topq/config/topq/config.json`
+- Custom themes: `~/.var/app/io.github.dirkvdb.topq/config/topq/themes/`
+
+Native configuration is not copied automatically. Copy settings and custom themes
+into these directories manually if needed. Passwords must be re-entered: Linux
+credential storage uses the Secret portal inside Flatpak, requiring a host portal
+backend that implements `org.freedesktop.portal.Secret` and an available, unlocked
+credential store. No direct `org.freedesktop.secrets` D-Bus permission is granted.
+Do not change the application ID for routine updates, since the portal's encryption
+key and sandbox data are scoped to that ID.
+
 ## Shared icons
 
 All platforms use the prepared icons in `dist/`. To regenerate them from

@@ -1,0 +1,66 @@
+{
+  "app-id": "io.github.dirkvdb.topq",
+  "runtime": "org.freedesktop.Platform",
+  "runtime-version": "25.08",
+  "sdk": "org.freedesktop.Sdk",
+  "sdk-extensions": [
+    "org.freedesktop.Sdk.Extension.rust-stable",
+    "org.freedesktop.Sdk.Extension.llvm20"
+  ],
+  "command": "topq",
+  "finish-args": [
+    "--share=network",
+    "--share=ipc",
+    "--socket=wayland",
+    "--socket=fallback-x11",
+    "--device=dri"
+  ],
+  "build-options": {
+    "append-path": "/usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm20/bin",
+    "env": {
+      "CARGO_HOME": "/run/build/topq/cargo-home",
+      "LIBCLANG_PATH": "/usr/lib/sdk/llvm20/lib"
+    }
+  },
+  "modules": [
+    {
+      "name": "topq",
+      "buildsystem": "simple",
+      "build-commands": [
+        "cargo build --release --frozen --bin topq",
+        "install -Dm755 target/release/topq /app/bin/topq",
+        "desktop-file-edit --set-icon=io.github.dirkvdb.topq topq.desktop",
+        "install -Dm644 topq.desktop /app/share/applications/io.github.dirkvdb.topq.desktop",
+        "install -Dm644 icon_512x512.png /app/share/icons/hicolor/512x512/apps/io.github.dirkvdb.topq.png",
+        "install -Dm644 io.github.dirkvdb.topq.metainfo.xml /app/share/metainfo/io.github.dirkvdb.topq.metainfo.xml",
+        "install -Dm644 LICENSE /app/share/licenses/topq/LICENSE"
+      ],
+      "sources": [
+        {
+          "type": "dir",
+          "path": "../..",
+          "skip": [".git", ".agents", ".devenv", ".direnv", ".flatpak-builder", "target", "dist"]
+        },
+        {
+          "type": "dir",
+          "path": "vendor",
+          "dest": "dist/flatpak/vendor"
+        },
+        {
+          "type": "file",
+          "path": "cargo-config.toml",
+          "dest": ".cargo",
+          "dest-filename": "config.toml"
+        },
+        {
+          "type": "file",
+          "path": "../icon_512x512.png"
+        },
+        {
+          "type": "file",
+          "path": "io.github.dirkvdb.topq.metainfo.xml"
+        }
+      ]
+    }
+  ]
+}

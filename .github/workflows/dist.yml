@@ -9,6 +9,38 @@ permissions:
   contents: read
 
 jobs:
+  flatpak:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-25.08
+      options: --privileged
+    env:
+      MISE_DEFAULT_CONFIG_FILENAME: dist/mise.linux.toml
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+
+      - name: Set up mise and packaging tools
+        uses: jdx/mise-action@v4
+        with:
+          version: 2026.10.4
+          cache: false
+
+      - name: Vendor locked Cargo dependencies
+        run: mise exec -- just flatpak-vendor
+
+      - name: Build and upload Linux Flatpak
+        uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          manifest-path: dist/flatpak/io.github.dirkvdb.topq.json
+          bundle: TopQ.flatpak
+          artifact-name: TopQ-Flatpak-${{ runner.arch }}
+          build-dir: dist/build/flatpak/app
+          repo-dir: dist/build/flatpak/repo
+          state-dir: dist/build/flatpak/state
+
   macos:
     runs-on: macos-latest
     timeout-minutes: 45

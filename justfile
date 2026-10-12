@@ -51,6 +51,32 @@ appimage:
     mise exec -- cargo build --release --locked --bin topq
     CARGO_BUNDLE_SKIP_BUILD=1 mise exec -- cargo bundle --release --format appimage
 
+# Prepare locked dependencies for Flatpak's offline build sandbox.
+[linux]
+flatpak-vendor:
+    cargo vendor --locked --versioned-dirs dist/flatpak/vendor > dist/flatpak/cargo-config.toml
+
+# Check host tools before the potentially expensive dependency preparation.
+[linux]
+[private]
+flatpak-check:
+    @command -v flatpak >/dev/null 2>&1 || { echo "Missing flatpak. Install Flatpak or re-enter the Linux devenv shell; see dist/README.md." >&2; exit 1; }
+    @command -v flatpak-builder >/dev/null 2>&1 || { echo "Missing flatpak-builder. Install it or re-enter the Linux devenv shell; see dist/README.md." >&2; exit 1; }
+    @command -v appstreamcli >/dev/null 2>&1 || { echo "Missing appstreamcli. Install AppStream or re-enter the Linux devenv shell; see dist/README.md." >&2; exit 1; }
+    @appstreamcli compose --help >/dev/null 2>&1 || { echo "Missing AppStream compose support. Install appstream-compose or re-enter the Linux devenv shell; see dist/README.md." >&2; exit 1; }
+
+# Install the user-scoped runtime and SDK for the host architecture.
+[linux]
+setup-flatpak: flatpak-check
+    flatpak remote-add --user --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+    flatpak install --user --noninteractive flathub org.freedesktop.Platform//25.08 org.freedesktop.Sdk//25.08 org.freedesktop.Sdk.Extension.rust-stable//25.08 org.freedesktop.Sdk.Extension.llvm20//25.08
+
+# Build and export a local Flatpak bundle; run setup-flatpak first.
+[linux]
+flatpak: flatpak-check flatpak-vendor
+    flatpak-builder --user --force-clean --state-dir=dist/build/flatpak/state --repo=dist/build/flatpak/repo dist/build/flatpak/app dist/flatpak/io.github.dirkvdb.topq.json
+    flatpak build-bundle dist/build/flatpak/repo dist/build/flatpak/TopQ.flatpak io.github.dirkvdb.topq --runtime-repo=https://flathub.org/repo/flathub.flatpakrepo
+
 # Refresh bundled themes from the source revision of gpui-kit in Cargo.lock.
 sync-themes:
     python3 scripts/sync_gpui.py themes
