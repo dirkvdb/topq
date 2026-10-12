@@ -61,8 +61,6 @@ pub(super) struct TopicRow {
     preview: RowPreview,
     state: RowState,
     _subscriptions: [Subscription; 2],
-    #[cfg(test)]
-    pub(super) render_count: usize,
 }
 
 impl TopicRow {
@@ -89,8 +87,6 @@ impl TopicRow {
                 cx.observe(explorer, |_, _, cx| cx.notify()),
                 cx.observe(&tree_state, |_, _, cx| cx.notify()),
             ],
-            #[cfg(test)]
-            render_count: 0,
         }
     }
 
@@ -192,10 +188,6 @@ impl TopicRow {
 
 impl Render for TopicRow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        #[cfg(test)]
-        {
-            self.render_count += 1;
-        }
         let Some(explorer) = self.explorer.upgrade() else {
             return div().into_any_element();
         };

@@ -16,7 +16,7 @@ anstyle-parse = "1"
 bytes = "1"
 chrono = "0.4"
 directories = "6"
-gpui-kit = { version = "0.7", features = ["tree-sitter"] }
+gpui-kit = { version = "0.7", features = ["tree-sitter", "gpui-fast"] }
 infer = { version = "0.22", default-features = false }
 keyring = { version = "4.2", default-features = false, features = ["v1"] }
 rumqttc = { version = "0.25", default-features = false, features = ["use-rustls", "websocket"] }

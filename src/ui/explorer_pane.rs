@@ -16,8 +16,6 @@ pub(super) struct ExplorerPane {
     explorer: WeakEntity<Explorer>,
     kind: ExplorerPaneKind,
     _subscription: Subscription,
-    #[cfg(test)]
-    pub(super) render_count: usize,
 }
 
 impl ExplorerPane {
@@ -29,18 +27,12 @@ impl ExplorerPane {
             explorer: explorer.downgrade(),
             kind,
             _subscription: subscription,
-            #[cfg(test)]
-            render_count: 0,
         }
     }
 }
 
 impl Render for ExplorerPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        #[cfg(test)]
-        {
-            self.render_count += 1;
-        }
         let Some(explorer) = self.explorer.upgrade() else {
             return div().into_any_element();
         };
