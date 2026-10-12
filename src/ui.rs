@@ -1311,8 +1311,6 @@ impl Explorer {
                             resizable_panel()
                                 .size_range(rems(4.5).to_pixels(window.rem_size())..gpui_kit::Pixels::MAX)
                                 .min_w_0()
-                                // A cached ancestor refreshes all nested caches when dirty.
-                                // Keep this composition uncached so row caches stay independent.
                                 .child(self.topics_view.clone()),
                         )
                         .child(
@@ -1335,7 +1333,7 @@ impl Explorer {
                                 .min_w_0()
                                 .flex_grow_0()
                                 .flex_shrink_1()
-                                .child(self.publish_view.clone().cached(StyleRefinement::default().size_full())),
+                                .child(self.publish_view.clone()),
                         ),
                 ),
             )
@@ -1433,7 +1431,7 @@ impl Explorer {
                                                 .entry(entry.item().id.clone())
                                                 .or_insert_with(|| cx.new(|cx| TopicRow::new(&view, entry, interaction, cx)))
                                                 .clone();
-                                            row.update(cx, |row, cx| row.sync(entry, interaction, view.read(cx), cx));
+                                            TopicRow::sync(&row, entry, interaction, &view, cx);
                                             row.cached(StyleRefinement::default().w_full().h(rems(1.5))).into_any_element()
                                         })
                                         .list_style(StyleRefinement::default().flex_grow_1().size_full())
@@ -1786,11 +1784,7 @@ impl Explorer {
             .v_flex()
             .size_full()
             .min_w_0()
-            .child(
-                self.header_view
-                    .clone()
-                    .cached(StyleRefinement::default().w_full().h(TITLE_BAR_HEIGHT).flex_none()),
-            )
+            .child(self.header_view.clone())
             .child(
                 div().flex_1().min_h_0().min_w_0().child(
                     h_resizable("panes")
@@ -1804,7 +1798,7 @@ impl Explorer {
                         .child(
                             resizable_panel()
                                 .size_range(rems(if self.publish_open { 18. } else { 20. }).to_pixels(rem)..gpui_kit::Pixels::MAX)
-                                .child(self.details_view.clone().cached(StyleRefinement::default().size_full())),
+                                .child(self.details_view.clone()),
                         ),
                 ),
             )

@@ -1,4 +1,4 @@
-//! Retained render boundaries keep animated panes from rebuilding their siblings.
+//! Retained pane entities provide independent rendering and notification boundaries.
 
 use gpui_kit::{Context, Entity, IntoElement, Render, Subscription, WeakEntity, Window, div};
 

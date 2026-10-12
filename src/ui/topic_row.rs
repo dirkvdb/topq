@@ -106,12 +106,17 @@ impl TopicRow {
         }
     }
 
-    pub(super) fn sync(&mut self, entry: &TreeEntry, interaction: TreeEntryState, explorer: &Explorer, cx: &App) {
-        let state = RowState::new(entry, interaction, explorer, cx);
-        if self.state != state {
-            self.state = state;
-            self.preview = Self::preview(&self.path, explorer, state.inline_payload, state.max_chars);
+    pub(super) fn sync(row: &Entity<Self>, entry: &TreeEntry, interaction: TreeEntryState, explorer: &Entity<Explorer>, cx: &mut App) {
+        let state = RowState::new(entry, interaction, explorer.read(cx), cx);
+        // Fast tracks update leases as writes, even when the closure changes nothing.
+        if row.read(cx).state == state {
+            return;
         }
+        let preview = Self::preview(&row.read(cx).path, explorer.read(cx), state.inline_payload, state.max_chars);
+        row.update(cx, |row, _| {
+            row.state = state;
+            row.preview = preview;
+        });
     }
 
     pub(super) fn item(&self, explorer: &Explorer, cx: &App) -> ListItem {
