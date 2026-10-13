@@ -3347,6 +3347,50 @@ fn settings_block_dragging_the_underlying_pane_divider(cx: &mut TestAppContext) 
 }
 
 #[gpui_kit::test]
+fn settings_sections_keep_icons_and_labels_left_aligned_across_selection_and_zoom(cx: &mut TestAppContext) {
+    for theme in [ThemeMode::Light, ThemeMode::Dark] {
+        for (width, font_size) in [(760., 16.), (760., 20.), (1200., 16.), (1200., 20.)] {
+            let (handle, _) = open(cx, false, width, 540.);
+            cx.update(|cx| {
+                Theme::change(theme, None, cx);
+                Theme::update(cx, |theme| theme.font_size = px(font_size));
+            });
+            cx.update_window(handle, |_, window, cx| {
+                window.render_frame(cx);
+                window.click("settings", cx);
+                for selected in ["connections", "appearance", "about"] {
+                    window.click(format!("settings-section-{selected}"), cx);
+                    window.render_frame(cx);
+                    let mut leading_edges = None;
+                    for (section, title) in [("connections", "Connections"), ("appearance", "Appearance"), ("about", "About")] {
+                        let button = window.find(format!("settings-section-{section}"));
+                        assert_eq!(button.label(), Some(title));
+                        let icon = window.find(format!("settings-section-{section}-icon"));
+                        let label = window.find(format!("settings-section-{section}-label"));
+                        assert!(icon.visible() && label.visible());
+                        let icon = icon.bounds();
+                        let label = label.bounds();
+                        assert_eq!(icon.size, size(window.rem_size(), window.rem_size()));
+                        assert_eq!(icon.left() - button.bounds().left(), window.rem_size() * 0.5);
+                        assert_eq!(label.left() - icon.right(), window.rem_size() * 0.5);
+                        assert_eq!(icon.center().y, button.bounds().center().y);
+                        assert!((label.center().y - button.bounds().center().y).abs() <= px(0.5));
+                        assert!(label.right() <= button.bounds().right());
+                        let edges = (icon.left(), label.left());
+                        if let Some(expected) = leading_edges {
+                            assert_eq!(edges, expected, "sidebar icons and labels should share leading edges");
+                        }
+                        leading_edges = Some(edges);
+                    }
+                }
+                window.click("close-settings", cx);
+            })
+            .unwrap();
+        }
+    }
+}
+
+#[gpui_kit::test]
 fn settings_tab_navigation_stays_within_the_settings_surface(cx: &mut TestAppContext) {
     let (handle, view) = open(cx, false, 760., 540.);
     cx.update_window(handle, |_, window, cx| {
@@ -3369,6 +3413,30 @@ fn settings_tab_navigation_stays_within_the_settings_surface(cx: &mut TestAppCon
         assert!(window.find("appearance-mode").visible());
         assert!(window.try_find("connections-overview").is_none());
 
+        window.press("tab", cx);
+        window.render_frame(cx);
+        assert_eq!(window.find("settings-section-about").focused(), Some(true));
+        window.press("enter", cx);
+        window.render_frame(cx);
+        assert!(window.find("about-application").visible());
+        assert!(window.try_find("appearance-mode").is_none());
+        window.press("tab", cx);
+        window.render_frame(cx);
+        assert!(view.read(cx).settings_focus.contains_focused(window, cx));
+        window.press("enter", cx);
+        window.press("tab", cx);
+        window.render_frame(cx);
+        assert_eq!(window.find("close-settings").focused(), Some(true));
+        window.press("shift-tab", cx);
+        window.render_frame(cx);
+        assert!(view.read(cx).settings_focus.contains_focused(window, cx));
+        window.press("shift-tab", cx);
+        window.render_frame(cx);
+        assert_eq!(window.find("settings-section-about").focused(), Some(true));
+        window.press("shift-tab", cx);
+        window.render_frame(cx);
+        assert_eq!(window.find("settings-section-appearance").focused(), Some(true));
+
         window.press("shift-tab", cx);
         window.render_frame(cx);
         assert_eq!(window.find("settings-section-connections").focused(), Some(true));
@@ -3381,6 +3449,96 @@ fn settings_tab_navigation_stays_within_the_settings_surface(cx: &mut TestAppCon
         window.click("close-settings", cx);
     })
     .unwrap();
+    assert_eq!(cx.opened_url().as_deref(), Some("https://github.com/dirkvdb/topq"));
+}
+
+#[gpui_kit::test]
+fn about_source_code_link_opens_the_repository_but_the_github_icon_does_not(cx: &mut TestAppContext) {
+    let (handle, _) = open(cx, false, 760., 540.);
+    assert!(cx.opened_url().is_none());
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("settings", cx);
+        window.click("settings-section-about", cx);
+        window.click("about-github-icon", cx);
+        assert!(window.find("settings-dialog").visible());
+    })
+    .unwrap();
+    assert!(cx.opened_url().is_none(), "the GitHub icon is not part of the link");
+    cx.update_window(handle, |_, window, cx| {
+        window.click("about-github-label", cx);
+        assert!(window.find("settings-dialog").visible());
+    })
+    .unwrap();
+    assert_eq!(cx.opened_url().as_deref(), Some("https://github.com/dirkvdb/topq"));
+}
+
+#[gpui_kit::test]
+fn about_settings_displays_the_bundled_logo_and_package_version(cx: &mut TestAppContext) {
+    for theme in [ThemeMode::Light, ThemeMode::Dark] {
+        for (width, font_size) in [(760., 16.), (760., 20.), (1200., 16.), (1200., 20.)] {
+            let (handle, view) = open(cx, false, width, 540.);
+            cx.update(|cx| {
+                Theme::change(theme, None, cx);
+                Theme::update(cx, |theme| theme.font_size = px(font_size));
+            });
+            cx.update_window(handle, |_, window, cx| {
+                window.render_frame(cx);
+                window.click("settings", cx);
+                let about = window.find("settings-section-about").bounds();
+                let appearance = window.find("settings-section-appearance").bounds();
+                assert_eq!(about.left(), appearance.left());
+                assert!(about.top() > appearance.bottom());
+                window.click("settings-section-about", cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.update_window(handle, |_, window, cx| {
+                window.render_frame(cx);
+                assert_eq!(view.read(cx).settings_page_ix, 2);
+                assert!(window.find("about-application").visible());
+                assert!(window.find("about-logo").visible());
+                assert!(window.find("about-github").visible());
+                assert_eq!(window.find("about-github").label(), Some("Source code"));
+                assert_eq!(window.find("about-logo").label(), Some("TopQ logo"));
+                assert_eq!(
+                    window.find("about-version").label(),
+                    Some(concat!("Version ", env!("CARGO_PKG_VERSION"))),
+                );
+                let logo = window.find("about-logo").bounds();
+                let version = window.find("about-version").bounds();
+                let settings = window.find("settings-dialog").bounds();
+                assert_eq!(logo.size, size(window.rem_size() * 6., window.rem_size() * 6.));
+                assert!(logo.left() >= settings.left() && logo.top() >= settings.top());
+                assert_eq!(version.left() - logo.right(), window.rem_size());
+                assert!(version.right() <= settings.right() && version.bottom() <= settings.bottom());
+                let github = window.find("about-github").bounds();
+                assert_eq!(github.left(), version.left());
+                let github_icon = window.find("about-github-icon");
+                assert!(github_icon.visible());
+                let github_icon = github_icon.bounds();
+                let github_label = window.find("about-github-label").bounds();
+                assert_eq!(github_icon.size, size(window.rem_size(), window.rem_size()));
+                assert_eq!(github_icon.left(), github.left());
+                assert_eq!(github_label.left() - github_icon.right(), window.rem_size() * 0.5);
+                assert!((github_icon.center().y - github.center().y).abs() <= px(0.5));
+                assert_eq!(github.top() - version.bottom(), window.rem_size() * 0.25);
+                assert!(github.right() <= settings.right() && github.bottom() <= settings.bottom());
+                assert!(window.try_find("appearance-mode").is_none());
+                assert!(window.try_find("connections-overview").is_none());
+                window.click("settings-section-appearance", cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.update_window(handle, |_, window, cx| {
+                window.render_frame(cx);
+                assert!(window.find("appearance-mode").visible());
+                assert!(window.try_find("about-application").is_none());
+                window.click("close-settings", cx);
+            })
+            .unwrap();
+        }
+    }
 }
 
 #[gpui_kit::test]
@@ -6693,8 +6851,15 @@ fn close_settings_button_still_closes_the_new_connection_view(cx: &mut TestAppCo
 }
 
 #[gpui_kit::test]
-fn escape_closes_settings_from_the_overview_appearance_and_connection_controls(cx: &mut TestAppContext) {
-    for target in [None, Some("appearance"), Some("name"), Some("password"), Some("toggle-password")] {
+fn escape_closes_settings_from_the_overview_appearance_about_and_connection_controls(cx: &mut TestAppContext) {
+    for target in [
+        None,
+        Some("appearance"),
+        Some("about"),
+        Some("name"),
+        Some("password"),
+        Some("toggle-password"),
+    ] {
         let (handle, view) = open(cx, false, 1200., 1600.);
         let mut previous_focus = None;
         cx.update_window(handle, |_, window, cx| {
@@ -6703,6 +6868,7 @@ fn escape_closes_settings_from_the_overview_appearance_and_connection_controls(c
             window.click("settings", cx);
             match target {
                 Some("appearance") => window.click("settings-section-appearance", cx),
+                Some("about") => window.click("settings-section-about", cx),
                 Some(id) => {
                     window.click("edit-connection:0", cx);
                     window.click(id, cx);

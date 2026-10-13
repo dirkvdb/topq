@@ -1,5 +1,7 @@
 //! Settings pages and broker management for the explorer.
 
+use std::sync::Arc;
+
 use super::{ConnectionStatus, ConnectionTestStatus, Explorer, connection_label, messages::LocalizedError};
 use crate::{
     appearance::{self, Appearance, AppearanceMode, ReduceMotion},
@@ -8,6 +10,7 @@ use crate::{
     mqtt::{self, Qos},
 };
 use gpui_kit::assets::IconName as AssetIconName;
+use gpui_kit::base::Link;
 use gpui_kit::component::{
     ActiveTheme, AxisExt, Disableable, FocusTrapElement, Icon, IconName, Sizable, StyledExt, ThemeMode, ThemeRegistry, WindowExt,
     button::{Button, ButtonVariant, ButtonVariants},
@@ -24,10 +27,58 @@ use gpui_kit::component::{
     tooltip::Tooltip,
 };
 use gpui_kit::{
-    AnyElement, App, AvailableSpace, Bounds, Context, Element, ElementId, Entity, GlobalElementId, InspectorElementId, IntoElement,
-    LayoutId, MouseButton, Pixels, Role, SharedString, Style, TestSupportExt, WeakEntity, Window, div, prelude::*, px, relative, rems,
-    size,
+    AnyElement, App, Asset, AvailableSpace, Bounds, Context, Element, ElementId, Entity, GlobalElementId, ImageCacheError,
+    InspectorElementId, IntoElement, LayoutId, MouseButton, ObjectFit, Pixels, RenderImage, Role, SharedString, Style, StyledImage,
+    TestSupportExt, WeakEntity, Window, div, img, prelude::*, px, relative, rems, size,
 };
+
+const ABOUT_LOGO_SIZE_REM: f32 = 6.;
+
+struct AboutLogo;
+
+impl AboutLogo {
+    fn pixel_size(rem_size: Pixels, scale_factor: f32) -> u32 {
+        f32::from(rem_size * ABOUT_LOGO_SIZE_REM * scale_factor).ceil().max(1.) as u32
+    }
+}
+
+impl Asset for AboutLogo {
+    type Source = u32;
+    type Output = Result<Arc<RenderImage>, ImageCacheError>;
+
+    #[expect(clippy::manual_async_fn, reason = "Asset futures must not capture the non-Send App reference.")]
+    fn load(side: Self::Source, _: &mut App) -> impl std::future::Future<Output = Self::Output> + Send + 'static {
+        async move {
+            let mut source =
+                image::load_from_memory_with_format(include_bytes!("../../data/logo.png"), image::ImageFormat::Png)?.to_rgba32f();
+            // Filter premultiplied alpha so transparent pixels cannot darken the logo's edges.
+            for pixel in source.pixels_mut() {
+                let alpha = pixel.0[3];
+                for channel in &mut pixel.0[..3] {
+                    *channel *= alpha;
+                }
+            }
+            let mut resized = image::imageops::resize(&source, side, side, image::imageops::FilterType::Lanczos3);
+            for pixel in resized.pixels_mut() {
+                let alpha = pixel.0[3];
+                if alpha > 0. {
+                    for channel in &mut pixel.0[..3] {
+                        *channel = (*channel / alpha).clamp(0., 1.);
+                    }
+                    pixel.0[3] = alpha.min(1.);
+                } else {
+                    pixel.0 = [0.; 4];
+                }
+            }
+            let mut bgra = image::DynamicImage::ImageRgba32F(resized).to_rgba8();
+            // GPUI's render images use BGRA, with straight alpha.
+            for pixel in bgra.pixels_mut() {
+                pixel.0.swap(0, 2);
+            }
+            Ok(Arc::new(RenderImage::new(vec![image::Frame::new(bgra)])))
+        }
+    }
+}
 
 // The native header's title row shrink-wraps its suffix. A large preferred width with a zero
 // minimum lets that row fill the page without overflowing or replacing its full-width divider.
@@ -1384,6 +1435,87 @@ impl Explorer {
         SettingPage::new("Appearance").resettable(false).group(group)
     }
 
+    fn about_page(&self) -> SettingPage {
+        SettingPage::new("About").resettable(false).group(
+            SettingGroup::new().item(
+                SettingItem::render(|_, _, cx| {
+                    let link_color = cx.theme().link;
+                    let focus_background = cx.theme().muted;
+                    div()
+                        .id("about-application")
+                        .test_support()
+                        .h_flex()
+                        .items_center()
+                        .gap_4()
+                        .child(
+                            div()
+                                .id("about-logo")
+                                .test_support()
+                                .aria_label("TopQ logo")
+                                .size(rems(ABOUT_LOGO_SIZE_REM))
+                                .flex_none()
+                                .child(
+                                    img(|window: &mut Window, cx: &mut App| {
+                                        let side = AboutLogo::pixel_size(window.rem_size(), window.scale_factor());
+                                        window.use_asset::<AboutLogo>(&side, cx)
+                                    })
+                                    .size_full()
+                                    .object_fit(ObjectFit::Contain),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .v_flex()
+                                .min_w_0()
+                                .gap_1()
+                                .child(Label::new("TopQ").text_lg().font_semibold())
+                                .child(
+                                    div()
+                                        .id("about-version")
+                                        .test_support()
+                                        .aria_label(concat!("Version ", env!("CARGO_PKG_VERSION")))
+                                        .text_sm()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(concat!("Version ", env!("CARGO_PKG_VERSION"))),
+                                )
+                                .child(
+                                    div()
+                                        .id("about-github")
+                                        .test_support()
+                                        .aria_label("Source code")
+                                        .h_flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .id("about-github-icon")
+                                                .test_support()
+                                                .size_4()
+                                                .flex_none()
+                                                .child(Icon::new(AssetIconName::Github).size_4()),
+                                        )
+                                        .child(
+                                            Link::new("about-github-link")
+                                                .accessibility_label("Source code")
+                                                .href("https://github.com/dirkvdb/topq")
+                                                .open_with(|url, _, _, cx| cx.open_url(url))
+                                                .text_sm()
+                                                .text_color(link_color)
+                                                .text_decoration_1()
+                                                .cursor_pointer()
+                                                .hover(move |this| this.text_color(link_color.opacity(0.8)))
+                                                .active(move |this| this.text_color(link_color.opacity(0.6)))
+                                                .focus_visible(move |this| this.bg(focus_background).text_decoration_2())
+                                                .child(div().id("about-github-label").test_support().child("Source code")),
+                                        ),
+                                ),
+                        )
+                })
+                .keywords(["about", "TopQ", "version", "GitHub", "source", "code"]),
+            ),
+        )
+    }
+
     fn appearance_setting(
         id: &'static str,
         title: &'static str,
@@ -1549,6 +1681,31 @@ impl Explorer {
         cx.notify();
     }
 
+    fn settings_section_label(section: &'static str, label: &'static str, icon: AssetIconName) -> impl IntoElement {
+        div()
+            .h_flex()
+            .w_full()
+            .min_w_0()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .id(SharedString::from(format!("settings-section-{section}-icon")))
+                    .test_support()
+                    .size_4()
+                    .flex_none()
+                    .child(Icon::new(icon).size_4()),
+            )
+            .child(
+                div()
+                    .id(SharedString::from(format!("settings-section-{section}-label")))
+                    .test_support()
+                    .min_w_0()
+                    .text_ellipsis()
+                    .child(label),
+            )
+    }
+
     pub(super) fn settings_dialog(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mut search_header = div().hidden();
         let search_header_style = search_header.style().clone();
@@ -1556,6 +1713,7 @@ impl Explorer {
         let sidebar_style = hidden_sidebar.style().clone();
         let connections_view = cx.weak_entity();
         let appearance_view = cx.weak_entity();
+        let about_view = cx.weak_entity();
         let settings_page_ix = self.settings_page_ix;
 
         div()
@@ -1623,7 +1781,8 @@ impl Explorer {
                                             .justify_start()
                                             .ghost()
                                             .when(settings_page_ix == 0, |button| button.secondary())
-                                            .label("Connections")
+                                            .accessibility_label("Connections")
+                                            .child(Self::settings_section_label("connections", "Connections", AssetIconName::Network))
                                             .on_click(move |_, _, cx| {
                                                 _ = connections_view.update(cx, |view, cx| view.select_settings_page(0, cx));
                                             }),
@@ -1635,16 +1794,30 @@ impl Explorer {
                                             .justify_start()
                                             .ghost()
                                             .when(settings_page_ix == 1, |button| button.secondary())
-                                            .label("Appearance")
+                                            .accessibility_label("Appearance")
+                                            .child(Self::settings_section_label("appearance", "Appearance", AssetIconName::Palette))
                                             .on_click(move |_, _, cx| {
                                                 _ = appearance_view.update(cx, |view, cx| view.select_settings_page(1, cx));
+                                            }),
+                                    )
+                                    .child(
+                                        Button::new("settings-section-about")
+                                            .small()
+                                            .w_full()
+                                            .justify_start()
+                                            .ghost()
+                                            .when(settings_page_ix == 2, |button| button.secondary())
+                                            .accessibility_label("About")
+                                            .child(Self::settings_section_label("about", "About", AssetIconName::Info))
+                                            .on_click(move |_, _, cx| {
+                                                _ = about_view.update(cx, |view, cx| view.select_settings_page(2, cx));
                                             }),
                                     ),
                             )
                             .child(
                                 div().flex_1().min_w_0().min_h_0().child(
                                     Settings::new(SharedString::from(format!("settings-pages:{}", self.settings_generation)))
-                                        .pages([self.connections_page(cx), self.appearance_page(cx)])
+                                        .pages([self.connections_page(cx), self.appearance_page(cx), self.about_page()])
                                         .default_selected_index(SelectIndex {
                                             page_ix: settings_page_ix,
                                             group_ix: None,
@@ -1659,5 +1832,46 @@ impl Explorer {
             )
             .focus_trap("settings-dialog", &self.settings_focus)
             .test_support()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AboutLogo;
+    use gpui_kit::{TestAppContext, px};
+    use std::sync::Arc;
+
+    #[test]
+    fn about_logo_raster_size_tracks_display_scale_and_ui_zoom() {
+        for (rem, scale, expected) in [
+            (16., 1., 96),
+            (16., 1.25, 120),
+            (16., 1.5, 144),
+            (16., 2., 192),
+            (16., 3., 288),
+            (20., 1., 120),
+            (20., 2., 240),
+            (17., 1.25, 128),
+        ] {
+            assert_eq!(AboutLogo::pixel_size(px(rem), scale), expected);
+        }
+    }
+
+    #[gpui_kit::test]
+    fn about_logo_prescales_with_antialiased_alpha_and_reuses_cached_images(cx: &mut TestAppContext) {
+        for side in [96, 120, 144, 192, 240, 288] {
+            assert!(cx.update(|cx| cx.fetch_asset::<AboutLogo>(&side)).is_none());
+            cx.run_until_parked();
+            let image = cx.update(|cx| cx.fetch_asset::<AboutLogo>(&side)).unwrap().unwrap();
+            assert_eq!(image.size(0).width.0, side as i32);
+            assert_eq!(image.size(0).height.0, side as i32);
+            let bytes = image.as_bytes(0).unwrap();
+            assert_eq!(bytes.len(), (side * side * 4) as usize);
+            assert!(bytes.chunks_exact(4).any(|pixel| pixel[3] == 0));
+            assert!(bytes.chunks_exact(4).any(|pixel| pixel[3] > 0 && pixel[3] < 255));
+            assert!(bytes.chunks_exact(4).any(|pixel| pixel[3] == 255));
+            let cached = cx.update(|cx| cx.fetch_asset::<AboutLogo>(&side)).unwrap().unwrap();
+            assert!(Arc::ptr_eq(&image, &cached));
+        }
     }
 }

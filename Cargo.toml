@@ -17,6 +17,7 @@ bytes = "1"
 chrono = "0.4"
 directories = "6"
 gpui-kit = { version = "0.7", features = ["tree-sitter", "gpui-fast"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
 infer = { version = "0.22", default-features = false }
 rumqttc = { version = "0.25", default-features = false, features = ["use-rustls", "websocket"] }
 rustls-native-certs = "0.8"
