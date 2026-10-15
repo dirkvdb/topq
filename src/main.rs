@@ -9,7 +9,7 @@ mod secrets;
 mod topics;
 mod ui;
 
-use gpui_kit::{AppContext, Bounds, WindowBounds, WindowOptions, px, size};
+use gpui_kit::{AppContext, Bounds, WindowBounds, QuitMode, WindowOptions, px, size};
 
 fn init_logging() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
@@ -25,12 +25,8 @@ fn main() {
 
         appearance::init(cx);
         ui::init(cx);
-        cx.on_window_closed(|cx, _| {
-            if cx.windows().is_empty() {
-                cx.quit();
-            }
-        })
-        .detach();
+        cx.set_quit_mode(QuitMode::LastWindowClosed);
+
         // Window bounds are platform geometry in logical pixels; content uses rem.
         if let Err(error) = gpui_kit::open_window(
             WindowOptions {
