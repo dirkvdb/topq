@@ -667,6 +667,56 @@ fn raw_payload_keeps_add_to_chart_available(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn first_monitoring_chart_fits_exactly_one_row_at_each_ui_scale(cx: &mut TestAppContext) {
+    for font_size in [14., 16., 20.] {
+        let (handle, view) = open(cx, false, 1000., 800.);
+        cx.update_window(handle, |_, window, cx| {
+            Theme::update(cx, |theme| theme.font_size = px(font_size));
+            window.activate_window();
+            view.update(cx, |view, cx| {
+                let mut incoming = message("home/a");
+                incoming.payload = Bytes::from_static(b"{\"power\":5}");
+                view.apply_broker_events([crate::mqtt::BrokerEvent::Message(incoming)], window, cx);
+                view.select_topic("home/a", window, cx);
+            });
+            window.render_frame(cx);
+            hover_numeric_field(&view, "/power", window, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("monitor-hovered-field", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let id = view.read(cx).monitoring.chart_ids().next().unwrap().element_id();
+            let chart = window.find(id.clone()).bounds();
+            let panel = window.find("monitor-panel").bounds();
+            let plot = window.find((id.clone(), "plot")).bounds();
+            let padding = window.rem_size() * 0.75;
+            assert!(
+                panel.bottom() <= window.viewport_size().height,
+                "monitoring must fit inside the window: {panel:?}"
+            );
+            assert!(window.find((id, "plot")).visible());
+            assert!(
+                (plot.size.height - window.rem_size() * 12.).abs() <= px(1.),
+                "the first plot must retain its full height at {font_size}px: {plot:?}"
+            );
+            assert!(
+                (panel.bottom() - chart.bottom() - padding).abs() <= px(1.),
+                "first chart must fit with exactly the content padding below it at {font_size}px: panel {panel:?}, chart {chart:?}"
+            );
+        })
+        .unwrap();
+        cx.run_until_parked();
+    }
+}
+
+#[gpui_kit::test]
 fn monitoring_charts_wrap_into_rows_as_window_width_changes(cx: &mut TestAppContext) {
     for (width, columns) in [(900., 1), (1400., 2), (2600., 3)] {
         let (handle, view) = open(cx, false, width, 800.);

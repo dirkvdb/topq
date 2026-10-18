@@ -1445,7 +1445,7 @@ impl Explorer {
             })
     }
 
-    fn details(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn details(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mut panel = div().id("details-pane").test_support().v_flex().size_full().min_h_0().min_w_0();
         let Some(path) = &self.selected else {
             return panel.p_6().justify_center().items_center().child(
@@ -1755,21 +1755,23 @@ impl Explorer {
             panel.child(content)
         } else {
             // The resize API consumes resolved geometry; minima/default follow UI zoom.
-            let rem = cx.theme().font_size;
+            let rem = window.rem_size();
             panel.child(
-                v_resizable("payload-chart-panes")
-                    .with_state(&self.monitor_panes)
-                    .child(
-                        resizable_panel()
-                            .size_range(rems(10.).to_pixels(rem)..gpui_kit::Pixels::MAX)
-                            .child(content),
-                    )
-                    .child(
-                        resizable_panel()
-                            .size(rems(18.).to_pixels(rem))
-                            .size_range(rems(10.).to_pixels(rem)..gpui_kit::Pixels::MAX)
-                            .child(self.monitoring.render(cx)),
-                    ),
+                div().flex_1().min_h_0().min_w_0().child(
+                    v_resizable("payload-chart-panes")
+                        .with_state(&self.monitor_panes)
+                        .child(
+                            resizable_panel()
+                                .size_range(rems(10.).to_pixels(rem)..gpui_kit::Pixels::MAX)
+                                .child(content),
+                        )
+                        .child(
+                            resizable_panel()
+                                .size(monitor::initial_height(window))
+                                .size_range(rems(10.).to_pixels(rem)..gpui_kit::Pixels::MAX)
+                                .child(self.monitoring.render(cx)),
+                        ),
+                ),
             )
         }
     }

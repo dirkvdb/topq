@@ -6,7 +6,7 @@ use chrono::{DateTime, Local};
 use gpui_kit::component::{
     ActiveTheme, IconName, Sizable, StyledExt,
     button::{Button, ButtonVariants, Toggle},
-    chart::{AreaChart, LineChart},
+    chart::AreaChart,
     menu::{DropdownMenu, PopupMenuItem},
     plot::{
         AxisLabelSide, AxisText, Curve, IntoPlot, PathCaches, Plot, PlotAxis, TooltipState,
@@ -29,6 +29,18 @@ use crate::topics::Message;
 
 const SAMPLE_LIMIT: usize = 300;
 const CHART_COLOR_COUNT: usize = 5;
+const PLOT_HEIGHT_REM: f32 = 12.;
+
+pub(super) fn initial_height(window: &Window) -> Pixels {
+    let rem = window.rem_size();
+    let heading = window.text_style().line_height.to_pixels(rems(0.875).into(), rem);
+    let plot = rems(PLOT_HEIGHT_REM).to_pixels(rem);
+    let toolbar = rems(1.5).to_pixels(rem);
+    // Header padding, content padding, chart padding and the toolbar-to-plot gap.
+    let spacing = rems(1. + 1.5 + 0.5 + 0.5).to_pixels(rem);
+    // The chart's two physical one-pixel borders do not scale with UI zoom.
+    heading + plot + toolbar + spacing + px(2.)
+}
 
 fn time_label(time: &DateTime<impl chrono::TimeZone>) -> String {
     time.with_timezone(&Local).format("%H:%M:%S").to_string()
@@ -445,6 +457,7 @@ impl Plot for GroupPlot {
                                 .stroke(series.color)
                                 .stroke_width(2.)
                                 .dot()
+                                .dot_size(rems(0.3125).to_pixels(window.rem_size()))
                                 .dot_fill(series.color)
                                 .paint_cached(&bounds, caches.slot(0), window);
                         }
@@ -479,19 +492,19 @@ impl Plot for GroupPlot {
         state: &TooltipState,
         cursor: Point<Pixels>,
         bounds: Bounds<Pixels>,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut App,
     ) -> Option<AnyElement> {
         let sample = self.series.iter().flat_map(|series| &series.samples).nth(state.index)?;
         let (_, height, _, _) = self.geometry(bounds, cx);
         let mut tooltip = Tooltip::new(cursor, bounds.size)
+            .gap(rems(1.).to_pixels(window.rem_size()))
             .glide(false)
             .cross_line(CrossLine::new(state.cross_line).height(height))
             .dots(self.nearest_samples(sample.time).zip(&state.dots).map(|((series, _), &dot)| {
-                // Match Kit's built-in line and area chart hover markers.
                 Dot::new(dot)
                     .size(px(8.))
-                    .halo(px(20.))
+                    .halo(rems(1.).to_pixels(window.rem_size()))
                     .stroke(cx.theme().background)
                     .fill(series.color)
             }))
@@ -754,7 +767,8 @@ impl Monitoring {
                 ChartKind::Line => ("Show area chart", gpui_kit::assets::IconName::ChartArea),
                 ChartKind::Area => ("Show line chart", gpui_kit::assets::IconName::ChartLine),
             };
-            let chart = if members.len() > 1 {
+            // Use the same configurable dot size for standalone and grouped lines.
+            let chart = if members.len() > 1 || options.kind == ChartKind::Line {
                 GroupPlot {
                     id: (id.clone(), "group-plot").into(),
                     left: 0.,
@@ -776,40 +790,22 @@ impl Monitoring {
                 }
                 .into_any_element()
             } else {
-                match options.kind {
-                    ChartKind::Line => LineChart::new(series.samples.iter().cloned())
-                        .id((id.clone(), "line-chart"))
-                        .x(|sample: &Sample| time_label(&sample.time))
-                        .y(|sample: &Sample| sample.value)
-                        .name(label.clone())
-                        .tooltip_title(|sample| time_label(&sample.time).into())
-                        .when(options.smooth, |chart| chart.natural())
-                        .when(!options.smooth, |chart| chart.linear())
-                        .dot()
-                        .y_domain(min, max)
-                        .y_axis(true)
-                        .y_tick_format(axis_label)
-                        .x_tick_count(3)
-                        .stroke(color)
-                        .appear(false)
-                        .into_any_element(),
-                    ChartKind::Area => AreaChart::new(series.samples.iter().cloned())
-                        .id((id.clone(), "area-chart"))
-                        .x(|sample: &Sample| time_label(&sample.time))
-                        .y(|sample: &Sample| sample.value)
-                        .name(label.clone())
-                        .tooltip_title(|sample| time_label(&sample.time).into())
-                        .when(options.smooth, |chart| chart.natural())
-                        .when(!options.smooth, |chart| chart.linear())
-                        .y_domain(min, max)
-                        .y_axis(true)
-                        .y_tick_format(axis_label)
-                        .x_tick_count(3)
-                        .stroke(color)
-                        .fill(color.opacity(0.2))
-                        .appear(false)
-                        .into_any_element(),
-                }
+                AreaChart::new(series.samples.iter().cloned())
+                    .id((id.clone(), "area-chart"))
+                    .x(|sample: &Sample| time_label(&sample.time))
+                    .y(|sample: &Sample| sample.value)
+                    .name(label.clone())
+                    .tooltip_title(|sample| time_label(&sample.time).into())
+                    .when(options.smooth, |chart| chart.natural())
+                    .when(!options.smooth, |chart| chart.linear())
+                    .y_domain(min, max)
+                    .y_axis(true)
+                    .y_tick_format(axis_label)
+                    .x_tick_count(3)
+                    .stroke(color)
+                    .fill(color.opacity(0.2))
+                    .appear(false)
+                    .into_any_element()
             };
 
             let owner = cx.weak_entity();
@@ -940,7 +936,14 @@ impl Monitoring {
                                     ),
                             ),
                     )
-                    .child(div().id((id.clone(), "plot")).test_support().w_full().h(rems(12.0)).child(chart)),
+                    .child(
+                        div()
+                            .id((id.clone(), "plot"))
+                            .test_support()
+                            .w_full()
+                            .h(rems(PLOT_HEIGHT_REM))
+                            .child(chart),
+                    ),
             );
         }
         div()

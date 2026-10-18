@@ -39,7 +39,7 @@ impl Render for ExplorerPane {
         explorer.update(cx, |explorer, cx| match self.kind {
             ExplorerPaneKind::Header => explorer.header(cx).into_any_element(),
             ExplorerPaneKind::Topics => explorer.topic_list(cx).into_any_element(),
-            ExplorerPaneKind::Details => explorer.details(cx).into_any_element(),
+            ExplorerPaneKind::Details => explorer.details(window, cx).into_any_element(),
             ExplorerPaneKind::Publish => explorer.publish_panel(window, cx).into_any_element(),
         })
     }
