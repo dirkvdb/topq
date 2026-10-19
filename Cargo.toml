@@ -16,14 +16,14 @@ anstyle-parse = "1"
 bytes = "1"
 chrono = "0.4"
 directories = "6"
-gpui-kit = { version = "0.7", features = ["tree-sitter", "gpui-fast"] }
+gpui-kit = { version = "0.8", features = ["tree-sitter", "gpui-fast"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 infer = { version = "0.22", default-features = false }
 rumqttc = { version = "0.25", default-features = false, features = ["use-rustls", "websocket"] }
 rustls-native-certs = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-similar = "2.7"
+similar = "3.2"
 toml = "1.1"
 percent-encoding = "2.3"
 url = "2.5"
@@ -40,10 +40,10 @@ futures-lite = "2"
 
 [dev-dependencies]
 keyring = { version = "4.2", default-features = false, features = ["v1"] }
-gpui-kit = { version = "0.7", features = ["test-support"] }
+gpui-kit = { version = "0.8", features = ["test-support"] }
 keyring-core = "1"
 tempfile = "3"
-tungstenite = { version = "0.26", default-features = false, features = ["handshake"] }
+tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 
 [lints.clippy]
 enum_variant_names = "allow"
