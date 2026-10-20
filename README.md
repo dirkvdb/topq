@@ -2,6 +2,7 @@
 
 An MQTT 5 topic explorer built with Rust and [GPUI Kit](https://gpui-kit.com).
 
+![Screenshot](./data/screenshot-0.png)
 ![Screenshot](./data/screenshot-1.png)
 
 ## Features
