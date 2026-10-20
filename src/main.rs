@@ -3,13 +3,14 @@
 mod appearance;
 mod bundled_themes;
 mod config;
+mod config_watch;
 mod error;
 mod mqtt;
 mod secrets;
 mod topics;
 mod ui;
 
-use gpui_kit::{AppContext, Bounds, WindowBounds, QuitMode, WindowOptions, px, size};
+use gpui_kit::{AppContext, Bounds, QuitMode, WindowBounds, WindowOptions, px, size};
 
 fn init_logging() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));

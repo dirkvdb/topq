@@ -33,7 +33,7 @@ pub(crate) enum ReduceMotion {
     Off,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct Appearance {
     mode: AppearanceMode,
@@ -176,16 +176,34 @@ pub(crate) fn init(cx: &mut App) {
 }
 
 pub(crate) fn load(path: &Path, cx: &App) -> Result<Appearance, AppearanceError> {
-    let mut preferences = match config::read_config_value(path)? {
-        Some(value) => serde_json::from_value(value).map_err(|error| AppearanceError::ParseSettings {
-            path: path.to_owned(),
-            source: error.into(),
-        })?,
-        None => Appearance::default(),
-    };
+    let value = config::read_config_value(path)?.unwrap_or_else(|| serde_json::json!({}));
+    from_config(value, path, cx)
+}
+
+/// Parses a config snapshot without changing live preferences or writing to disk.
+pub(crate) fn from_config(value: serde_json::Value, path: &Path, cx: &App) -> Result<Appearance, AppearanceError> {
+    let mut preferences: Appearance = serde_json::from_value(value).map_err(|error| AppearanceError::ParseSettings {
+        path: path.to_owned(),
+        source: error.into(),
+    })?;
     preferences.path = Some(path.to_path_buf());
     preferences.repair_invalid_themes(cx);
     Ok(preferences)
+}
+
+/// Applies validated preferences without saving; returns whether they changed.
+pub(crate) fn apply_loaded(preferences: Appearance, window: &mut Window, cx: &mut App) -> Result<bool, AppearanceError> {
+    if cx.global::<Appearance>() == &preferences {
+        return Ok(false);
+    }
+    // Resolve both themes before committing so an apply error leaves live state intact.
+    let light = theme_config(ThemeMode::Light, &preferences.light_theme, cx)?;
+    let dark = theme_config(ThemeMode::Dark, &preferences.dark_theme, cx)?;
+    let mode = effective_mode(preferences.mode, Some(window), cx);
+    cx.set_global(preferences);
+    apply_pair(mode, light, dark, cx);
+    cx.refresh_windows();
+    Ok(true)
 }
 
 fn load_or_default(path: &Path, cx: &App) -> Appearance {
@@ -723,6 +741,132 @@ mod tests {
                 assert!(cx.reduce_motion());
                 assert_eq!(cx.global::<Appearance>().path.as_deref(), Some(path.as_path()));
             }
+        });
+    }
+
+    #[gpui_kit::test]
+    fn reload_applies_snapshot_preferences_without_writing_config(cx: &mut TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.json");
+        let original = b"{\"mode\":\"light\",\"connections\":[]}\n";
+        fs::write(&path, original).unwrap();
+        cx.update(|cx| setup(cx, &path));
+        let handle = cx.add_window(|_, _| TestView);
+        cx.update_window(handle.into(), |_, window, cx| {
+            cx.set_reduce_motion(false);
+            for (mode, motion, inline, limit, max_chars, expected_mode) in [
+                (AppearanceMode::Dark, ReduceMotion::On, false, true, 0, ThemeMode::Dark),
+                (AppearanceMode::Light, ReduceMotion::Off, true, false, 25, ThemeMode::Light),
+                (
+                    AppearanceMode::System,
+                    ReduceMotion::System,
+                    false,
+                    true,
+                    10,
+                    ThemeMode::from(window.appearance()),
+                ),
+            ] {
+                let value = serde_json::json!({
+                    "mode": mode,
+                    "light_theme": "Gruvbox Light",
+                    "dark_theme": "Tokyo Night",
+                    "reduce_motion": motion,
+                    "inline_payload": inline,
+                    "inline_payload_limit_enabled": limit,
+                    "inline_payload_max_chars": max_chars,
+                    "connections": []
+                });
+                let preferences = from_config(value.clone(), &path, cx).unwrap();
+                assert!(apply_loaded(preferences, window, cx).unwrap());
+                assert_eq!(cx.global::<Appearance>(), &from_config(value, &path, cx).unwrap());
+                assert_eq!(Appearance::mode(cx), mode);
+                assert_eq!(Appearance::reduce_motion(cx), motion);
+                assert_eq!(Appearance::motion_reduced(cx), motion == ReduceMotion::On);
+                assert!(!cx.reduce_motion());
+                assert_eq!(Appearance::inline_payload(cx), inline);
+                assert_eq!(Appearance::inline_payload_limit_enabled(cx), limit);
+                assert_eq!(Appearance::inline_payload_max_chars(cx), max_chars);
+                assert_eq!(Theme::global(cx).mode, expected_mode);
+                assert_eq!(
+                    Theme::global(cx).theme_name().as_str(),
+                    Appearance::selected_theme(expected_mode, cx)
+                );
+                assert_eq!(Theme::global(cx).light_theme.name.as_str(), "Gruvbox Light");
+                assert_eq!(Theme::global(cx).dark_theme.name.as_str(), "Tokyo Night");
+                assert_tokens(cx);
+                assert_eq!(fs::read(&path).unwrap(), original);
+            }
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn identical_reload_skips_theme_reapplication_and_does_not_create_config(cx: &mut TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.json");
+        cx.update(|cx| setup(cx, &path));
+        let handle = cx.add_window(|_, _| TestView);
+        cx.update_window(handle.into(), |_, window, cx| {
+            Theme::update(cx, |theme| theme.font_size = px(40.));
+            let preferences = from_config(serde_json::json!({}), &path, cx).unwrap();
+            assert!(!apply_loaded(preferences, window, cx).unwrap());
+            assert_eq!(Theme::global(cx).font_size, px(40.));
+            assert!(!path.exists());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn invalid_reload_preserves_live_preferences_theme_and_config(cx: &mut TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.json");
+        let original = b"{\"mode\":\"dark\",\"inline_payload\":false}";
+        fs::write(&path, original).unwrap();
+        cx.update(|cx| setup(cx, &path));
+        let handle = cx.add_window(|_, _| TestView);
+        cx.update_window(handle.into(), |_, window, cx| {
+            let before = load(&path, cx).unwrap();
+            let theme = Theme::global(cx).clone();
+            for value in [
+                serde_json::json!({"mode": "invalid"}),
+                serde_json::json!({"reduce_motion": true}),
+                serde_json::json!({"inline_payload": "false"}),
+                serde_json::json!({"inline_payload_limit_enabled": null}),
+                serde_json::json!({"inline_payload_max_chars": -1}),
+            ] {
+                let error = from_config(value, &path, cx)
+                    .and_then(|preferences| apply_loaded(preferences, window, cx))
+                    .unwrap_err();
+                assert!(matches!(error, AppearanceError::ParseSettings { path: failed_path, .. } if failed_path == path));
+                assert_eq!(cx.global::<Appearance>(), &before);
+                assert_eq!(Theme::global(cx).theme_name(), theme.theme_name());
+                assert_eq!(Theme::global(cx).colors, theme.colors);
+                assert_eq!(Theme::global(cx).tokens, theme.tokens);
+                assert_eq!(fs::read(&path).unwrap(), original);
+            }
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn snapshot_parsing_repairs_themes_without_mutating_live_preferences(cx: &mut TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.json");
+        cx.update(|cx| {
+            setup(cx, &path);
+            let before = load(&path, cx).unwrap();
+            let preferences = from_config(
+                serde_json::json!({"mode": "dark", "light_theme": "Removed", "dark_theme": "Ayu Light"}),
+                &path,
+                cx,
+            )
+            .unwrap();
+            assert_eq!(preferences.mode, AppearanceMode::Dark);
+            assert_eq!(preferences.light_theme, DEFAULT_LIGHT_THEME);
+            assert_eq!(preferences.dark_theme, DEFAULT_DARK_THEME);
+            assert_eq!(preferences.path.as_deref(), Some(path.as_path()));
+            assert_eq!(cx.global::<Appearance>(), &before);
+            assert!(!path.exists());
         });
     }
 

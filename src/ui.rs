@@ -36,6 +36,7 @@ use crate::{
 
 mod appearance_errors;
 mod config_errors;
+mod config_reload;
 mod explorer_pane;
 mod messages;
 mod mqtt_errors;
@@ -279,6 +280,9 @@ pub struct Explorer {
     settings_page_ix: usize,
     settings_generation: u64,
     event_task: Option<Task<()>>,
+    config_watch_task: Option<Task<()>>,
+    config_watch_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
+    config_reload_error: Option<String>,
     received_age_task: Option<Task<()>>,
     animation_scheduled: bool,
     ui_state_saved_on_close: bool,
@@ -287,6 +291,8 @@ pub struct Explorer {
 
 impl Explorer {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        // Observe before loading so edits during startup are not lost to the baseline.
+        let watch = config::application_config_paths().map(|(config, state)| crate::config_watch::ConfigWatch::new(config, state));
         let (saved_connections, error) = match config::load_connections() {
             Ok(connections) => (connections, None),
             Err(error) => (SavedConnections::default(), Some(error.localized_message())),
@@ -304,6 +310,10 @@ impl Explorer {
         view.publish_height_rem = state.publish_height_rem;
         view.publish_height_fraction = state.publish_height_fraction;
         view.restore_publish_height = state.publish_height_rem.is_some() || state.publish_height_fraction.is_some();
+        match watch {
+            Ok(watch) => view.watch_config(watch, window, cx),
+            Err(error) => view.config_reload_failed(error, cx),
+        }
         view
     }
 
@@ -608,6 +618,9 @@ impl Explorer {
             settings_page_ix: 0,
             settings_generation: 0,
             event_task: None,
+            config_watch_task: None,
+            config_watch_paths: None,
+            config_reload_error: None,
             received_age_task: None,
             animation_scheduled: false,
             ui_state_saved_on_close: false,
@@ -633,6 +646,7 @@ impl Explorer {
             self.active_config = None;
             self.status = ConnectionStatus::Disconnected;
             self.show_config = false;
+            self.resume_config_watch(window, cx);
             self.clear_topics(window, cx);
             self.focus_topics(window, cx);
             cx.notify();
@@ -646,6 +660,7 @@ impl Explorer {
                 self.connection = Some(connection);
                 self.active_config = Some(config);
                 self.show_config = false;
+                self.resume_config_watch(window, cx);
                 self.status = ConnectionStatus::Connecting;
                 self.clear_topics(window, cx);
                 self.focus_topics(window, cx);

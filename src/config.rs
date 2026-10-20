@@ -213,8 +213,23 @@ pub fn config_path() -> Result<PathBuf, ConfigError> {
     Ok(dirs.config_dir().join("config.json"))
 }
 
+std::thread_local! {
+    static APPLICATION_CONFIG_REVISION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Main-thread revision of successful configuration facade writes. Capture before
+/// background reads and compare on return to reject snapshots predating a save.
+/// Each thread has an independent counter, including test threads.
+pub(crate) fn application_config_revision() -> u64 {
+    APPLICATION_CONFIG_REVISION.with(std::cell::Cell::get)
+}
+
+fn advance_application_config_revision() {
+    APPLICATION_CONFIG_REVISION.with(|revision| revision.set(revision.get().wrapping_add(1)));
+}
+
 /// An absent selection means no connection is active, even when the list is nonempty.
-#[derive(Default)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub(crate) struct SavedConnections {
     pub connections: Vec<ConnectionConfig>,
     pub selected: Option<usize>,
@@ -225,7 +240,9 @@ pub(crate) fn load_connections() -> Result<SavedConnections, ConfigError> {
 }
 
 pub(crate) fn save_connections(saved: &SavedConnections) -> Result<(), ConfigError> {
-    save_connections_with_entry(saved, &password_entry)
+    save_connections_with_entry(saved, &password_entry)?;
+    advance_application_config_revision();
+    Ok(())
 }
 
 fn save_connections_with_entry(
@@ -263,8 +280,16 @@ fn save_connections_with_entry(
     }
 }
 
+/// Resolves the normal configuration and state override paths, in that order.
+/// Capture these on the main thread before moving filesystem work to a background
+/// executor: test path locators are intentionally thread-local.
+pub(crate) fn application_config_paths() -> Result<(PathBuf, PathBuf), ConfigError> {
+    Ok((config_path()?, state_config_path()?))
+}
+
 pub(crate) fn application_config_read_path() -> Result<PathBuf, ConfigError> {
-    prioritized_config_path(&state_config_path()?, &config_path()?)
+    let (config_path, state_path) = application_config_paths()?;
+    prioritized_config_path(&state_path, &config_path)
 }
 
 fn state_config_path() -> Result<PathBuf, ConfigError> {
@@ -274,7 +299,7 @@ fn state_config_path() -> Result<PathBuf, ConfigError> {
     Ok(path.with_file_name("config.json"))
 }
 
-fn prioritized_config_path(state_path: &Path, config_path: &Path) -> Result<PathBuf, ConfigError> {
+pub(crate) fn prioritized_config_path(state_path: &Path, config_path: &Path) -> Result<PathBuf, ConfigError> {
     match fs::symlink_metadata(state_path) {
         Ok(_) => Ok(state_path.to_path_buf()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(config_path.to_path_buf()),
@@ -398,6 +423,10 @@ fn read_connections(path: &Path) -> Result<Option<StoredConnections>, ConfigErro
     let Some(value) = read_config_value(path)? else {
         return Ok(None);
     };
+    stored_connections_from_value(value, path).map(Some)
+}
+
+fn stored_connections_from_value(value: serde_json::Value, path: &Path) -> Result<StoredConnections, ConfigError> {
     if path.file_name().is_some_and(|name| name == "config.json") && value.get("connections").is_none() {
         let appearance_only = [
             "mode",
@@ -411,36 +440,83 @@ fn read_connections(path: &Path) -> Result<Option<StoredConnections>, ConfigErro
         .iter()
         .any(|key| value.get(key).is_some());
         if appearance_only || value.as_object().is_some_and(serde_json::Map::is_empty) {
-            return Ok(Some(StoredConnections::default()));
+            return Ok(StoredConnections::default());
         }
     }
     let stored = serde_json::from_value(value).map_err(|error| ConfigError::ParseConnections {
         path: path.to_owned(),
         source: error.into(),
     })?;
-    Ok(Some(stored))
+    Ok(stored)
+}
+
+/// Loads a parsed snapshot without resolving paths or rereading the file.
+/// Omitted client IDs retain their runtime identity; unchanged credential accounts
+/// reuse the previous password (including a known missing password). New accounts
+/// retain the normal credential-store error and missing-entry behavior.
+pub(crate) fn load_connections_from_value(
+    value: serde_json::Value,
+    path: &Path,
+    previous: &SavedConnections,
+) -> Result<SavedConnections, ConfigError> {
+    load_connections_from_value_with_entry(value, path, previous, &password_entry)
 }
 
 fn load_connections_from(
     path: &Path,
     entry: &impl Fn(&ConnectionConfig) -> Result<Entry, ConfigError>,
 ) -> Result<SavedConnections, ConfigError> {
-    let Some(stored) = read_connections(path)? else {
+    let Some(value) = read_config_value(path)? else {
         return Ok(SavedConnections::default());
     };
+    load_connections_from_value_with_entry(value, path, &SavedConnections::default(), entry)
+}
+
+fn load_connections_from_value_with_entry(
+    value: serde_json::Value,
+    path: &Path,
+    previous: &SavedConnections,
+    entry: &impl Fn(&ConnectionConfig) -> Result<Entry, ConfigError>,
+) -> Result<SavedConnections, ConfigError> {
+    let omitted_client_ids: Vec<bool> = value
+        .get("connections")
+        .and_then(serde_json::Value::as_array)
+        .map(|connections| connections.iter().map(|connection| connection.get("client_id").is_none()).collect())
+        .unwrap_or_default();
+    let stored = stored_connections_from_value(value, path)?;
     let mut connections = Vec::with_capacity(stored.connections.len());
     let mut accounts = HashSet::new();
     let mut names = HashSet::new();
-    for saved in stored.connections {
+    for (index, saved) in stored.connections.into_iter().enumerate() {
         let mut config = saved.config;
         if !config.name.is_empty() && !names.insert(config.name.clone()) {
             continue;
         }
+        let account = credential_account(&config);
+        let previous_account = previous.connections.iter().find(|old| credential_account(old) == account);
+        if omitted_client_ids.get(index) == Some(&true) {
+            let previous_identity = previous
+                .connections
+                .iter()
+                .find(|old| old.name == config.name && credential_account(old) == account)
+                .or_else(|| {
+                    previous
+                        .connections
+                        .iter()
+                        .find(|old| !config.name.is_empty() && old.name == config.name)
+                })
+                .or(previous_account);
+            if let Some(old) = previous_identity {
+                config.client_id.clone_from(&old.client_id);
+            }
+        }
         config.validate()?;
-        if !accounts.insert(credential_account(&config)) {
+        if !accounts.insert(account) {
             return Err(ConfigError::DuplicateConnectionAccount);
         }
-        if !config.username.is_empty() {
+        if let Some(old) = previous_account.filter(|_| !config.username.is_empty()) {
+            config.password.clone_from(&old.password);
+        } else if !config.username.is_empty() {
             config.password = match entry(&config)?.get_password() {
                 Ok(password) => password,
                 Err(KeyringError::NoEntry) => String::new(),
@@ -917,6 +993,12 @@ fn empty_config_value() -> serde_json::Value {
 }
 
 pub(crate) fn update_application_config(preferred_path: &Path, value: &impl Serialize) -> Result<PathBuf, ConfigError> {
+    let path = update_application_config_inner(preferred_path, value)?;
+    advance_application_config_revision();
+    Ok(path)
+}
+
+fn update_application_config_inner(preferred_path: &Path, value: &impl Serialize) -> Result<PathBuf, ConfigError> {
     let config_path = config_path()?;
     let state_path = state_config_path()?;
     if preferred_path != config_path && preferred_path != state_path {
@@ -958,16 +1040,20 @@ pub(crate) fn update_application_config(preferred_path: &Path, value: &impl Seri
 
 pub(crate) fn read_config_value(path: &Path) -> Result<Option<serde_json::Value>, ConfigError> {
     match fs::read(path) {
-        Ok(data) => serde_json::from_slice(&data).map(Some).map_err(|error| ConfigError::ParseConfig {
-            path: path.to_owned(),
-            source: error.into(),
-        }),
+        Ok(data) => parse_config_bytes(&data, path).map(Some),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(source) => Err(ConfigError::ReadConfig {
             path: path.to_owned(),
             source,
         }),
     }
+}
+
+pub(crate) fn parse_config_bytes(data: &[u8], path: &Path) -> Result<serde_json::Value, ConfigError> {
+    serde_json::from_slice(data).map_err(|error| ConfigError::ParseConfig {
+        path: path.to_owned(),
+        source: error.into(),
+    })
 }
 
 fn write_json(path: &Path, value: &impl Serialize) -> Result<(), ConfigError> {
@@ -1016,6 +1102,257 @@ mod tests {
 
     use super::*;
     use crate::error::config::{ConfigDiagnostic, ConnectionUriCode};
+
+    #[test]
+    fn successful_configuration_facades_advance_revision_once_per_write() {
+        let before = application_config_revision();
+        save_connections(&SavedConnections::default()).unwrap();
+        assert_eq!(application_config_revision(), before.wrapping_add(1));
+        let path = config_path().unwrap();
+        update_application_config(&path, &serde_json::json!({"mode": "dark"})).unwrap();
+        assert_eq!(application_config_revision(), before.wrapping_add(2));
+        let dir = tempfile::tempdir().unwrap();
+        update_application_config(&dir.path().join("config.json"), &serde_json::json!({})).unwrap();
+        assert_eq!(application_config_revision(), before.wrapping_add(3));
+    }
+
+    #[test]
+    fn failed_configuration_facade_writes_do_not_advance_revision() {
+        let (config, state) = application_config_paths().unwrap();
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        fs::create_dir_all(state.parent().unwrap()).unwrap();
+        // Both atomic-write destinations fail, including the state fallback.
+        fs::create_dir(config.with_extension("json.tmp")).unwrap();
+        fs::create_dir(state.with_extension("json.tmp")).unwrap();
+        let before = application_config_revision();
+        assert!(matches!(
+            save_connections(&SavedConnections::default()),
+            Err(ConfigError::WriteApplicationConfig { .. })
+        ));
+        assert_eq!(application_config_revision(), before);
+        assert!(matches!(
+            update_application_config(&config, &serde_json::json!({"mode": "dark"})),
+            Err(ConfigError::WriteApplicationConfig { .. })
+        ));
+        assert_eq!(application_config_revision(), before);
+    }
+
+    #[test]
+    fn failed_configuration_facade_validation_and_parsing_do_not_advance_revision() {
+        let before = application_config_revision();
+        let invalid = SavedConnections {
+            connections: Vec::new(),
+            selected: Some(0),
+        };
+        assert!(matches!(
+            save_connections(&invalid),
+            Err(ConfigError::SelectedConnectionOutOfRange { .. })
+        ));
+        assert_eq!(application_config_revision(), before);
+        let config = config_path().unwrap();
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        fs::write(&config, b"{").unwrap();
+        assert!(matches!(
+            update_application_config(&config, &serde_json::json!({})),
+            Err(ConfigError::ParseConfig { .. })
+        ));
+        assert_eq!(application_config_revision(), before);
+    }
+
+    #[test]
+    fn low_level_configuration_writes_do_not_advance_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let before = application_config_revision();
+        update_json(&path, &serde_json::json!({})).unwrap();
+        save_connections_to(&path, &SavedConnections::default(), &mock_entries()).unwrap();
+        assert_eq!(application_config_revision(), before);
+    }
+
+    #[test]
+    fn application_config_revision_wraps_and_is_thread_local() {
+        let before = application_config_revision();
+        std::thread::spawn(|| {
+            assert_eq!(application_config_revision(), 0);
+            APPLICATION_CONFIG_REVISION.with(|revision| revision.set(u64::MAX));
+            save_connections(&SavedConnections::default()).unwrap();
+            assert_eq!(application_config_revision(), 0);
+            save_connections(&SavedConnections::default()).unwrap();
+            assert_eq!(application_config_revision(), 1);
+        })
+        .join()
+        .unwrap();
+        assert_eq!(application_config_revision(), before);
+    }
+
+    #[test]
+    fn snapshot_connections_preserve_omitted_ids_across_reordering_and_appearance_edits() {
+        let path = Path::new("config.json");
+        let original = serde_json::json!({
+            "connections": [
+                {"name": "Home", "connection": "mqtt://localhost"},
+                {"name": "Work", "connection": "mqtt://work"}
+            ],
+            "active_connection": "Home"
+        });
+        let previous = load_connections_from_value(original, path, &SavedConnections::default()).unwrap();
+        let changed = serde_json::json!({
+            "mode": "dark",
+            "connections": [
+                {"name": "Work", "connection": "mqtt://work"},
+                {"name": "Home", "connection": "mqtt://localhost"}
+            ],
+            "active_connection": "Home"
+        });
+        let loaded = load_connections_from_value(changed, path, &previous).unwrap();
+        assert!(loaded.connections[0] == previous.connections[1]);
+        assert!(loaded.connections[1] == previous.connections[0]);
+        assert_eq!(loaded.selected, Some(1));
+    }
+
+    #[test]
+    fn snapshot_connections_match_renamed_entries_by_account_and_respect_explicit_ids() {
+        let path = Path::new("config.json");
+        let previous = SavedConnections {
+            connections: vec![ConnectionConfig {
+                name: "Old".into(),
+                client_id: "runtime-id".into(),
+                ..Default::default()
+            }],
+            selected: None,
+        };
+        let value = serde_json::json!({"connections": [{"name": "Renamed", "connection": "mqtt://localhost"}]});
+        let loaded = load_connections_from_value(value.clone(), path, &previous).unwrap();
+        assert_eq!(loaded.connections[0].client_id, "runtime-id");
+        let mut explicit = value;
+        explicit["connections"][0]["client_id"] = "explicit-id".into();
+        let loaded = load_connections_from_value(explicit, path, &previous).unwrap();
+        assert_eq!(loaded.connections[0].client_id, "explicit-id");
+    }
+
+    #[test]
+    fn snapshot_connections_prefer_name_and_account_over_a_name_only_match() {
+        let path = Path::new("config.json");
+        let previous = SavedConnections {
+            connections: vec![
+                ConnectionConfig {
+                    name: "Home".into(),
+                    host: "other".into(),
+                    client_id: "other-id".into(),
+                    ..Default::default()
+                },
+                ConnectionConfig {
+                    name: "Home".into(),
+                    client_id: "correct-id".into(),
+                    ..Default::default()
+                },
+            ],
+            selected: None,
+        };
+        let value = serde_json::json!({"connections": [{"name": "Home", "connection": "mqtt://localhost"}]});
+        let loaded = load_connections_from_value(value, path, &previous).unwrap();
+        assert_eq!(loaded.connections[0].client_id, "correct-id");
+    }
+
+    #[test]
+    fn snapshot_connections_reuse_passwords_only_for_unchanged_credential_accounts() {
+        let path = Path::new("config.json");
+        let previous = SavedConnections {
+            connections: vec![authenticated_config()],
+            selected: None,
+        };
+        let entries = |_: &ConnectionConfig| -> Result<Entry, ConfigError> { panic!("unchanged accounts must not access credentials") };
+        let value = serde_json::json!({
+            "connections": [{"name": "Renamed", "connection": "mqtt://mqtt-user@localhost", "password": "ignored"}]
+        });
+        let loaded = load_connections_from_value_with_entry(value, path, &previous, &entries).unwrap();
+        assert_eq!(loaded.connections[0].password, previous.connections[0].password);
+
+        let entries = mock_entries();
+        let value = serde_json::json!({"connections": [{"name": "Home", "connection": "mqtts://mqtt-user@localhost"}]});
+        let loaded = load_connections_from_value_with_entry(value, path, &previous, &entries).unwrap();
+        assert!(loaded.connections[0].password.is_empty());
+    }
+
+    #[test]
+    fn snapshot_connections_new_accounts_use_secret_store_and_propagate_failures() {
+        let path = Path::new("config.json");
+        let entries = mock_entries();
+        let config = authenticated_config();
+        entries(&config).unwrap().set_password(&config.password).unwrap();
+        let value = serde_json::json!({"connections": [{"connection": "mqtt://mqtt-user@localhost"}]});
+        let loaded = load_connections_from_value_with_entry(value.clone(), path, &SavedConnections::default(), &entries).unwrap();
+        assert_eq!(loaded.connections[0].password, config.password);
+        entries(&config)
+            .unwrap()
+            .inner
+            .as_any()
+            .downcast_ref::<mock::Cred>()
+            .unwrap()
+            .set_error(KeyringError::NoStorageAccess(std::io::Error::other("locked").into()));
+        assert!(matches!(
+            load_connections_from_value_with_entry(value, path, &SavedConnections::default(), &entries),
+            Err(ConfigError::RetrievePassword { .. })
+        ));
+    }
+
+    #[test]
+    fn snapshot_connections_normalize_qos_duplicates_and_selection_like_disk_loads() {
+        let value = serde_json::json!({
+            "connections": [
+                {"name": "Home", "connection": "mqtt://localhost", "topics": [{"topic": "#", "qos": 99}]},
+                {"name": "Home", "connection": "mqtt://ignored"},
+                {"name": "Work", "connection": "mqtt://work"}
+            ],
+            "active_connection": "Work"
+        });
+        let loaded = load_connections_from_value(value, Path::new("config.json"), &SavedConnections::default()).unwrap();
+        assert_eq!(loaded.connections.len(), 2);
+        assert_eq!(loaded.connections[0].topics[0].qos, Qos::AtMostOnce);
+        assert_eq!(loaded.selected, Some(1));
+        assert_eq!(loaded.connections[1].topics, vec![TopicSubscription::default()]);
+    }
+
+    #[test]
+    fn snapshot_connections_validate_explicit_ids_topics_accounts_and_storage_shape() {
+        let path = Path::new("config.json");
+        for value in [
+            serde_json::json!({"connections": [{"connection": "mqtt://localhost", "client_id": ""}]}),
+            serde_json::json!({"connections": [{"connection": "mqtt://localhost", "topics": []}]}),
+            serde_json::json!({"connections": [{"connection": "mqtt://localhost", "topics": [{"topic": "a/#/b", "qos": 0}]}]}),
+            serde_json::json!({"connections": [{"connection": "mqtt://localhost", "topics": [{"topic": "#", "qos": "0"}]}]}),
+            serde_json::json!({"connections": [{"connection": "http://localhost"}]}),
+            serde_json::json!({"connections": [{"connection": "mqtt://localhost", "client_id": null}]}),
+            serde_json::json!({"host": "localhost"}),
+        ] {
+            assert!(load_connections_from_value(value, path, &SavedConnections::default()).is_err());
+        }
+        let duplicate_accounts = serde_json::json!({"connections": [
+            {"name": "One", "connection": "mqtt://localhost"},
+            {"name": "Two", "connection": "mqtt://localhost"}
+        ]});
+        assert!(matches!(
+            load_connections_from_value(duplicate_accounts, path, &SavedConnections::default()),
+            Err(ConfigError::DuplicateConnectionAccount)
+        ));
+    }
+
+    #[test]
+    fn snapshot_connections_accept_appearance_only_and_empty_application_configs() {
+        for value in [serde_json::json!({}), serde_json::json!({"mode": "dark"})] {
+            let loaded = load_connections_from_value(value, Path::new("config.json"), &SavedConnections::default()).unwrap();
+            assert!(loaded == SavedConnections::default());
+        }
+    }
+
+    #[test]
+    fn application_config_paths_can_be_captured_before_moving_to_another_thread() {
+        let paths = application_config_paths().unwrap();
+        assert_eq!(paths.0, config_path().unwrap());
+        assert_eq!(paths.1, state_config_path().unwrap());
+        let captured = paths.clone();
+        assert_eq!(std::thread::spawn(move || captured).join().unwrap(), paths);
+    }
 
     #[derive(Clone, Default)]
     struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);

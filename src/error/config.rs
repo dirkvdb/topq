@@ -215,6 +215,10 @@ pub enum ConfigError {
         source: ConfigDiagnostic,
     },
     ConfigObjectRequired,
+    WatchConfig {
+        path: PathBuf,
+        source: notify::Error,
+    },
     InspectConfig {
         path: PathBuf,
         source: std::io::Error,
@@ -305,6 +309,7 @@ impl ConfigError {
             | Self::ParseConnections { path, .. }
             | Self::SerializeConfig { path, .. }
             | Self::InspectConfig { path, .. }
+            | Self::WatchConfig { path, .. }
             | Self::ConfigNotWritable { path, .. }
             | Self::WriteApplicationConfig { path, .. }
             | Self::CreateConfigDirectory { path, .. }
@@ -361,6 +366,7 @@ impl ConfigError {
             Self::SerializeConfig { .. } => "config.serialize_failed",
             Self::ConfigObjectRequired => "config.json_object_required",
             Self::InspectConfig { .. } => "config.inspect_failed",
+            Self::WatchConfig { .. } => "config.watch_failed",
             Self::ConfigNotWritable { .. } => "config.not_writable",
             Self::WriteApplicationConfig { .. } => "config.application.write_failed",
 
@@ -416,6 +422,10 @@ impl fmt::Debug for ConfigError {
         }
         if let Self::RollbackCredentials { failures } = self {
             debug.field("failures", failures);
+        } else if let Self::WatchConfig { .. } = self {
+            // Native backend errors can contain arbitrary prose; retain the typed
+            // source for inspection without including it in diagnostic logging.
+            debug.field("source", &"native filesystem watcher error");
         } else if let Some(source) = self.source() {
             debug.field("source", &source);
         }
@@ -443,6 +453,7 @@ impl std::error::Error for ConfigError {
             | Self::FlushConfig { source, .. }
             | Self::SaveConfig { source, .. } => Some(source),
             Self::ParseConfig { source, .. } | Self::ParseConnections { source, .. } | Self::SerializeConfig { source, .. } => Some(source),
+            Self::WatchConfig { source, .. } => Some(source),
             Self::ConnectionUriUsernameNotUtf8 { source } => Some(source),
             Self::Validation(error) => Some(error),
             Self::FormatConnectionUri { source } | Self::InvalidConnectionUri { source } => Some(source),

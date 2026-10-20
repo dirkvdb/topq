@@ -56,6 +56,7 @@ impl LocalizedError for ConfigError {
             Self::SerializeConfig { .. } => "Could not serialize the configuration settings.",
             Self::ConfigObjectRequired => "Configuration settings must be JSON objects.",
             Self::InspectConfig { .. } => "Could not inspect the configuration file.",
+            Self::WatchConfig { .. } => "Could not watch the configuration files for changes.",
             Self::ConfigNotWritable { .. } => "The application configuration cannot be written. Check your directory permissions and try again.",
             Self::WriteApplicationConfig { .. } => "Could not save the application configuration. Check your directory permissions and try again.",
 
@@ -144,6 +145,21 @@ mod tests {
         assert_eq!(error.localized_message(), "Enter a broker hostname or IP address.");
         let error = ConfigError::from(error);
         assert_eq!(error.localized_message(), "Enter a broker hostname or IP address.");
+    }
+
+    #[test]
+    fn watcher_error_preserves_typed_context_without_logging_arbitrary_source() {
+        use std::error::Error as _;
+        let error = ConfigError::WatchConfig {
+            path: "/private/config.json".into(),
+            source: notify::Error::generic("raw-secret-config-contents"),
+        };
+        assert_eq!(error.code(), "config.watch_failed");
+        assert_eq!(error.path(), Some(std::path::Path::new("/private/config.json")));
+        assert!(error.source().unwrap().downcast_ref::<notify::Error>().is_some());
+        assert_eq!(error.localized_message(), "Could not watch the configuration files for changes.");
+        assert!(!format!("{error:?}").contains("raw-secret-config-contents"));
+        assert!(!error.localized_message().contains("/private"));
     }
 
     #[test]

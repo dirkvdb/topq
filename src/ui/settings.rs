@@ -172,6 +172,7 @@ impl Explorer {
     }
 
     pub(super) fn open_connection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.pause_config_watch();
         if !self.show_config {
             self.settings_generation += 1;
             self.settings_page_ix = 0;
@@ -233,6 +234,7 @@ impl Explorer {
         self.topic_editor_open = false;
         self.topic_editor_restore_focus = None;
         self.show_config = false;
+        self.resume_config_watch(window, cx);
         self.field_error = None;
         if let Some(handle) = self.restore_focus.take() {
             handle.focus(window, cx);

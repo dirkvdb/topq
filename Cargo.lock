@@ -7470,6 +7470,7 @@ dependencies = [
  "infer",
  "keyring",
  "keyring-core",
+ "notify",
  "oo7",
  "percent-encoding",
  "rumqttc",
