@@ -2,6 +2,10 @@ name: Distribution
 
 on:
   push:
+    branches:
+      - '**'
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
   pull_request:
   workflow_dispatch:
 
@@ -45,7 +49,7 @@ jobs:
         with:
           manifest-path: dist/flatpak/io.github.dirkvdb.topq.json
           arch: ${{ matrix.variant.arch }}
-          bundle: TopQ.flatpak
+          bundle: TopQ-${{ matrix.variant.arch }}.flatpak
           artifact-name: TopQ-Flatpak-${{ runner.arch }}
           build-dir: dist/build/flatpak/app
           repo-dir: dist/build/flatpak/repo
@@ -154,3 +158,26 @@ jobs:
           name: TopQ-Linux-${{ runner.arch }}
           path: dist/build/release/bundle/appimage/*.AppImage
           if-no-files-found: error
+
+  release:
+    name: Publish release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [flatpak, macos, windows, linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download distribution artifacts
+        uses: actions/download-artifact@v6
+        with:
+          pattern: TopQ-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Publish GitHub release
+        run: gh release create "$RELEASE_TAG" release-assets/* --verify-tag --generate-notes --repo "$GH_REPO"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
