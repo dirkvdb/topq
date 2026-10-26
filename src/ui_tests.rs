@@ -4,7 +4,8 @@ use gpui_kit::InputEvent as _;
 use gpui_kit::component::{ActiveTheme, Theme, ThemeMode, WindowExt};
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{
-    AnyWindowHandle, App, AppContext, Bounds, Entity, Focusable, Styled, TestAppContext, Window, WindowBounds, WindowOptions, px, size,
+    AnyWindowHandle, App, AppContext, Bounds, ElementId, Entity, Focusable, Pixels, Styled, TestAppContext, Window, WindowBounds,
+    WindowOptions, px, size,
 };
 
 use super::{ConnectionStatus, ConnectionTestStatus, Explorer, messages::LocalizedError};
@@ -3460,7 +3461,7 @@ fn settings_tab_navigation_stays_within_the_settings_surface(cx: &mut TestAppCon
         assert_eq!(window.find("settings-section-appearance").focused(), Some(true));
         window.press("enter", cx);
         window.render_frame(cx);
-        assert!(window.find("appearance-mode").visible());
+        assert!(window.find("inline-payload").visible());
         assert!(window.try_find("connections-overview").is_none());
 
         window.press("tab", cx);
@@ -3582,7 +3583,7 @@ fn about_settings_displays_the_bundled_logo_and_package_version(cx: &mut TestApp
             cx.run_until_parked();
             cx.update_window(handle, |_, window, cx| {
                 window.render_frame(cx);
-                assert!(window.find("appearance-mode").visible());
+                assert!(window.find("inline-payload").visible());
                 assert!(window.try_find("about-application").is_none());
                 window.click("close-settings", cx);
             })
@@ -3591,8 +3592,137 @@ fn about_settings_displays_the_bundled_logo_and_package_version(cx: &mut TestApp
     }
 }
 
+fn theme_card_id(name: &str) -> ElementId {
+    (ElementId::from("theme"), gpui_kit::SharedString::from(name.to_owned())).into()
+}
+
+fn reveal_appearance(id: impl Into<ElementId>, window: &mut Window, cx: &mut App) {
+    let id = id.into();
+    let mut controls: Vec<ElementId> = Vec::new();
+    for setting in ["inline-payload", "inline-payload-limit"] {
+        controls.extend([
+            ElementId::from(format!("{setting}-label")),
+            ElementId::from(setting),
+            ElementId::from(format!("{setting}-description")),
+        ]);
+    }
+    controls.push("inline-payload-max-chars".into());
+    controls.extend(
+        ["reduce-motion-label", "reduce-motion", "reduce-motion-description"]
+            .into_iter()
+            .map(ElementId::from),
+    );
+    controls.extend(["mode-light", "mode-dark", "mode-system"].into_iter().map(ElementId::from));
+    let themes = gpui_kit::component::ThemeRegistry::global(cx).sorted_themes();
+    for mode in [ThemeMode::Light, ThemeMode::Dark] {
+        controls.extend(
+            themes
+                .iter()
+                .filter(|theme| theme.mode == mode)
+                .map(|theme| theme_card_id(&theme.name)),
+        );
+    }
+    let target_index = controls
+        .iter()
+        .position(|control| control == &id)
+        .expect("known appearance control");
+    for _ in 0..200 {
+        window.render_frame(cx);
+        let body = window.find("settings-sections").bounds();
+        let target = window.try_find(id.clone());
+        if target
+            .as_ref()
+            .is_some_and(|target| target.visible() && target.bounds().top() >= body.top() && target.bounds().bottom() <= body.bottom())
+        {
+            return;
+        }
+        // Settings virtualizes whole groups. Neither an offscreen group nor the
+        // old mode group is a reliable wheel target once a theme section scrolls.
+        let (anchor_index, _) = controls
+            .iter()
+            .enumerate()
+            .filter_map(|(index, control)| window.try_find(control.clone()).map(|target| (index, target)))
+            .filter(|(_, target)| {
+                target.visible()
+                    && target.bounds().center().y > body.top() + window.rem_size() * 0.25
+                    && target.bounds().center().y < body.bottom() - window.rem_size() * 0.25
+            })
+            .min_by_key(|(_, target)| (target.bounds().center().y - body.center().y).abs())
+            .expect("the scrolling appearance body must expose a card or control");
+        let upwards = target
+            .as_ref()
+            .map_or(target_index < anchor_index, |target| target.bounds().top() < body.top());
+        let delta = window.rem_size() * if upwards { 4. } else { -4. };
+        window.scroll(
+            controls[anchor_index].clone(),
+            gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.), delta)),
+            cx,
+        );
+    }
+    panic!("appearance control {id:?} did not scroll fully into view");
+}
+
+fn assert_appearance_preview(card: Bounds<Pixels>, preview: Bounds<Pixels>, label: Bounds<Pixels>) {
+    for part in [preview, label] {
+        assert!(
+            part.size.width > px(0.) && part.size.height > px(0.),
+            "preview and label need nonzero geometry: {part:?}"
+        );
+        assert!(
+            part.left() >= card.left() && part.right() <= card.right() && part.top() >= card.top() && part.bottom() <= card.bottom(),
+            "preview and label must stay inside their card: part={part:?}, card={card:?}"
+        );
+    }
+    assert!(
+        preview.bottom() <= label.top(),
+        "the preview must stack above, not overlap, its label"
+    );
+}
+
+fn assert_appearance_cards_do_not_overlap(first: Bounds<Pixels>, second: Bounds<Pixels>) {
+    assert!(
+        first.right() <= second.left()
+            || second.right() <= first.left()
+            || first.bottom() <= second.top()
+            || second.bottom() <= first.top(),
+        "appearance cards must not overlap: first={first:?}, second={second:?}"
+    );
+}
+
 #[gpui_kit::test]
-fn appearance_selectors_stay_compact_and_aligned(cx: &mut TestAppContext) {
+fn appearance_theme_selection_follows_other_options(cx: &mut TestAppContext) {
+    let (handle, _) = open(cx, true, 1200., 1100.);
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("settings-section-appearance", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        let modes = window.find("appearance-mode").bounds();
+        let motion = window.find("reduce-motion").bounds();
+        let inline = window.find("inline-payload").bounds();
+        let limit = window.find("inline-payload-max-chars").bounds();
+        let first_theme = gpui_kit::component::ThemeRegistry::global(cx)
+            .sorted_themes()
+            .into_iter()
+            .find(|theme| theme.mode == ThemeMode::Light)
+            .unwrap()
+            .name
+            .clone();
+        let card = window.find(theme_card_id(&first_theme));
+        assert!(card.visible());
+        assert!(inline.bottom() < limit.top());
+        assert!(limit.bottom() < motion.top());
+        assert!(motion.bottom() < modes.top(), "Reduce motion must precede Appearance mode");
+        assert!(modes.bottom() < card.bounds().top(), "appearance mode must precede Light themes");
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn appearance_preview_cards_and_theme_grids_fit_across_themes_widths_and_zoom(cx: &mut TestAppContext) {
     for theme in [ThemeMode::Light, ThemeMode::Dark] {
         for (width, font_size) in [(760., 16.), (760., 20.), (1200., 16.), (1200., 20.)] {
             let (handle, _) = open(cx, true, width, 540.);
@@ -3608,76 +3738,115 @@ fn appearance_selectors_stay_compact_and_aligned(cx: &mut TestAppContext) {
             cx.run_until_parked();
             cx.update_window(handle, |_, window, cx| {
                 window.render_frame(cx);
-                let settings = window.find("settings-dialog").bounds();
-                let mode = window.find("appearance-mode").bounds();
-                let light = window.find("light-theme").bounds();
-                let dark = window.find("dark-theme").bounds();
-                for selector in [mode, light, dark] {
+                assert_eq!(window.rem_size(), px(font_size));
+                assert!(window.find("inline-payload").visible());
+                let body = window.find("settings-sections").bounds();
+                for id in ["inline-payload", "inline-payload-limit", "reduce-motion"] {
+                    reveal_appearance(format!("{id}-description"), window, cx);
+                    // In the stacked layout, help text precedes the control;
+                    // revealing the text alone can leave the control below the viewport.
+                    reveal_appearance(id, window, cx);
+                    let control = window.find(id);
+                    let label = window.find(format!("{id}-label"));
+                    let description = window.find(format!("{id}-description"));
+                    assert!(label.visible() && description.visible(), "the complete {id} setting must remain visible");
+                    let label = label.bounds();
+                    let description = description.bounds();
                     assert!(
-                        selector.size.width < settings.size.width / 2.,
-                        "appearance selectors should remain compact: selector={selector:?}, settings={settings:?}"
+                        control.visible(),
+                        "miscellaneous setting {id} must remain reachable: theme={theme:?}, width={width}, font={font_size}, body={body:?}, control={:?}, label={label:?}, description={description:?}",
+                        control.bounds()
                     );
-                    assert!(selector.left() >= settings.left() && selector.right() <= settings.right());
-                    assert_eq!(selector.left(), mode.left(), "selector leading edges should align");
-                    assert_eq!(selector.right(), mode.right(), "selector trailing edges should align");
-                    assert_eq!(selector.size, mode.size, "appearance selectors should share one control size");
+                    assert!(control.bounds().left() >= body.right() && control.bounds().right() <= window.viewport_size().width);
+                    assert!(control.bounds().top() >= body.top() && control.bounds().bottom() <= body.bottom());
+                    assert_eq!(description.left(), label.left());
+                    assert!(description.bottom() <= body.bottom());
                 }
-                assert!(mode.bottom() < light.top());
-                assert!(light.bottom() < dark.top());
-                let mode_label = window.find("appearance-mode-label").bounds();
-                let mut previous_bottom = None;
-                for (id, selector) in [("appearance-mode", mode), ("light-theme", light), ("dark-theme", dark)] {
-                    let label = window.find(format!("{id}-label")).bounds();
-                    let description = window.find(format!("{id}-description")).bounds();
-                    assert_eq!(label.left(), mode_label.left(), "field labels should share a leading edge");
-                    assert_eq!(description.left(), label.left(), "help text should align with its label");
-                    assert_eq!(description.top() - label.bottom(), window.rem_size() * 0.25);
-                    if selector.left() == label.left() {
-                        assert_eq!(selector.top() - description.bottom(), window.rem_size() * 0.5);
-                    } else {
-                        assert_eq!(selector.center().y, label.center().y, "align controls to labels, not descriptions");
-                        assert_eq!(selector.left() - label.right(), window.rem_size() * 1.5);
-                    }
-                    if let Some(bottom) = previous_bottom {
-                        assert_eq!(label.top() - bottom, window.rem_size(), "setting rows should share one gap");
-                    }
-                    previous_bottom = Some(description.bottom().max(selector.bottom()));
-                }
-                window.scroll("appearance-mode", gpui_kit::ScrollDelta::Lines(gpui_kit::point(0., -20.)), cx);
-                let motion = window.find("reduce-motion");
-                let label = window.find("reduce-motion-label").bounds();
-                let description = window.find("reduce-motion-description").bounds();
-                assert!(
-                    motion.visible(),
-                    "the motion setting must be reachable at minimum size and larger text"
-                );
-                assert!(motion.bounds().left() >= settings.left() && motion.bounds().right() <= settings.right());
-                assert!(motion.bounds().top() >= settings.top() && motion.bounds().bottom() <= settings.bottom());
-                assert_eq!(description.left(), label.left());
-                assert!(description.bottom() <= settings.bottom());
-                let inline = window.find("inline-payload");
-                let label = window.find("inline-payload-label").bounds();
-                let description = window.find("inline-payload-description").bounds();
-                assert!(inline.visible(), "inline payload must be reachable at minimum size and larger text");
-                assert!(inline.bounds().left() >= settings.left() && inline.bounds().right() <= settings.right());
-                assert_eq!(inline.bounds().left(), motion.bounds().left());
-                assert_eq!(description.left(), label.left());
-                assert!(description.bottom() <= settings.bottom());
-                window.scroll("inline-payload", gpui_kit::ScrollDelta::Lines(gpui_kit::point(0., -20.)), cx);
-                let limit = window.find("inline-payload-limit");
+                reveal_appearance("inline-payload-max-chars", window, cx);
+                let limit = window.find("inline-payload-limit").bounds();
                 let number = window.find("inline-payload-max-chars");
-                let label = window.find("inline-payload-limit-label").bounds();
-                let description = window.find("inline-payload-limit-description").bounds();
-                assert!(
-                    limit.visible() && number.visible(),
-                    "length controls must fit at minimum size and larger text"
-                );
-                assert!(limit.bounds().left() >= settings.left());
-                assert!(limit.bounds().right() < number.bounds().left());
-                assert!(number.bounds().right() <= settings.right());
-                assert_eq!(number.bounds().center().y, limit.bounds().center().y);
-                assert_eq!(label.left(), description.left());
-                assert!(description.bottom() <= settings.bottom());
+                assert!(number.visible());
+                assert!(limit.right() < number.bounds().left());
+                assert_eq!(number.bounds().center().y, limit.center().y);
+                let mut mode_size = None;
+                for (id, label, mode) in [
+                    ("mode-light", "Light", AppearanceMode::Light),
+                    ("mode-dark", "Dark", AppearanceMode::Dark),
+                    ("mode-system", "Follow system", AppearanceMode::System),
+                ] {
+                    reveal_appearance(id, window, cx);
+                    let card = window.within("appearance-mode").find(id);
+                    assert_eq!(card.label(), Some(label));
+                    assert_eq!(card.selected(), Some(Appearance::mode(cx) == mode));
+                    let bounds = card.bounds();
+                    assert!(bounds.left() >= body.right() && bounds.right() <= window.viewport_size().width);
+                    if let Some(expected) = mode_size {
+                        assert_eq!(bounds.size, expected, "mode previews must share one card size");
+                    }
+                    mode_size = Some(bounds.size);
+                    let scope = window.within(id);
+                    let preview = scope.find("mode-preview").bounds();
+                    let label = scope.find("mode-label").bounds();
+                    assert_eq!(preview.size.height, window.rem_size() * 5.);
+                    assert_appearance_preview(bounds, preview, label);
+                    for other in ["mode-light", "mode-dark", "mode-system"].into_iter().filter(|other| *other != id) {
+                        if let Some(other) = window.try_find(other) {
+                            assert_appearance_cards_do_not_overlap(bounds, other.bounds());
+                        }
+                    }
+                }
+                let themes: Vec<_> = gpui_kit::component::ThemeRegistry::global(cx)
+                    .sorted_themes()
+                    .into_iter()
+                    .cloned()
+                    .collect();
+                let mut card_size: Option<gpui_kit::Size<Pixels>> = None;
+                for (mode, section) in [(ThemeMode::Light, "light-themes"), (ThemeMode::Dark, "dark-themes")] {
+                    let matching: Vec<_> = themes.iter().filter(|theme| theme.mode == mode).collect();
+                    assert!(matching.len() >= 2, "exercise a real theme grid");
+                    for (index, config) in matching.iter().enumerate() {
+                        let id = theme_card_id(&config.name);
+                        reveal_appearance(id.clone(), window, cx);
+                        let card = window.within(section).find(id.clone());
+                        let label = format!("{}, {} theme", config.name, if mode.is_dark() { "Dark" } else { "Light" });
+                        assert_eq!(card.label(), Some(label.as_str()));
+                        assert_eq!(card.selected(), Some(&config.name == cx.theme().theme_name()));
+                        assert!(
+                            !card
+                                .path()
+                                .contains(&ElementId::from(if mode.is_dark() { "light-themes" } else { "dark-themes" }))
+                        );
+                        let bounds = card.bounds();
+                        assert!(bounds.left() >= body.right() && bounds.right() <= window.viewport_size().width);
+                        if let Some(expected) = card_size {
+                            assert!((bounds.size.width - expected.width).abs() <= px(1.));
+                            assert_eq!(bounds.size.height, expected.height, "theme cards must share one height");
+                        }
+                        card_size = Some(bounds.size);
+                        let scope = window.within(id);
+                        let swatch = scope.find("theme-swatch").bounds();
+                        let label = scope.find("theme-label").bounds();
+                        assert_eq!(swatch.size.height, window.rem_size() * 4.);
+                        assert_appearance_preview(bounds, swatch, label);
+                        for other in matching.iter().take(index) {
+                            if let Some(other) = window.try_find(theme_card_id(&other.name)) {
+                                let other = other.bounds();
+                                assert_appearance_cards_do_not_overlap(bounds, other);
+                                if (bounds.top() - other.top()).abs() <= px(1.) {
+                                    assert_eq!(bounds.bottom(), other.bottom(), "grid rows must align");
+                                    assert!(other.right() <= bounds.left(), "themes follow registry order across a row");
+                                } else {
+                                    assert!(other.bottom() <= bounds.top(), "wrapped themes follow registry order down the grid");
+                                }
+                            }
+                        }
+                        if index == 1 && width == 1200. {
+                            let first = window.find(theme_card_id(&matching[0].name)).bounds();
+                            assert_eq!(first.top(), bounds.top(), "wide settings should show multiple theme columns");
+                        }
+                    }
+                }
+                window.click("close-settings", cx);
             })
             .unwrap();
         }
@@ -3727,10 +3896,11 @@ fn inline_payload_switch_updates_cached_previews_and_persists_pointer_and_keyboa
     cx.run_until_parked();
     for enabled in [false, true] {
         cx.update_window(handle, |_, window, cx| {
-            window.render_frame(cx);
+            reveal_appearance("inline-payload", window, cx);
             assert_eq!(window.find("inline-payload").label(), Some("Inline payload"));
             assert_eq!(window.find("inline-payload").checked(), Some(!enabled));
             if enabled {
+                reveal_appearance("reduce-motion", window, cx);
                 window.click("reduce-motion", cx);
             } else {
                 window.click("inline-payload", cx);
@@ -3742,13 +3912,18 @@ fn inline_payload_switch_updates_cached_previews_and_persists_pointer_and_keyboa
             cx.update_window(handle, |_, window, cx| window.press("escape", cx)).unwrap();
             cx.run_until_parked();
             cx.update_window(handle, |_, window, cx| {
-                for _ in 0..16 {
+                let tab_limit = gpui_kit::component::ThemeRegistry::global(cx).sorted_themes().len() + 16;
+                for _ in 0..tab_limit {
                     window.press("tab", cx);
-                    if window.find("inline-payload").focused() == Some(true) {
+                    if window
+                        .try_find("inline-payload")
+                        .is_some_and(|control| control.focused() == Some(true))
+                    {
                         break;
                     }
                 }
                 assert_eq!(window.find("inline-payload").focused(), Some(true));
+                assert!(!Appearance::inline_payload(cx), "tabbing alone must not enable inline payloads");
                 window.press("space", cx);
             })
             .unwrap();
@@ -3820,7 +3995,7 @@ fn inline_payload_length_limit_supports_native_input_steps_and_hides_only_long_p
     .unwrap();
     cx.run_until_parked();
     cx.update_window(handle, |_, window, cx| {
-        window.render_frame(cx);
+        reveal_appearance("inline-payload-limit", window, cx);
         assert_eq!(window.find("inline-payload-limit").checked(), Some(false));
         assert_eq!(window.find(("input", input_id)).value(), Some("10"));
         let before = Appearance::inline_payload_max_chars(cx);
@@ -3853,7 +4028,7 @@ fn inline_payload_length_limit_supports_native_input_steps_and_hides_only_long_p
     .unwrap();
     cx.run_until_parked();
     cx.update_window(handle, |_, window, cx| {
-        window.render_frame(cx);
+        reveal_appearance("inline-payload-max-chars", window, cx);
         window.click(("input", input_id), cx);
         window.press("secondary-a", cx);
         window.input("11", cx);
@@ -3899,13 +4074,13 @@ fn inline_payload_length_limit_supports_native_input_steps_and_hides_only_long_p
     .unwrap();
     cx.run_until_parked();
     cx.update_window(handle, |_, window, cx| {
-        window.render_frame(cx);
+        reveal_appearance("inline-payload-limit", window, cx);
         window.click("inline-payload-limit", cx);
     })
     .unwrap();
     cx.run_until_parked();
     cx.update_window(handle, |_, window, cx| {
-        window.render_frame(cx);
+        reveal_appearance("inline-payload-limit", window, cx);
         assert_eq!(window.find("inline-payload-limit").checked(), Some(false));
         assert_eq!(window.find(("input", input_id)).value(), Some("11"));
         let before = Appearance::inline_payload_max_chars(cx);
@@ -3924,7 +4099,7 @@ fn inline_payload_length_limit_supports_native_input_steps_and_hides_only_long_p
     .unwrap();
     cx.run_until_parked();
     cx.update_window(handle, |_, window, cx| {
-        window.render_frame(cx);
+        reveal_appearance("inline-payload-limit", window, cx);
         assert_eq!(window.find("inline-payload-limit").checked(), Some(false));
         assert_eq!(window.find(("input", input_id)).value(), Some("11"));
         window.click("close-settings", cx);
@@ -4031,6 +4206,7 @@ fn inline_payload_nontext_types_use_datatype_tags_without_a_length_limit_and_hid
     cx.update_window(handle, |_, window, cx| {
         window.click("settings", cx);
         window.click("settings-section-appearance", cx);
+        reveal_appearance("inline-payload", window, cx);
         window.click("inline-payload", cx);
     })
     .unwrap();
@@ -4052,6 +4228,7 @@ fn inline_payload_nontext_types_use_datatype_tags_without_a_length_limit_and_hid
         assert!(window.find("topic:home:preview").label().unwrap().contains("2 topics"));
         window.click("settings", cx);
         window.click("settings-section-appearance", cx);
+        reveal_appearance("inline-payload", window, cx);
         window.click("inline-payload", cx);
     })
     .unwrap();
@@ -4164,7 +4341,7 @@ fn reduce_motion_menu_supports_pointer_keyboard_and_saved_preferences(cx: &mut T
     cx.run_until_parked();
     let previous_focus = cx
         .update_window(handle, |_, window, cx| {
-            window.render_frame(cx);
+            reveal_appearance("reduce-motion", window, cx);
             assert_eq!(window.find("reduce-motion").label(), Some("Reduce motion: System"));
             let focus = window.focused(cx);
             window.click("reduce-motion", cx);
@@ -4193,7 +4370,11 @@ fn reduce_motion_menu_supports_pointer_keyboard_and_saved_preferences(cx: &mut T
         (2, ReduceMotion::Off, "off"),
         (0, ReduceMotion::System, "system"),
     ] {
-        cx.update_window(handle, |_, window, cx| window.click("reduce-motion", cx)).unwrap();
+        cx.update_window(handle, |_, window, cx| {
+            reveal_appearance("reduce-motion", window, cx);
+            window.click("reduce-motion", cx);
+        })
+        .unwrap();
         cx.run_until_parked();
         cx.update_window(handle, |_, window, cx| {
             window.render_frame(cx);
@@ -4234,177 +4415,201 @@ fn reduce_motion_menu_supports_pointer_keyboard_and_saved_preferences(cx: &mut T
 }
 
 #[gpui_kit::test]
-fn appearance_menus_support_keyboard_selection_dismissal_and_saved_preferences(cx: &mut TestAppContext) {
+fn appearance_cards_support_pointer_keyboard_selection_and_saved_preferences(cx: &mut TestAppContext) {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("appearance.json");
-    let (handle, _) = open(cx, true, 760., 540.);
+    let (handle, view) = open(cx, false, 760., 540.);
     cx.update(|cx| cx.set_global(crate::appearance::load(&path, cx).unwrap()));
     cx.update_window(handle, |_, window, cx| {
+        window.activate_window();
         crate::appearance::select_mode(AppearanceMode::Dark, window, cx).unwrap();
         window.render_frame(cx);
+        window.click("settings", cx);
         window.click("settings-section-appearance", cx);
     })
     .unwrap();
     cx.run_until_parked();
-    let previous_focus = cx
-        .update_window(handle, |_, window, cx| {
-            window.render_frame(cx);
-            assert_eq!(window.find("appearance-mode").label(), Some("Mode: Dark"));
-            assert_eq!(window.find("light-theme").label(), Some("Light theme: Ayu Light"));
-            assert_eq!(window.find("dark-theme").label(), Some("Dark theme: Ayu Dark"));
-            let focus = window.focused(cx);
-            window.click("light-theme", cx);
-            focus
+    cx.update_window(handle, |_, window, cx| {
+        reveal_appearance("mode-light", window, cx);
+        assert_eq!(window.find("mode-dark").selected(), Some(true));
+        window.click("mode-light", cx);
+        assert_eq!(Appearance::mode(cx), AppearanceMode::Light);
+        assert_eq!(cx.theme().theme_name().as_str(), "Ayu Light");
+        assert_eq!(window.find("mode-light").selected(), Some(true));
+        window.press("tab", cx);
+        assert_eq!(window.find("mode-dark").focused(), Some(true));
+        assert_eq!(
+            window.find("mode-dark").selected(),
+            Some(false),
+            "focus alone must not select a mode"
+        );
+        assert_eq!(Appearance::mode(cx), AppearanceMode::Light);
+        window.press("space", cx);
+        assert_eq!(Appearance::mode(cx), AppearanceMode::Dark);
+        assert_eq!(cx.theme().theme_name().as_str(), "Ayu Dark");
+        assert_eq!(window.find("mode-dark").selected(), Some(true));
+        assert_eq!(window.find("mode-light").selected(), Some(false));
+        let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["mode"], "dark");
+        window.press("tab", cx);
+        assert_eq!(window.find("mode-system").focused(), Some(true));
+        window.press("enter", cx);
+        assert_eq!(Appearance::mode(cx), AppearanceMode::System);
+        assert_eq!(cx.theme().mode, ThemeMode::from(window.appearance()));
+        assert_eq!(window.find("mode-system").selected(), Some(true));
+        let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["mode"], "system");
+        window.click("mode-dark", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    for (mode, appearance_mode, name, slot, saved_mode) in [
+        (ThemeMode::Light, AppearanceMode::Light, "Gruvbox Light", "light_theme", "light"),
+        (ThemeMode::Dark, AppearanceMode::Dark, "Tokyo Night", "dark_theme", "dark"),
+    ] {
+        cx.update_window(handle, |_, window, cx| {
+            let id = theme_card_id(name);
+            reveal_appearance(id.clone(), window, cx);
+            assert_eq!(window.find(id.clone()).selected(), Some(false));
+            if mode == ThemeMode::Light {
+                window.click(id.clone(), cx);
+            } else {
+                let themes: Vec<_> = gpui_kit::component::ThemeRegistry::global(cx)
+                    .sorted_themes()
+                    .into_iter()
+                    .filter(|theme| theme.mode == mode)
+                    .map(|theme| theme.name.clone())
+                    .collect();
+                let index = themes.iter().position(|theme| theme.as_str() == name).unwrap();
+                let previous = theme_card_id(&themes[index - 1]);
+                reveal_appearance(previous.clone(), window, cx);
+                window.click(previous, cx);
+                window.press("tab", cx);
+                assert_eq!(window.find(id.clone()).focused(), Some(true));
+                assert_eq!(window.find(id.clone()).selected(), Some(false));
+                assert_ne!(Appearance::selected_theme(mode, cx), name, "tabbing must not activate a theme");
+                window.press("enter", cx);
+            }
+            assert_eq!(
+                Appearance::mode(cx),
+                appearance_mode,
+                "an explicit appearance follows the clicked theme's mode"
+            );
+            assert_eq!(Appearance::selected_theme(mode, cx), name);
+            assert_eq!(cx.theme().mode, mode);
+            assert_eq!(cx.theme().theme_name().as_str(), name);
+            assert_eq!(window.find(id).selected(), Some(true));
+            assert!(view.read(cx).error.is_none());
+            let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(saved["mode"], saved_mode);
+            assert_eq!(saved[slot], name);
         })
         .unwrap();
+        cx.run_until_parked();
+    }
+    cx.update_window(handle, |_, window, cx| {
+        reveal_appearance("mode-light", window, cx);
+        window.click("mode-light", cx);
+        assert_eq!(cx.theme().theme_name().as_str(), "Gruvbox Light");
+        crate::appearance::sync_system(window, cx);
+        assert_eq!(
+            cx.theme().theme_name().as_str(),
+            "Gruvbox Light",
+            "explicit mode ignores system appearance"
+        );
+        window.click("mode-dark", cx);
+        assert_eq!(cx.theme().theme_name().as_str(), "Tokyo Night");
+        assert_eq!(cx.theme().highlight_theme.name, "Tokyo Night");
+        window.click("mode-system", cx);
+        let before = cx.theme().clone();
+        let inactive = if before.mode.is_dark() { ThemeMode::Light } else { ThemeMode::Dark };
+        let names: Vec<_> = gpui_kit::component::ThemeRegistry::global(cx)
+            .sorted_themes()
+            .into_iter()
+            .filter(|theme| theme.mode == inactive)
+            .map(|theme| theme.name.clone())
+            .take(2)
+            .collect();
+        assert_eq!(names.len(), 2);
+        for (index, name) in names.iter().enumerate() {
+            let id = theme_card_id(name);
+            reveal_appearance(id.clone(), window, cx);
+            if index == 0 {
+                window.click(id.clone(), cx);
+            } else {
+                window.press("tab", cx);
+                assert_eq!(window.find(id.clone()).focused(), Some(true));
+                assert_eq!(Appearance::selected_theme(inactive, cx), names[0].as_str());
+                window.press("space", cx);
+            }
+            assert_eq!(Appearance::mode(cx), AppearanceMode::System);
+            assert_eq!(Appearance::selected_theme(inactive, cx), name.as_str());
+            assert_eq!(cx.theme().mode, before.mode);
+            assert_eq!(cx.theme().theme_name(), before.theme_name());
+            assert_eq!(
+                cx.theme().colors,
+                before.colors,
+                "inactive System-mode selection must preserve active colors"
+            );
+            assert_eq!(cx.theme().tokens, before.tokens);
+            assert_eq!(
+                window.find(id).selected(),
+                Some(false),
+                "saved inactive slots are not active theme selections"
+            );
+            let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(saved["mode"], "system");
+            assert_eq!(saved[if inactive.is_dark() { "dark_theme" } else { "light_theme" }], name.as_str());
+            assert_eq!(
+                saved[if inactive.is_dark() { "light_theme" } else { "dark_theme" }],
+                before.theme_name().as_str()
+            );
+        }
+        let active = theme_card_id(before.theme_name());
+        reveal_appearance(active.clone(), window, cx);
+        assert_eq!(window.find(active).selected(), Some(true));
+        window.click("close-settings", cx);
+    })
+    .unwrap();
     cx.run_until_parked();
     cx.update_window(handle, |_, window, cx| {
+        let preferences = crate::appearance::load(&path, cx).unwrap();
+        let light = Appearance::selected_theme(ThemeMode::Light, cx).to_owned();
+        let dark = Appearance::selected_theme(ThemeMode::Dark, cx).to_owned();
+        cx.set_global(preferences);
+        crate::appearance::sync_system(window, cx);
+        assert_eq!(Appearance::mode(cx), AppearanceMode::System);
+        assert_eq!(Appearance::selected_theme(ThemeMode::Light, cx), light);
+        assert_eq!(Appearance::selected_theme(ThemeMode::Dark, cx), dark);
         window.render_frame(cx);
-        assert!(window.find("popup-menu").visible());
+        window.click("settings", cx);
+        window.click("settings-section-appearance", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        reveal_appearance("mode-system", window, cx);
+        assert_eq!(window.find("mode-system").selected(), Some(true));
+        let active = theme_card_id(cx.theme().theme_name());
+        reveal_appearance(active.clone(), window, cx);
+        assert_eq!(window.find(active.clone()).selected(), Some(true));
+        // Scrolling observes the restored selection without focusing it.
+        window.click(active.clone(), cx);
+        assert_eq!(window.find(active).focused(), Some(true));
+        assert!(view.read(cx).settings_focus.contains_focused(window, cx));
         window.press("escape", cx);
     })
     .unwrap();
     cx.run_until_parked();
     cx.update_window(handle, |_, window, cx| {
         window.render_frame(cx);
-        assert!(window.try_find("popup-menu").is_none());
-        assert!(window.find("settings-dialog").visible());
-        assert_eq!(window.focused(cx), previous_focus);
-        window.click("light-theme", cx);
+        assert!(window.try_find("settings-dialog").is_none());
     })
     .unwrap();
-    cx.run_until_parked();
-    cx.update_window(handle, |_, window, cx| {
-        window.render_frame(cx);
-        let themes: Vec<_> = gpui_kit::component::ThemeRegistry::global(cx)
-            .sorted_themes()
-            .into_iter()
-            .filter(|theme| theme.mode == ThemeMode::Light)
-            .collect();
-        let menu = window.within("popup-menu");
-        for (ix, theme) in themes.iter().enumerate() {
-            assert_eq!(menu.find(ix).label(), Some(theme.name.as_str()));
-        }
-        let target = themes.iter().position(|theme| theme.name == "Gruvbox Light").unwrap();
-        for _ in 0..themes.len() {
-            window.press("down", cx);
-            if window.within("popup-menu").find(target).selected() == Some(true) {
-                break;
-            }
-        }
-        assert_eq!(window.within("popup-menu").find(target).selected(), Some(true));
-        window.press("enter", cx);
-    })
-    .unwrap();
-    cx.run_until_parked();
-    cx.update_window(handle, |_, window, cx| {
-        window.render_frame(cx);
-        assert_eq!(Appearance::mode(cx), AppearanceMode::Dark);
-        assert_eq!(cx.theme().theme_name().as_str(), "Ayu Dark");
-        assert_eq!(window.find("light-theme").label(), Some("Light theme: Gruvbox Light"));
-        window.click("appearance-mode", cx);
-    })
-    .unwrap();
-    cx.run_until_parked();
-    cx.update_window(handle, |_, window, cx| {
-        window.render_frame(cx);
-        let menu = window.within("popup-menu");
-        for (ix, label) in ["System", "Light", "Dark"].into_iter().enumerate() {
-            assert_eq!(menu.find(ix).label(), Some(label));
-        }
-        for _ in 0..3 {
-            window.press("down", cx);
-            if window.within("popup-menu").find(1usize).selected() == Some(true) {
-                break;
-            }
-        }
-        assert_eq!(window.within("popup-menu").find(1usize).selected(), Some(true));
-        window.press("enter", cx);
-    })
-    .unwrap();
-    cx.run_until_parked();
-    cx.update_window(handle, |_, window, cx| {
-        window.render_frame(cx);
-        assert_eq!(Appearance::mode(cx), AppearanceMode::Light);
-        assert_eq!(cx.theme().theme_name().as_str(), "Gruvbox Light");
-        crate::appearance::sync_system(window, cx);
-        assert_eq!(cx.theme().theme_name().as_str(), "Gruvbox Light");
-        assert_eq!(window.find("appearance-mode").label(), Some("Mode: Light"));
-        window.click("dark-theme", cx);
-    })
-    .unwrap();
-    cx.run_until_parked();
-    cx.update_window(handle, |_, window, cx| {
-        window.render_frame(cx);
-        let themes: Vec<_> = gpui_kit::component::ThemeRegistry::global(cx)
-            .sorted_themes()
-            .into_iter()
-            .filter(|theme| theme.mode == ThemeMode::Dark)
-            .collect();
-        let target = themes.iter().position(|theme| theme.name == "Tokyo Night").unwrap();
-        let menu = window.within("popup-menu");
-        for (ix, theme) in themes.iter().enumerate() {
-            assert_eq!(menu.find(ix).label(), Some(theme.name.as_str()));
-        }
-        window.scroll("popup-menu", gpui_kit::ScrollDelta::Lines(gpui_kit::point(0., -20.)), cx);
-        window.render_frame(cx);
-        window.within("popup-menu").click(target, cx);
-    })
-    .unwrap();
-    cx.run_until_parked();
-    cx.update_window(handle, |_, window, cx| {
-        window.render_frame(cx);
-        assert_eq!(cx.theme().theme_name().as_str(), "Gruvbox Light");
-        assert_eq!(window.find("dark-theme").label(), Some("Dark theme: Tokyo Night"));
-        window.click("appearance-mode", cx);
-    })
-    .unwrap();
-    cx.run_until_parked();
-    cx.update_window(handle, |_, window, cx| {
-        window.render_frame(cx);
-        window.within("popup-menu").click(2usize, cx);
-    })
-    .unwrap();
-    cx.run_until_parked();
-    cx.update_window(handle, |_, window, cx| {
-        window.render_frame(cx);
-        assert_eq!(Appearance::mode(cx), AppearanceMode::Dark);
-        assert_eq!(cx.theme().theme_name().as_str(), "Tokyo Night");
-        assert_eq!(cx.theme().highlight_theme.name, "Tokyo Night");
-        window.click("appearance-mode", cx);
-    })
-    .unwrap();
-    cx.run_until_parked();
-    cx.update_window(handle, |_, window, cx| {
-        window.render_frame(cx);
-        window.within("popup-menu").click(0usize, cx);
-    })
-    .unwrap();
-    cx.run_until_parked();
-    cx.update_window(handle, |_, window, cx| {
-        window.render_frame(cx);
-        assert_eq!(Appearance::mode(cx), AppearanceMode::System);
-        let expected = if ThemeMode::from(window.appearance()).is_dark() {
-            "Tokyo Night"
-        } else {
-            "Gruvbox Light"
-        };
-        assert_eq!(cx.theme().theme_name().as_str(), expected);
-        assert_eq!(window.find("appearance-mode").label(), Some("Mode: System"));
-        assert!(window.try_find("popup-menu").is_none());
-        assert!(window.find("settings-dialog").visible());
-    })
-    .unwrap();
-    cx.update(|cx| {
-        cx.set_global(crate::appearance::load(&path, cx).unwrap());
-        assert_eq!(Appearance::mode(cx), AppearanceMode::System);
-        assert_eq!(Appearance::selected_theme(ThemeMode::Light, cx), "Gruvbox Light");
-        assert_eq!(Appearance::selected_theme(ThemeMode::Dark, cx), "Tokyo Night");
-    });
 }
 
 #[gpui_kit::test]
-fn appearance_menus_load_custom_themes_created_after_opening_explorer_and_save_selection(cx: &mut TestAppContext) {
+fn appearance_cards_load_custom_themes_created_after_opening_explorer_and_save_selection(cx: &mut TestAppContext) {
     use std::fs;
 
     let directory = tempfile::tempdir().unwrap();
@@ -4423,14 +4628,15 @@ fn appearance_menus_load_custom_themes_created_after_opening_explorer_and_save_s
         }
     });
     cx.update_window(handle, |_, window, cx| {
-        crate::appearance::select_mode(AppearanceMode::Light, window, cx).unwrap();
+        window.activate_window();
+        crate::appearance::select_mode(AppearanceMode::Dark, window, cx).unwrap();
         window.render_frame(cx);
         window.click("settings-section-appearance", cx);
     })
     .unwrap();
     cx.run_until_parked();
 
-    // Write only after Explorer is open, so startup theme loading cannot satisfy the test.
+    // Write only after Explorer is open, so startup loading cannot satisfy the test.
     fs::create_dir_all(themes_directory.parent().unwrap()).unwrap();
     fs::create_dir(&themes_directory).unwrap();
     fs::write(themes_directory.join("broken.json"), "invalid JSON").unwrap();
@@ -4448,86 +4654,73 @@ fn appearance_menus_load_custom_themes_created_after_opening_explorer_and_save_s
         )
         .unwrap();
     }
-
-    for (id, mode, name, other_name, preference) in [
+    cx.update_window(handle, |_, window, cx| {
+        window.click("settings-section-about", cx);
+        window.click("settings-section-appearance", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    for (section, mode, appearance_mode, name, preference) in [
         (
-            "light-theme",
+            "light-themes",
             ThemeMode::Light,
+            AppearanceMode::Light,
             "AAA Custom Light",
-            "AAA Custom Dark",
             "light_theme",
         ),
-        ("dark-theme", ThemeMode::Dark, "AAA Custom Dark", "AAA Custom Light", "dark_theme"),
+        (
+            "dark-themes",
+            ThemeMode::Dark,
+            AppearanceMode::Dark,
+            "AAA Custom Dark",
+            "dark_theme",
+        ),
     ] {
         cx.update_window(handle, |_, window, cx| {
-            window.render_frame(cx);
-            window.click(id, cx);
-        })
-        .unwrap();
-        cx.run_until_parked();
-        cx.update_window(handle, |_, window, cx| {
-            window.render_frame(cx);
             let themes: Vec<_> = gpui_kit::component::ThemeRegistry::global(cx)
                 .sorted_themes()
                 .into_iter()
                 .filter(|theme| theme.mode == mode)
+                .map(|theme| theme.name.clone())
                 .collect();
-            let target = themes.iter().position(|theme| theme.name == name).unwrap();
-            let menu = window.within("popup-menu");
-            for (index, theme) in themes.iter().enumerate() {
-                let item = menu.find(index);
-                assert_eq!(item.label(), Some(theme.name.as_str()));
-                assert_ne!(item.label(), Some(other_name));
-            }
-            assert!(menu.try_find(themes.len()).is_none());
-            assert!(menu.find(target).visible());
+            assert!(themes.iter().any(|theme| theme.as_str() == name));
+            let id = theme_card_id(name);
+            reveal_appearance(id.clone(), window, cx);
+            let label = format!("{name}, {} theme", if mode.is_dark() { "Dark" } else { "Light" });
+            assert_eq!(window.within(section).find(id.clone()).label(), Some(label.as_str()));
             if mode == ThemeMode::Light {
-                for _ in 0..themes.len() {
-                    window.press("up", cx);
-                    if window.within("popup-menu").find(target).selected() == Some(true) {
-                        break;
-                    }
-                }
-                assert_eq!(window.within("popup-menu").find(target).selected(), Some(true));
+                let index = themes.iter().position(|theme| theme.as_str() == name).unwrap();
+                let next = theme_card_id(&themes[index + 1]);
+                reveal_appearance(next.clone(), window, cx);
+                window.click(next, cx);
+                window.press("shift-tab", cx);
+                assert_eq!(window.find(id.clone()).focused(), Some(true));
+                assert_ne!(Appearance::selected_theme(mode, cx), name);
                 window.press("enter", cx);
             } else {
-                window.within("popup-menu").click(target, cx);
+                window.click(id.clone(), cx);
             }
-        })
-        .unwrap();
-        cx.run_until_parked();
-        cx.update_window(handle, |_, window, cx| {
-            window.render_frame(cx);
-            let label = format!("{} theme: {name}", if mode.is_dark() { "Dark" } else { "Light" });
-            assert_eq!(window.find(id).label(), Some(label.as_str()));
+            assert_eq!(window.find(id).selected(), Some(true));
             assert_eq!(Appearance::selected_theme(mode, cx), name);
-            assert_eq!(Appearance::mode(cx), AppearanceMode::Light);
-            assert_eq!(cx.theme().theme_name().as_str(), "AAA Custom Light");
-            assert!(view.read(cx).error.is_none());
-            assert!(window.try_find("popup-menu").is_none());
+            assert_eq!(Appearance::mode(cx), appearance_mode);
+            assert_eq!(cx.theme().theme_name().as_str(), name);
+            assert!(
+                view.read(cx).error.is_none(),
+                "a malformed neighboring theme must not block valid themes"
+            );
             let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
             assert_eq!(saved[preference], name);
         })
         .unwrap();
+        cx.run_until_parked();
     }
-
-    cx.update_window(handle, |_, window, cx| window.click("appearance-mode", cx))
-        .unwrap();
-    cx.run_until_parked();
     cx.update_window(handle, |_, window, cx| {
-        window.render_frame(cx);
-        window.within("popup-menu").click(2usize, cx);
+        reveal_appearance("mode-dark", window, cx);
+        assert_eq!(window.find("mode-dark").selected(), Some(true));
+        window.click("close-settings", cx);
     })
     .unwrap();
     cx.run_until_parked();
-    cx.update_window(handle, |_, window, cx| {
-        window.render_frame(cx);
-        assert_eq!(Appearance::mode(cx), AppearanceMode::Dark);
-        assert_eq!(cx.theme().theme_name().as_str(), "AAA Custom Dark");
-        assert_eq!(window.find("appearance-mode").label(), Some("Mode: Dark"));
-        assert!(window.try_find("popup-menu").is_none());
-    })
-    .unwrap();
     cx.update(|cx| {
         cx.set_global(crate::appearance::load(&path, cx).unwrap());
         assert_eq!(Appearance::mode(cx), AppearanceMode::Dark);
@@ -4594,8 +4787,11 @@ fn title_bar_picker_lists_saved_servers_and_settings_hold_theme(cx: &mut TestApp
         window.render_frame(cx);
         assert!(window.find("settings-dialog").visible());
         assert!(window.find("appearance-mode").visible());
-        assert!(window.find("light-theme").visible());
-        assert!(window.find("dark-theme").visible());
+        for (section, name) in [("light-themes", "Ayu Light"), ("dark-themes", "Ayu Dark")] {
+            let id = theme_card_id(name);
+            reveal_appearance(id.clone(), window, cx);
+            assert!(window.within(section).find(id).visible());
+        }
         assert_eq!(window.find("close-settings").label(), Some("Close settings"));
         window.click("close-settings", cx);
     })
@@ -7341,7 +7537,7 @@ fn reduce_motion_setting_stops_active_and_future_topic_and_payload_animations(cx
     .unwrap();
     cx.run_until_parked();
     cx.update_window(handle, |_, window, cx| {
-        window.render_frame(cx);
+        reveal_appearance("reduce-motion", window, cx);
         window.click("reduce-motion", cx);
     })
     .unwrap();

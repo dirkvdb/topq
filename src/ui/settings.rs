@@ -1,6 +1,6 @@
 //! Settings pages and broker management for the explorer.
 
-use std::sync::Arc;
+use std::{rc::Rc, sync::Arc};
 
 use super::{ConnectionStatus, ConnectionTestStatus, Explorer, connection_label, messages::LocalizedError};
 use crate::{
@@ -10,12 +10,14 @@ use crate::{
     mqtt::{self, Qos},
 };
 use gpui_kit::assets::IconName as AssetIconName;
-use gpui_kit::base::Link;
+use gpui_kit::base::{Link, Radio, RadioGroup};
 use gpui_kit::component::{
-    ActiveTheme, AxisExt, Disableable, FocusTrapElement, Icon, IconName, Sizable, StyledExt, ThemeMode, ThemeRegistry, WindowExt,
+    ActiveTheme, AxisExt, Disableable, FocusTrapElement, Icon, IconName, Sizable, StyledExt, Theme, ThemeColor, ThemeConfig, ThemeMode,
+    ThemeRegistry, WindowExt,
     button::{Button, ButtonVariant, ButtonVariants},
     checkbox::Checkbox,
     collapsible::Collapsible,
+    dialog::Confirm,
     input::{Input, InputGroup, InputState, NumberInput},
     label::Label,
     menu::{DropdownMenu, PopupMenuItem},
@@ -27,7 +29,7 @@ use gpui_kit::component::{
     tooltip::Tooltip,
 };
 use gpui_kit::{
-    AnyElement, App, Asset, AvailableSpace, Bounds, Context, Element, ElementId, Entity, GlobalElementId, ImageCacheError,
+    AnyElement, App, Asset, AvailableSpace, Axis, Bounds, Context, Div, Element, ElementId, Entity, GlobalElementId, ImageCacheError,
     InspectorElementId, IntoElement, LayoutId, MouseButton, ObjectFit, Pixels, RenderImage, Role, SharedString, Style, StyledImage,
     TestSupportExt, WeakEntity, Window, div, img, prelude::*, px, relative, rems, size,
 };
@@ -202,6 +204,11 @@ impl Explorer {
     fn select_settings_page(&mut self, page_ix: usize, cx: &mut Context<Self>) {
         if self.settings_page_ix == page_ix {
             return;
+        }
+        if page_ix == 1
+            && let Err(error) = appearance::load_custom_themes(cx)
+        {
+            tracing::warn!(error_code = error.code(), diagnostic = ?error, "appearance.custom_themes.load_failed");
         }
         self.settings_page_ix = page_ix;
         self.settings_generation += 1;
@@ -1312,58 +1319,38 @@ impl Explorer {
 
     fn appearance_page(&self, cx: &mut Context<Self>) -> SettingPage {
         let view = cx.weak_entity();
-        let mut group = SettingGroup::new().item(
-            SettingItem::render(move |options, _, cx| {
-                Self::appearance_setting(
-                    "appearance-mode",
-                    "Mode",
-                    "Follow your system or choose Light or Dark.",
-                    Self::appearance_mode_menu(view.clone(), cx),
-                    options.layout().is_vertical(),
-                    cx,
-                )
+        let mode_group = SettingGroup::new().item(
+            SettingItem::render(move |_, _, cx| {
+                div()
+                    .v_flex()
+                    .gap_3()
+                    .child(Self::appearance_heading(
+                        "Appearance mode",
+                        "Choose a light or dark appearance, or follow your system.",
+                        cx,
+                    ))
+                    .child(Self::appearance_mode_choices(view.clone(), cx))
             })
             .keywords(["mode", "system", "appearance"]),
         );
-        for (mode, title, description) in [
-            (ThemeMode::Light, "Light theme", "Used when the appearance is light."),
-            (ThemeMode::Dark, "Dark theme", "Used when the appearance is dark."),
-        ] {
-            let view = cx.weak_entity();
-            group = group.item(
-                SettingItem::render(move |options, _, cx| {
-                    Self::appearance_setting(
-                        if mode.is_dark() { "dark-theme" } else { "light-theme" },
-                        title,
-                        description,
-                        Self::theme_menu(view.clone(), mode, cx),
-                        options.layout().is_vertical(),
-                        cx,
-                    )
-                })
-                .keywords([title, "theme", "appearance", "color"]),
-            );
-        }
         let view = cx.weak_entity();
-        group = group.item(
-            SettingItem::render(move |options, _, cx| {
-                Self::appearance_setting(
-                    "reduce-motion",
-                    "Reduce motion",
-                    match Appearance::reduce_motion(cx) {
-                        ReduceMotion::System => "Follow your system’s reduced-motion preference.",
-                        ReduceMotion::On => "Disable topic and payload change animations to reduce rendering load.",
-                        ReduceMotion::Off => "Animate topic and payload changes, regardless of the system preference.",
-                    },
-                    Self::reduce_motion_menu(view.clone(), cx),
-                    options.layout().is_vertical(),
-                    cx,
-                )
-            })
-            .keywords(["motion", "animation", "performance", "appearance"]),
-        );
+        let reduce_motion = SettingItem::render(move |options, _, cx| {
+            Self::appearance_setting(
+                "reduce-motion",
+                "Reduce motion",
+                match Appearance::reduce_motion(cx) {
+                    ReduceMotion::System => "Follow your system’s reduced-motion preference.",
+                    ReduceMotion::On => "Disable topic and payload change animations to reduce rendering load.",
+                    ReduceMotion::Off => "Animate topic and payload changes, regardless of the system preference.",
+                },
+                Self::reduce_motion_menu(view.clone(), cx),
+                options.layout().is_vertical(),
+                cx,
+            )
+        })
+        .keywords(["motion", "animation", "performance", "appearance"]);
         let view = cx.weak_entity();
-        group = group.item(
+        let mut group = SettingGroup::new().item(
             SettingItem::render(move |options, _, cx| {
                 let view = view.clone();
                 Self::appearance_setting(
@@ -1423,6 +1410,7 @@ impl Explorer {
                 .keywords(["inline", "payload", "length", "limit", "characters", "display"]),
             );
         }
+        group = group.item(reduce_motion);
         if let Some(error) = self.error.clone() {
             group = group.footer(move |_, cx| {
                 div()
@@ -1434,7 +1422,14 @@ impl Explorer {
                     .child(error.clone())
             });
         }
-        SettingPage::new("Appearance").resettable(false).group(group)
+        let mut page = SettingPage::new("Appearance").resettable(false).group(group).group(mode_group);
+        for mode in [ThemeMode::Light, ThemeMode::Dark] {
+            let view = cx.weak_entity();
+            page = page.group(SettingGroup::new().item(
+                SettingItem::render(move |_, _, cx| Self::theme_section(view.clone(), mode, cx)).keywords(["theme", "appearance", "color"]),
+            ));
+        }
+        page
     }
 
     fn about_page(&self) -> SettingPage {
@@ -1561,24 +1556,165 @@ impl Explorer {
             .into_any_element()
     }
 
-    fn appearance_mode_menu(view: WeakEntity<Self>, cx: &App) -> impl IntoElement + use<> {
-        let label = Appearance::mode(cx).label();
-        Button::new("appearance-mode")
+    fn appearance_heading(title: &'static str, description: &'static str, cx: &App) -> Div {
+        div()
+            .v_flex()
+            .gap_1()
+            .child(div().font_semibold().child(title))
+            .child(div().text_sm().text_color(cx.theme().muted_foreground).child(description))
+    }
+
+    fn appearance_mode_choices(view: WeakEntity<Self>, cx: &App) -> impl IntoElement {
+        let light = Self::theme_preview_colors(&cx.theme().light_theme);
+        let dark = Self::theme_preview_colors(&cx.theme().dark_theme);
+        div().id("appearance-mode").test_support().child(
+            RadioGroup::new("appearance-mode-choices")
+                .aria_label("Appearance mode")
+                .axis(Axis::Horizontal)
+                .h_flex()
+                .flex_wrap()
+                .gap_4()
+                .children(
+                    [
+                        ("mode-light", AppearanceMode::Light.label(), AppearanceMode::Light),
+                        ("mode-dark", AppearanceMode::Dark.label(), AppearanceMode::Dark),
+                        ("mode-system", "Follow system", AppearanceMode::System),
+                    ]
+                    .map(|(id, label, mode)| Self::appearance_mode_card(view.clone(), id, label, mode, &light, &dark, cx)),
+                ),
+        )
+    }
+
+    fn appearance_mode_card(
+        view: WeakEntity<Self>,
+        id: &'static str,
+        label: &'static str,
+        mode: AppearanceMode,
+        light: &ThemeColor,
+        dark: &ThemeColor,
+        cx: &App,
+    ) -> Radio {
+        let selected = Appearance::mode(cx) == mode;
+        let accent = cx.theme().primary;
+        let keyboard_view = view.clone();
+        let preview = div()
+            .id("mode-preview")
+            .test_support()
+            .h_flex()
             .w_full()
-            .outline()
-            .label(label)
-            .accessibility_label(format!("Mode: {label}"))
-            .dropdown_caret(true)
-            .dropdown_menu(move |mut menu, _, cx| {
-                for mode in [AppearanceMode::System, AppearanceMode::Light, AppearanceMode::Dark] {
-                    let view = view.clone();
-                    menu = menu.item(PopupMenuItem::new(mode.label()).checked(Appearance::mode(cx) == mode).on_click(
-                        move |_, window, cx| {
-                            _ = view.update(cx, |view, cx| view.select_appearance_mode(mode, window, cx));
-                        },
-                    ));
-                }
-                menu
+            .h_20()
+            .rounded(cx.theme().radius)
+            .overflow_hidden()
+            .border_2()
+            .border_color(if selected { accent } else { cx.theme().border })
+            .map(|preview| match mode {
+                AppearanceMode::Light => preview.child(Self::mini_theme_window(light)),
+                AppearanceMode::Dark => preview.child(Self::mini_theme_window(dark)),
+                AppearanceMode::System => preview
+                    .child(
+                        div()
+                            .h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .overflow_hidden()
+                            .child(Self::mini_theme_window(light).w(relative(2.))),
+                    )
+                    .child(
+                        div()
+                            .h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .justify_end()
+                            .overflow_hidden()
+                            .child(Self::mini_theme_window(dark).w(relative(2.))),
+                    ),
+            });
+        Radio::new(id)
+            .accessibility_label(label)
+            .checked(selected)
+            .v_flex()
+            .items_center()
+            .w(rems(9.))
+            .max_w_full()
+            .gap_2()
+            .p_1()
+            .rounded(cx.theme().radius_lg)
+            .border_1()
+            .border_color(cx.theme().border.opacity(0.))
+            .cursor_default()
+            .hover(|style| style.bg(cx.theme().muted))
+            .active(|style| style.bg(cx.theme().accent))
+            .focus_visible(move |style| style.border_color(accent))
+            .child(preview)
+            .child(
+                div()
+                    .id("mode-label")
+                    .test_support()
+                    .h_flex()
+                    .gap_2()
+                    .text_sm()
+                    .child(Self::appearance_radio_indicator(selected, cx))
+                    .child(label),
+            )
+            .on_change(move |_, _, window, cx| {
+                _ = view.update(cx, |view, cx| view.select_appearance_mode(mode, window, cx));
+            })
+            .on_action(move |_: &Confirm, window, cx| {
+                cx.stop_propagation();
+                _ = keyboard_view.update(cx, |view, cx| view.select_appearance_mode(mode, window, cx));
+            })
+    }
+
+    fn mini_theme_window(colors: &ThemeColor) -> Div {
+        let dot = |color| div().size_1().rounded_full().bg(color);
+        div().w_full().h_full().flex_none().p_2().bg(colors.muted).child(
+            div()
+                .v_flex()
+                .size_full()
+                .rounded_sm()
+                .overflow_hidden()
+                .bg(colors.background)
+                .child(
+                    div()
+                        .h_flex()
+                        .h_3()
+                        .flex_none()
+                        .px_1()
+                        .gap_0p5()
+                        .bg(colors.title_bar)
+                        .child(dot(colors.danger))
+                        .child(dot(colors.warning))
+                        .child(dot(colors.success)),
+                )
+                .child(
+                    div()
+                        .v_flex()
+                        .p_1p5()
+                        .gap_1()
+                        .child(div().w_10().h_1().rounded_full().bg(colors.primary))
+                        .child(div().w_16().max_w_full().h_1().rounded_full().bg(colors.foreground.opacity(0.35)))
+                        .child(div().w_12().max_w_full().h_1().rounded_full().bg(colors.foreground.opacity(0.2))),
+                ),
+        )
+    }
+
+    fn appearance_radio_indicator(selected: bool, cx: &App) -> Div {
+        div()
+            .size_3()
+            .flex_none()
+            .h_flex()
+            .justify_center()
+            .rounded_full()
+            .border_2()
+            .border_color(if selected {
+                cx.theme().primary
+            } else {
+                cx.theme().muted_foreground
+            })
+            .when(selected, |indicator| {
+                indicator.child(div().size_1().rounded_full().bg(cx.theme().primary))
             })
     }
 
@@ -1605,35 +1741,109 @@ impl Explorer {
             })
     }
 
-    fn theme_menu(view: WeakEntity<Self>, mode: ThemeMode, cx: &App) -> impl IntoElement + use<> {
-        let label = Appearance::selected_theme(mode, cx).to_owned();
-        Button::new(if mode.is_dark() { "dark-theme" } else { "light-theme" })
-            .w_full()
-            .outline()
-            .accessibility_label(format!("{} theme: {label}", if mode.is_dark() { "Dark" } else { "Light" }))
-            .tooltip(label.clone())
-            .label(label)
-            .dropdown_caret(true)
-            .dropdown_menu(move |menu, window, cx| {
-                if let Err(error) = appearance::load_custom_themes(cx) {
-                    tracing::warn!(error_code = error.code(), diagnostic = ?error, "appearance.custom_themes.load_failed");
-                }
-                let mut menu = menu
-                    .min_w(rems(14.).to_pixels(window.rem_size()))
-                    .max_h(rems(24.).to_pixels(window.rem_size()))
-                    .scrollable(true);
-                for theme in ThemeRegistry::global(cx).sorted_themes() {
-                    if theme.mode != mode {
-                        continue;
-                    }
-                    let name = theme.name.clone();
-                    let selected = Appearance::selected_theme(mode, cx) == name.as_str();
-                    let view = view.clone();
-                    menu = menu.item(PopupMenuItem::new(name.clone()).checked(selected).on_click(move |_, window, cx| {
-                        _ = view.update(cx, |view, cx| view.select_theme(mode, name.clone(), window, cx));
-                    }));
-                }
-                menu
+    fn theme_section(view: WeakEntity<Self>, mode: ThemeMode, cx: &App) -> Div {
+        let (id, title) = if mode.is_dark() {
+            ("dark-themes", "Dark themes")
+        } else {
+            ("light-themes", "Light themes")
+        };
+        div().v_flex().gap_3().child(div().font_semibold().child(title)).child(
+            RadioGroup::new(id).aria_label(title).flex().flex_wrap().gap_3().children(
+                ThemeRegistry::global(cx)
+                    .sorted_themes()
+                    .into_iter()
+                    .filter(|theme| theme.mode == mode)
+                    .map(|theme| Self::theme_card(view.clone(), theme, cx)),
+            ),
+        )
+    }
+
+    fn theme_preview_colors(config: &Rc<ThemeConfig>) -> ThemeColor {
+        let base = if config.mode.is_dark() {
+            ThemeColor::dark()
+        } else {
+            ThemeColor::light()
+        };
+        let mut preview = Theme::from(base.as_ref());
+        preview.apply_config(config);
+        preview.colors
+    }
+
+    fn theme_card(view: WeakEntity<Self>, config: &Rc<ThemeConfig>, cx: &App) -> Radio {
+        let colors = Self::theme_preview_colors(config);
+        let name = config.name.clone();
+        let keyboard_name = name.clone();
+        let keyboard_view = view.clone();
+        let mode = config.mode;
+        let mode_label = if mode.is_dark() { "Dark" } else { "Light" };
+        let selected = &name == cx.theme().theme_name();
+        let accent = cx.theme().primary;
+        let hover_border = cx.theme().muted_foreground;
+        Radio::new((ElementId::from("theme"), name.clone()))
+            .accessibility_label(format!("{name}, {mode_label} theme"))
+            .checked(selected)
+            .v_flex()
+            .min_w_0()
+            .w(rems(10.))
+            .max_w_full()
+            .h(rems(9.))
+            .p_2()
+            .gap_2()
+            .rounded(cx.theme().radius_lg)
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().group_box)
+            .styles(move |styles| styles.checked(|style| style.border_color(accent)))
+            .cursor_default()
+            .hover(move |style| style.border_color(if selected { accent } else { hover_border }))
+            .active(|style| style.bg(cx.theme().accent))
+            .focus_visible(|style| style.border_color(accent).bg(cx.theme().muted))
+            .child(
+                div()
+                    .id("theme-swatch")
+                    .test_support()
+                    .v_flex()
+                    .h_16()
+                    .flex_none()
+                    .w_full()
+                    .p_2()
+                    .gap_1()
+                    .rounded(cx.theme().radius)
+                    .overflow_hidden()
+                    .bg(colors.background)
+                    .child(div().w_10().h_1().rounded_full().bg(colors.primary))
+                    .child(div().w_20().max_w_full().h_1().rounded_full().bg(colors.foreground.opacity(0.7)))
+                    .child(div().w_12().max_w_full().h_1().rounded_full().bg(colors.foreground.opacity(0.4))),
+            )
+            .child(
+                div()
+                    .id("theme-label")
+                    .test_support()
+                    .h_flex()
+                    .items_start()
+                    .min_w_0()
+                    .gap_1()
+                    .text_sm()
+                    .child(div().flex_1().min_w_0().h_10().line_clamp(2).child(name.clone()))
+                    .child(
+                        div()
+                            .v_flex()
+                            .items_end()
+                            .gap_1()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(mode_label)
+                            .when(selected, |label| {
+                                label.child(Icon::new(IconName::Check).size_3().text_color(accent))
+                            }),
+                    ),
+            )
+            .on_change(move |_, _, window, cx| {
+                _ = view.update(cx, |view, cx| view.select_theme(mode, name.clone(), window, cx));
+            })
+            .on_action(move |_: &Confirm, window, cx| {
+                cx.stop_propagation();
+                _ = keyboard_view.update(cx, |view, cx| view.select_theme(mode, keyboard_name.clone(), window, cx));
             })
     }
 
@@ -1677,8 +1887,22 @@ impl Explorer {
     }
 
     fn select_theme(&mut self, mode: ThemeMode, name: SharedString, window: &mut Window, cx: &mut Context<Self>) {
-        if let Err(error) = appearance::select_theme(mode, name, window, cx) {
+        if Appearance::selected_theme(mode, cx) != name.as_str()
+            && let Err(error) = appearance::select_theme(mode, name, window, cx)
+        {
             self.error = Some(error.localized_message());
+        }
+        // Keep System following intact when configuring its inactive palette.
+        if Appearance::mode(cx) != AppearanceMode::System && cx.theme().mode != mode {
+            self.select_appearance_mode(
+                if mode.is_dark() {
+                    AppearanceMode::Dark
+                } else {
+                    AppearanceMode::Light
+                },
+                window,
+                cx,
+            );
         }
         cx.notify();
     }
