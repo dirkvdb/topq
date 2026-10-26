@@ -1,6 +1,6 @@
 # Packaging
 
-Packaging uses mise-managed just 1.56.0, Rust 1.95.0, cargo-binstall 1.25.2,
+Packaging uses mise-managed just 1.56.0, Rust 1.98.0, cargo-binstall 1.25.2,
 and cargo-bundle (0.12.0 for macOS/Windows, 0.11.0 for Linux). Cargo-bundle
 provides app and DMG generation; cargo-packager offers an updater but is not
 needed for this workflow. Cargo-dist is aimed at broader release automation.

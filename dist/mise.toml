@@ -6,7 +6,7 @@ cargo.binstall_quickinstall = true
 [tools]
 cargo-binstall = "1.25.2"
 just = "1.56.0"
-rust = { version = "1.95.0", profile = "minimal" }
+rust = { version = "1.98.0", profile = "minimal" }
 "cargo:cargo-bundle" = { version = "0.12.0", locked = true }
 
 [env]
