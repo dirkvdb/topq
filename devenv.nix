@@ -22,7 +22,7 @@
   languages.rust = {
     enable = true;
     channel = "stable";
-    version = "1.95.0";
+    version = "1.98.0";
     components = [
       "rustc"
       "cargo"

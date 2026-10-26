@@ -280,7 +280,7 @@ impl Explorer {
                         |_, _, _| (),
                         move |viewport, _, window, _| {
                             let scroll_owner = owner.clone();
-                            window.on_mouse_event(move |event: &gpui_kit::ScrollWheelEvent, phase, _, cx| {
+                            window.on_mouse_event(move |event: &gpui_kit::ScrollEvent, phase, _, cx| {
                                 if !phase.bubble() && viewport.contains(&event.position) {
                                     let _ = scroll_owner.update(cx, |view, cx| {
                                         if view.hovered_field.take().is_some() {
