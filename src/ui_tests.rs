@@ -8252,6 +8252,33 @@ fn metadata_tags_leave_room_for_json_at_minimum_size_in_both_themes(cx: &mut Tes
 }
 
 #[gpui_kit::test]
+fn primary_shortcut_opens_connection_settings(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, false, 900., 640.);
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(!view.read(cx).show_config);
+        window.press("secondary-,", cx);
+        window.render_frame(cx);
+        assert!(window.find("settings-dialog").visible());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn primary_shortcut_focuses_topics_from_the_filter(cx: &mut TestAppContext) {
+    let (handle, _) = open(cx, false, 900., 640.);
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        let topics_focus = window.focused(cx).unwrap();
+        window.click("topic-search", cx);
+        assert_eq!(window.find("topic-search").focused(), Some(true));
+        window.press("secondary-1", cx);
+        assert!(topics_focus.is_focused(window));
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
 fn topic_filter_shortcuts_work_from_the_application_shell_payload_and_toolbar(cx: &mut TestAppContext) {
     let (handle, view) = open(cx, false, 900., 640.);
     cx.update_window(handle, |_, window, cx| {

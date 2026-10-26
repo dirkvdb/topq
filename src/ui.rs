@@ -76,16 +76,20 @@ gpui_kit::actions!(
     ]
 );
 
+fn primary_shortcut(mac: &'static str, other: &'static str, cx: &App) -> &'static str {
+    if cx.platform_info().is_mac() { mac } else { other }
+}
+
 pub(crate) fn init(cx: &mut App) {
     payload_raw::init(cx);
     cx.bind_keys([
-        KeyBinding::new("secondary-,", OpenConnection, Some("Explorer")),
+        KeyBinding::new(primary_shortcut("cmd-,", "ctrl-,", cx), OpenConnection, Some("Explorer")),
         KeyBinding::new("escape", CancelConnection, Some("SettingsDialog")),
         KeyBinding::new("escape", FocusTopics, Some("TopicFilter")),
         KeyBinding::new("/", FocusTopicFilter, Some("Explorer && !TopicFilter && !PublishPanel")),
         KeyBinding::new("ctrl-f", FocusTopicFilter, Some("Explorer")),
         KeyBinding::new("ctrl-f", FocusTopicFilter, Some("Explorer > Input")),
-        KeyBinding::new("secondary-1", FocusTopics, Some("Explorer")),
+        KeyBinding::new(primary_shortcut("cmd-1", "ctrl-1", cx), FocusTopics, Some("Explorer")),
         KeyBinding::new("home", FirstTopic, Some("Tree")),
         KeyBinding::new("end", LastTopic, Some("Tree")),
         KeyBinding::new("left", NavigateTopicLeft, Some("Tree")),
