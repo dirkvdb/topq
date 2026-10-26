@@ -8180,7 +8180,7 @@ fn topic_deletion_dialog_wraps_content_and_keeps_actions_visible_across_themes_a
                     view.show_confirm_topic_deletion_dialog(path.into(), window, cx, |_, _| panic!("layout test must not publish"));
                 });
                 window.render_frame(cx);
-                let surface = window.within("dialog").find(0usize).bounds();
+                let surface = window.within("dialog").find("surface").bounds();
                 let scope = window.find("delete-topic-scope");
                 let marker = window.find("delete-topic-marker");
                 let warning = window.find("delete-topic-warning");
