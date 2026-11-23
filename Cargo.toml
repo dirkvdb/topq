@@ -16,7 +16,7 @@ anstyle-parse = "1"
 bytes = "1"
 chrono = "0.4"
 directories = "6"
-gpui-kit = { version = "0.9", features = ["tree-sitter", "gpui-fast"] }
+gpui-kit = { version = "0.10", features = ["tree-sitter", "gpui-fast"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 infer = { version = "0.22", default-features = false }
 notify = "8"
