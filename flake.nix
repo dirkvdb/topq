@@ -2,7 +2,7 @@
   description = "Topq MQTT explorer";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.11";
     flake-utils.url = "github:numtide/flake-utils";
     rust-overlay = {
       url = "github:oxalica/rust-overlay/stable";
@@ -55,6 +55,7 @@
           buildInputs =
             with pkgs;
             [
+              aws-lc
               fontconfig.dev
               vulkan-headers
             ]
