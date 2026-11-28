@@ -27,7 +27,9 @@ jobs:
     timeout-minutes: 60
     container:
       image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-25.08
-      options: --privileged
+      # Docker seeds the anonymous volume with the preinstalled SDK. Flatpak
+      # can then rename old deployments without hitting OverlayFS's EXDEV.
+      options: --privileged --volume /var/lib/flatpak
     env:
       MISE_DEFAULT_CONFIG_FILENAME: dist/mise.flatpak.toml
     steps:

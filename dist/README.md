@@ -209,8 +209,11 @@ flatpak-builder --user --install --force-clean --state-dir=dist/build/flatpak/st
 
 The distribution workflow uses the official
 [`flatpak/flatpak-github-actions/flatpak-builder@v6`](https://github.com/flatpak/flatpak-github-actions)
-action in Flathub's privileged Freedesktop 25.08 container. The host-side Rust and
-just tools come from `dist/mise.flatpak.toml`, independently of AppImage tooling.
+action in Flathub's privileged Freedesktop 25.08 container. An anonymous Docker
+volume at `/var/lib/flatpak` is populated from the image so Flatpak can update
+preinstalled runtimes without renaming image-layer directories on OverlayFS.
+The host-side Rust and just tools come from `dist/mise.flatpak.toml`,
+independently of AppImage tooling.
 After vendoring the locked Cargo dependencies, the action handles SDK installation, build caching,
 bundle export, and artifact upload. It builds `TopQ.flatpak` bundles natively for
 x86_64 on `ubuntu-24.04` and aarch64 on `ubuntu-24.04-arm`, uploading separate
